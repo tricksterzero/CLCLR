@@ -1,0 +1,51 @@
+// このファイルと読み込むファイルは UTF-8（設定画面のダイアログに日本語の文字列を書くため）
+#pragma code_page(65001)
+#include <windows.h>
+#include <commctrl.h>
+#include "resource.h"
+
+// exe本体のリソースアイコン（タスクバー・エクスプローラでの表示用）。
+// 最初（かつ唯一）のICONリソースがexeの既定アイコンとして使われる。
+1 ICON "icons/app.ico"
+
+// アプリケーションマニフェスト（Common Controls v6・PerMonitorV2・asInvoker）。
+// ID 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID、型 24 = RT_MANIFEST。
+1 24 "app.manifest"
+
+// バージョン情報（エクスプローラーのプロパティの「詳細」）。番号は build.rs が Cargo.toml の version から
+// 作る version.h（OUT_DIR）にある。
+#include "version.h"
+1 VERSIONINFO
+FILEVERSION CLCLR_VERSION_BIN
+PRODUCTVERSION CLCLR_VERSION_BIN
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 日本語（0x0411）・Unicode（1200 = 0x04B0）
+        BLOCK "041104B0"
+        BEGIN
+            VALUE "FileDescription", "CLCLR"
+            VALUE "FileVersion", CLCLR_FILE_VERSION_STR
+            VALUE "InternalName", "CLCLR"
+            VALUE "LegalCopyright", "Copyright (c) 2026 tsZ"
+            VALUE "OriginalFilename", "CLCLR.exe"
+            VALUE "ProductName", "CLCLR"
+            VALUE "ProductVersion", CLCLR_PRODUCT_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0411, 1200
+    END
+END
+
+// 設定画面
+#include "settings.rc"
+
+// ピン留めの名前の変更
+#include "rename.rc"

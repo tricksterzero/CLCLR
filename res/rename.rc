@@ -1,0 +1,14 @@
+// ピン留めの名前の変更（ビューア）。app.rc から読み込む（文字コードは app.rc の
+// #pragma code_page(65001) で UTF-8）。見出し（LTEXT）は入力欄のすぐ前に置く（アクセスキーのため）。
+
+IDD_RENAME DIALOGEX 0, 0, 240, 74
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "名前の変更"
+FONT 9, "Yu Gothic UI", 400, 0, 0x80
+BEGIN
+    LTEXT "名前(&N)", -1, 7, 7, 226, 8
+    EDITTEXT IDC_RENAME_NAME, 7, 18, 226, 12, ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT "空にすると自動の名前（テキストの1行目）に戻ります。", -1, 7, 34, 226, 8
+    DEFPUSHBUTTON "OK", IDOK, 136, 52, 45, 15
+    PUSHBUTTON "キャンセル", IDCANCEL, 188, 52, 45, 15
+END
