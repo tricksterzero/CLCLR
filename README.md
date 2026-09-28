@@ -23,6 +23,16 @@ CLCL（Ohno Tomoaki 氏、MIT ライセンス。[公式サイト](https://nakka.
 
 CLCLR を2つ同時に動かすことはできません（別のフォルダに置いたものでも同じです）。2つ目を起動すると、動いている方のビューアが前に出ます。
 
+### セキュリティソフトの誤検出について
+
+CLCLR は、クリップボードの履歴を取って貼り付け直すために、次の機能を使います。キー入力を記録するソフト（キーロガー）と似た動きに見えるため、セキュリティソフトによっては、マルウェアと誤って判定することがあります。
+
+- クリップボードの監視（コピーした内容を履歴に加えるため）
+- 低レベルのキーボードフック（Ctrl・Shift・Alt の二度押しを見るため。二度押しを使う設定にしたときだけ使います）
+- キー入力の送出（選んだ項目を、元の窓へ自動で貼り付けるため）
+
+CLCLR には、ネットワークに接続する処理はありません。履歴と設定は、`CLCLR.exe` と同じフォルダに保存します。
+
 ## 使い方
 
 ### 常駐とトレイ
@@ -221,8 +231,12 @@ powershell -ExecutionPolicy Bypass -File scripts\release.ps1
 
 ## 不具合の報告・要望
 
-不具合の報告や要望は、[このリポジトリの Issues](https://github.com/tricksterzero/CLCLR/issues)、もしくは [作者のX（Twitter）アカウント](https://x.com/tsZ) までお寄せください。
+不具合の報告や要望は次のどれかまでお寄せください。
+
+- 作者へのメール: [mail@tszero.jp](mailto:mail@tszero.jp)
+- [このリポジトリの Issues](https://github.com/tricksterzero/CLCLR/issues)
+- [作者のX（Twitter）アカウント](https://x.com/tsZ)
 
 ## ライセンス
 
-MIT ライセンスです（[LICENSE](LICENSE)）。本家 CLCL（MIT）、アイコン（Google の Material Symbols、Apache License 2.0）、組み込んでいる Rust のクレートの表示は [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) にあります。
+無料で使えるフリーソフトで、MIT ライセンスです（[LICENSE](LICENSE)）。本家 CLCL（MIT）、アイコン（Google の Material Symbols、Apache License 2.0）、組み込んでいる Rust のクレートの表示は [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) にあります。
