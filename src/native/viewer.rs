@@ -609,6 +609,9 @@ struct WindowCtx {
     drag: Cell<Option<Drag>>,
     /// ドラッグ中の一覧の行（マウスを捕まえている間。`begin_row_drag`）。描画は落とす先の目印をここから読む
     row_drag: Cell<Option<RowDrag>>,
+    /// 行のドラッグを右ボタンで取り消し、右ボタンを離すのを待っている（その間もマウスを捕まえておく。
+    /// `cancel_row_drag_by_right_button`）
+    row_drag_right_up: Cell<bool>,
     /// 窓に付けているメニューバー（ドロップダウンは自前描画。`menu_draw::MenuBar` の説明）。窓の破棄の前に
     /// 外す（`ViewerWindow` の `Drop`）。借用はメニューバーを差し替える間だけ
     menu_bar: RefCell<Option<MenuBar>>,
@@ -742,6 +745,7 @@ impl ViewerWindow {
             preview_height: Cell::new(None),
             drag: Cell::new(None),
             row_drag: Cell::new(None),
+            row_drag_right_up: Cell::new(false),
             menu_bar: RefCell::new(Some(menu)),
             menu_bar_pending: Cell::new(false),
             topmost: Cell::new(false),
@@ -3251,18 +3255,37 @@ fn finish_row_drag(hwnd: HWND, ctx: &WindowCtx, x: i32, y: i32) {
     }
 }
 
-/// ドラッグを取り消す（Esc・マウスを失った・隠す・終了）。目印を消し、まだ捕まえていればマウスを放す。
-/// ドラッグしていなければ何もしない。
+/// ドラッグを取り消す（Esc・マウスを失った・隠す・終了）。目印を消し、まだ捕まえていればマウスを放す（右ボタンでの
+/// 取り消しの後、右ボタンを離すのを待っている間も放す）。どちらでもなければ何もしない。
 fn cancel_row_drag(hwnd: HWND, ctx: &WindowCtx) {
-    let Some(drag) = ctx.row_drag.take() else {
+    let drag = ctx.row_drag.take();
+    let waiting = ctx.row_drag_right_up.replace(false);
+    if drag.is_none() && !waiting {
         return;
-    };
+    }
     unsafe {
-        refresh_drop_mark(hwnd, ctx, drag.mark, false);
+        if let Some(drag) = drag {
+            refresh_drop_mark(hwnd, ctx, drag.mark, false);
+        }
         if GetCapture() == hwnd {
             let _ = ReleaseCapture();
         }
     }
+}
+
+/// ドラッグ中に右ボタンを押した: ドラッグを取り消して目印を消す。マウスは右ボタンを離すまで捕まえたままにし、離す
+/// 操作は窓が受け取って捨てる（`WM_RBUTTONUP`）。すぐに放すと、離す操作が下の一覧・ツリーへ届き、右クリックの
+/// メニューが出うるため。ドラッグしていなければ何もしない（false）。
+fn cancel_row_drag_by_right_button(hwnd: HWND, ctx: &WindowCtx) -> bool {
+    let Some(drag) = ctx.row_drag.take() else {
+        return false;
+    };
+    ctx.row_drag_right_up.set(true);
+    unsafe {
+        refresh_drop_mark(hwnd, ctx, drag.mark, false);
+    }
+    set_drag_cursor(true);
+    true
 }
 
 /// 右クリックメニューのコマンド ID。テキスト変換は `MENU_TRANSFORM_BASE` + `TextTransform::ALL` の添字、
@@ -3681,6 +3704,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         finish_row_drag(hwnd, ctx, x, y);
                         return LRESULT(0);
                     }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            // 行のドラッグ中の右ボタンは取り消し（マウスを捕まえているので、どこで押してもここへ来る）
+            WM_RBUTTONDOWN => {
+                if ctx_ref(hwnd).is_some_and(|ctx| cancel_row_drag_by_right_button(hwnd, ctx)) {
+                    return LRESULT(0);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            // 右ボタンでの取り消しの後の離す操作は、既定の処理へ渡さずに捨て（渡すと WM_CONTEXTMENU になる）、
+            // マウスを放す
+            WM_RBUTTONUP => {
+                if let Some(ctx) = ctx_ref(hwnd).filter(|ctx| ctx.row_drag_right_up.get()) {
+                    cancel_row_drag(hwnd, ctx);
+                    return LRESULT(0);
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
@@ -6775,31 +6814,80 @@ mod tests {
         assert!(recorder.commands.borrow().is_empty(), "取り消した・始めていないドラッグで移動を伝えた");
     }
 
-    /// 実際のマウスの入力で、ピン留めの行を押して動かすと一覧がドラッグを検知し（`LVN_BEGINDRAG`）、窓がマウスを
-    /// 捕まえて、フォルダの行の上で離すとそのフォルダへの移動を伝える。押して動かす・離すのは別のスレッドから行い
-    /// （一覧はドラッグを検知するまで押下の処理から戻らない）、このスレッドはメッセージを処理し続ける。
-    /// マウスのカーソルを動かす（終わったら戻す）ので、通常の実行では動かさない。
+    /// 右ボタンでの取り消し: 押すとドラッグを取り消して目印を消すが、右ボタンを離すまでマウスを捕まえたままにし、
+    /// その間に左ボタンを離しても落とさない。右ボタンを離すとマウスを放す。待っている間に隠す・終了の要求
+    /// （`cancel_modal`）が来ても放す。ドラッグしていないときの右ボタンは扱わない。
     #[test]
-    #[ignore]
-    fn real_mouse_drag_moves_row_into_folder() {
+    fn right_button_cancels_row_drag_and_holds_capture_until_release() {
+        use windows::Win32::UI::WindowsAndMessaging::{WM_RBUTTONDOWN, WM_RBUTTONUP};
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let (window, recorder, [folder, ..]) = window_with_folder_row();
+        let hwnd = window.hwnd();
+        let tree = unsafe { GetDlgItem(Some(hwnd), ID_TREE).unwrap() };
+        let folder_item = unsafe { find_tree_item(ctx_ref(hwnd).unwrap(), tree, Source::Pinned(Some(folder))) }.unwrap();
+        let over_tree = tree_item_point(&window, tree, folder_item);
+        let ctx = unsafe { ctx_ref(hwnd) }.unwrap();
+
+        begin_drag(&window, 1);
+        mouse(hwnd, WM_MOUSEMOVE, over_tree);
+        assert_eq!(drop_mark(hwnd), Some(DropMark::Tree(Some(folder))));
+        mouse(hwnd, WM_RBUTTONDOWN, over_tree);
+        assert!(ctx.row_drag.get().is_none(), "右ボタンで取り消されない");
+        assert_eq!(tree_item_at(tree, TVGN_DROPHILITE).0, 0, "取り消した後も強調が残っている");
+        assert_eq!(unsafe { GetCapture() }, hwnd, "右ボタンを離す前にマウスを放した");
+        mouse(hwnd, WM_LBUTTONUP, over_tree);
+        assert_eq!(unsafe { GetCapture() }, hwnd);
+        mouse(hwnd, WM_RBUTTONUP, over_tree);
+        assert_ne!(unsafe { GetCapture() }, hwnd, "右ボタンを離してもマウスを放さない");
+        assert!(!ctx.row_drag_right_up.get());
+
+        begin_drag(&window, 1);
+        mouse(hwnd, WM_RBUTTONDOWN, over_tree);
+        cancel_modal(hwnd);
+        assert_ne!(unsafe { GetCapture() }, hwnd, "右ボタンを待つ間の隠す要求でマウスを放さない");
+        assert!(!ctx.row_drag_right_up.get());
+
+        // ドラッグしていなければ扱わない（待つ状態にならない）
+        mouse(hwnd, WM_RBUTTONDOWN, over_tree);
+        assert!(!ctx.row_drag_right_up.get());
+        mouse(hwnd, WM_RBUTTONUP, over_tree);
+        assert!(recorder.commands.borrow().is_empty(), "取り消したドラッグで移動を伝えた");
+    }
+
+    /// 実際のマウスの入力で、一覧の `from` の行を押して `over` の行の真ん中まで動かす。押して動かす・離すのは別の
+    /// スレッドから行い（一覧はドラッグを検知するまで押下の処理から戻らない）、このスレッドはメッセージを処理し続ける。
+    /// 動かし終えたときに、窓がマウスを捕まえているかと落とす先の目印を記録して返す。その後、`right_cancel` なら
+    /// 右ボタンを押して離してから、左ボタンを離す（そうでなければ左ボタンを離すだけ）。カーソルは最後に元へ戻す。
+    fn real_mouse_drag(window: &ViewerWindow, from: usize, over: usize, right_cancel: bool) -> Option<(bool, Option<DropMark>)> {
         use std::sync::mpsc;
         use windows::Win32::UI::Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
+            SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN,
+            MOUSEEVENTF_RIGHTUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
         };
         use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
-        let _gui = crate::tray::lock_gui_resource_tests();
-        let (window, recorder, [folder, item, _]) = window_with_folder_row();
         let hwnd = window.hwnd();
+        // 位置は決めて置く（CW_USEDEFAULT は作るたびにずらして置くので、ほかのテストの後では行が画面の外に出うる）
         unsafe {
-            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 100, 100, 0, 0, SWP_NOSIZE);
         }
         pump(hwnd, 50);
         let to_screen = |mut p: POINT| {
             let _ = unsafe { ClientToScreen(hwnd, &mut p) };
             (p.x, p.y)
         };
-        let from = to_screen(list_row_point(&window, 1, 0.5));
-        let over = to_screen(list_row_point(&window, 0, 0.5));
+        let from = to_screen(list_row_point(window, from, 0.5));
+        let over = to_screen(list_row_point(window, over, 0.5));
+        let under = unsafe { windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(POINT { x: from.0, y: from.1 }) };
+        let (mut rect, ex) = (RECT::default(), unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowLongW(hwnd, windows::Win32::UI::WindowsAndMessaging::GWL_EXSTYLE)
+        });
+        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect) };
+        assert_eq!(
+            under,
+            list(window),
+            "押す位置 {from:?} の下が一覧ではない（窓 {rect:?}、拡張スタイル {ex:#x}、表示 {}）",
+            is_visible(hwnd)
+        );
         let mut saved = POINT::default();
         unsafe { GetCursorPos(&mut saved) }.unwrap();
         let (moved_tx, moved) = mpsc::channel();
@@ -6822,6 +6910,12 @@ mod tests {
             pause(100);
             moved_tx.send(()).unwrap();
             let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(5));
+            if right_cancel {
+                button(MOUSEEVENTF_RIGHTDOWN);
+                pause(100);
+                button(MOUSEEVENTF_RIGHTUP);
+                pause(100);
+            }
             button(MOUSEEVENTF_LEFTUP);
             pause(100);
             unsafe { SetCursorPos(saved.x, saved.y) }.unwrap();
@@ -6837,9 +6931,39 @@ mod tests {
         }
         input.join().unwrap();
         pump(hwnd, 100);
+        during
+    }
+
+    /// 実際のマウスの入力で、ピン留めの行を押して動かすと一覧がドラッグを検知し（`LVN_BEGINDRAG`）、窓がマウスを
+    /// 捕まえて、フォルダの行の上で離すとそのフォルダへの移動を伝える。
+    /// マウスのカーソルを動かす（終わったら戻す）ので、通常の実行では動かさない。
+    #[test]
+    #[ignore]
+    fn real_mouse_drag_moves_row_into_folder() {
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let (window, recorder, [folder, item, _]) = window_with_folder_row();
+        let during = real_mouse_drag(&window, 1, 0, false);
         assert_eq!(during, Some((true, Some(DropMark::Into(folder)))), "ドラッグが始まらない・目印が違う");
-        assert_ne!(unsafe { GetCapture() }, hwnd);
+        assert_ne!(unsafe { GetCapture() }, window.hwnd());
         assert_eq!(recorder.commands.borrow().as_slice(), [(item, RowCommand::Place { to: Some(folder), before: None })]);
+    }
+
+    /// 実際のマウスの入力で、ドラッグ中に右クリックすると取り消され、その後に左ボタンを離しても移動を伝えない。
+    /// 右ボタンを離す操作が一覧へ渡って、右クリックのメニューを求めることもない。マウスは最後に放している。
+    /// マウスのカーソルを動かす（終わったら戻す）ので、通常の実行では動かさない。
+    #[test]
+    #[ignore]
+    fn real_mouse_right_click_cancels_drag_without_menu() {
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let (window, recorder, [folder, ..]) = window_with_folder_row();
+        let during = real_mouse_drag(&window, 1, 0, true);
+        assert_eq!(during, Some((true, Some(DropMark::Into(folder)))), "ドラッグが始まらない・目印が違う");
+        let ctx = unsafe { ctx_ref(window.hwnd()) }.unwrap();
+        assert!(ctx.row_drag.get().is_none() && !ctx.row_drag_right_up.get());
+        assert_ne!(unsafe { GetCapture() }, window.hwnd(), "マウスを放していない");
+        assert!(recorder.commands.borrow().is_empty(), "取り消したのに移動を伝えた");
+        assert!(recorder.menu_requests.borrow().is_empty(), "右ボタンを離す操作で右クリックのメニューを求めた");
+        assert!(recorder.tree_menu_requests.borrow().is_empty());
     }
 
     // --- ツリーの名前の編集 ---
