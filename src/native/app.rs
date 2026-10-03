@@ -1201,9 +1201,10 @@ impl ViewerHandler for App {
         self.request(action);
     }
 
-    /// ピン留めの行を、検索せずに表示しているときだけ（並べ替えと同じ。検索の結果はフォルダをまたぐため）。
+    /// ピン留めの行（移動）は、検索せずに表示しているときだけ（並べ替えと同じ。検索の結果はフォルダをまたぐため）。
+    /// 履歴の行（ピン留め）は、検索中もできる（右クリックの「ピン留めに追加」と同じ）。
     fn can_drag_row(&self, target: RowTarget) -> bool {
-        target.pinned && self.needle.borrow().is_empty()
+        !target.pinned || self.needle.borrow().is_empty()
     }
 
     fn pinned_title(&self, id: Uuid) -> Option<Option<String>> {
@@ -1711,7 +1712,8 @@ mod tests {
 
     /// ピン留めの並べ替え: メニューの「上へ」「下へ」は同じ親の中の位置で決まり、項目とフォルダを区別しない。
     /// フォルダの行のメニューは、フォルダがあるときだけ出す。検索中は並べ替えを出さず、並べ替え・ドラッグでの
-    /// 移動を依頼しない。フォルダの行は移動・並べ替えだけを依頼し、送る・削除（確認の前）などは依頼しない。
+    /// 移動を依頼せず、ピン留めの行のドラッグもさせない（履歴の行のドラッグはピン留めなので、検索中もさせる）。
+    /// フォルダの行は移動・並べ替えだけを依頼し、送る・削除（確認の前）などは依頼しない。
     /// 履歴の行は、移動・並べ替えを依頼しない。
     #[test]
     fn reorder_menu_and_commands_follow_position_and_search() {
@@ -1746,6 +1748,7 @@ mod tests {
         let hwnd = HWND::default();
         let history_row = RowTarget { id: item, pinned: false, folder: false };
         let place = RowCommand::Place { to: Some(folder), before: None };
+        assert!(app.can_drag_row(item_row) && app.can_drag_row(folder_row) && app.can_drag_row(history_row));
         app.on_row_command(hwnd, item_row, RowCommand::Reorder(Down));
         app.on_row_command(hwnd, folder_row, RowCommand::Reorder(Up));
         app.on_row_command(hwnd, item_row, place);
@@ -1762,6 +1765,8 @@ mod tests {
         app.on_row_command(hwnd, item_row, RowCommand::Reorder(Down));
         app.on_row_command(hwnd, item_row, place);
         assert_eq!(app.row_menu(item_row).unwrap().reorder, None, "検索中に並べ替えを出した");
+        assert!(!app.can_drag_row(item_row) && !app.can_drag_row(folder_row), "検索中にピン留めの行をドラッグできる");
+        assert!(app.can_drag_row(history_row), "検索中に履歴の行をドラッグできない（ピン留めはできる）");
         assert_eq!(app.row_menu(folder_row).unwrap().reorder, None);
         assert_eq!(
             received.try_iter().collect::<Vec<_>>(),
