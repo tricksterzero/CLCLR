@@ -137,7 +137,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_UP};
 use windows::Win32::UI::WindowsAndMessaging::FALT;
 use crate::store::Direction;
 use windows::Win32::Graphics::Gdi::{MapWindowPoints, UpdateWindow};
-use windows::Win32::UI::Controls::{LVN_BEGINDRAG, TVGN_PARENT};
+use windows::Win32::UI::Controls::{LVN_BEGINDRAG, TVGN_PARENT, TVN_BEGINDRAGW};
 use windows::Win32::UI::WindowsAndMessaging::IDC_NO;
 use crate::icons;
 use crate::menu_draw::{self, MenuBar, PopupMenu};
@@ -3023,24 +3023,29 @@ enum DropMark {
     Tree(Option<Uuid>),
 }
 
-/// ドラッグ中の一覧の行。
+/// ドラッグ中の一覧の行・ツリーのピン留めのフォルダ。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RowDrag {
     target: RowTarget,
-    /// ピン留めの行なら、一覧に出しているピン留めのフォルダ（None はルート）。行の間へ落としたときの入れる先。
+    /// ピン留めの行・フォルダが今いるフォルダ（None はルート）。ツリーのここへは落とせない（落としても動かない）。
     /// 履歴の行では使わない（None）
-    folder: Option<Uuid>,
+    parent: Option<Uuid>,
+    /// 一覧の上に落とせるときの、一覧に出しているピン留めのフォルダ（内の None はルート）。行の間へ落としたときの
+    /// 入れる先。外の None は一覧の上に落とせない（履歴の行、検索中・自分の中を出しているときのツリーのフォルダ）
+    list_folder: Option<Option<Uuid>>,
     /// 今の落とす先（None は落とせない所）
     mark: Option<DropMark>,
 }
 
 impl RowDrag {
-    /// 落とす先への操作。ピン留めの行は移動（`RowCommand::Place`）、履歴の行はツリーのピン留めへのピン留め
-    /// （`RowCommand::Pin`。一覧の上の落とす先は履歴の行には出さないので None）。
+    /// 落とす先への操作。ピン留めの行・フォルダは移動（`RowCommand::Place`）、履歴の行はツリーのピン留めへの
+    /// ピン留め（`RowCommand::Pin`）。一覧の上の落とす先は、一覧に落とせないドラッグには None。
     fn command(&self, mark: DropMark) -> Option<RowCommand> {
         match (self.target.pinned, mark) {
-            (true, DropMark::Before(before)) => Some(RowCommand::Place { to: self.folder, before }),
-            (true, DropMark::Into(folder)) => Some(RowCommand::Place { to: Some(folder), before: None }),
+            (true, DropMark::Before(before)) => self.list_folder.map(|to| RowCommand::Place { to, before }),
+            (true, DropMark::Into(folder)) => {
+                self.list_folder.map(|_| RowCommand::Place { to: Some(folder), before: None })
+            }
             (true, DropMark::Tree(folder)) => Some(RowCommand::Place { to: folder, before: None }),
             (false, DropMark::Tree(folder)) => Some(RowCommand::Pin(folder)),
             (false, DropMark::Before(_) | DropMark::Into(_)) => None,
@@ -3080,8 +3085,8 @@ fn list_drop_mark(rows: &[Row], dragged: Uuid, hit: Option<(usize, i32, i32)>) -
 }
 
 /// ツリーの `point`（ツリーのクライアント座標）の項目へ落とす先（ピン留めのルート・フォルダ）。ピン留めでない
-/// 項目は None。ピン留めの行では、ドラッグしているフォルダ自身とその中、一覧に出しているフォルダ（今いる所）も
-/// None（履歴の行はどのピン留めへも入れられる）。
+/// 項目は None。ピン留めの行・フォルダでは、ドラッグしているフォルダ自身とその中、今いるフォルダも None
+/// （履歴の行はどのピン留めへも入れられる）。
 unsafe fn tree_drop_mark(ctx: &WindowCtx, tree: HWND, point: POINT, drag: &RowDrag) -> Option<DropMark> {
     let item = unsafe { tree_item_at_point(tree, point) };
     if item.0 == 0 {
@@ -3090,23 +3095,31 @@ unsafe fn tree_drop_mark(ctx: &WindowCtx, tree: HWND, point: POINT, drag: &RowDr
     let Some(Source::Pinned(folder)) = (unsafe { tree_item_source(ctx, tree, item) }) else {
         return None;
     };
-    if drag.target.pinned && folder == drag.folder {
+    if drag.target.pinned && folder == drag.parent {
         return None;
     }
-    if drag.target.folder {
-        // 項目から根へ辿り、ドラッグしているフォルダがあれば、その中（か自身）
-        let dragged = Source::Pinned(Some(drag.target.id));
-        let mut at = item;
-        while at.0 != 0 {
-            if unsafe { tree_item_source(ctx, tree, at) } == Some(dragged) {
-                return None;
-            }
-            at = HTREEITEM(unsafe {
-                SendMessageW(tree, TVM_GETNEXTITEM, Some(WPARAM(TVGN_PARENT as usize)), Some(LPARAM(at.0))).0
-            });
-        }
+    if drag.target.folder && unsafe { tree_item_within(ctx, tree, item, drag.target.id) } {
+        return None;
     }
     Some(DropMark::Tree(folder))
+}
+
+/// ツリーの項目の親の項目（無ければ 0）。
+unsafe fn tree_parent_item(tree: HWND, item: HTREEITEM) -> HTREEITEM {
+    HTREEITEM(unsafe { SendMessageW(tree, TVM_GETNEXTITEM, Some(WPARAM(TVGN_PARENT as usize)), Some(LPARAM(item.0))).0 })
+}
+
+/// ツリーの項目が、ピン留めのフォルダ `folder` 自身かその中か（項目から根へ辿って探す）。
+unsafe fn tree_item_within(ctx: &WindowCtx, tree: HWND, item: HTREEITEM, folder: Uuid) -> bool {
+    let wanted = Source::Pinned(Some(folder));
+    let mut at = item;
+    while at.0 != 0 {
+        if unsafe { tree_item_source(ctx, tree, at) } == Some(wanted) {
+            return true;
+        }
+        at = unsafe { tree_parent_item(tree, at) };
+    }
+    false
 }
 
 /// 窓のクライアント座標 `point` が `child` の中にあれば、`child` のクライアント座標を返す。
@@ -3122,14 +3135,12 @@ unsafe fn point_in_child(hwnd: HWND, child: HWND, point: POINT) -> Option<POINT>
 }
 
 /// 窓のクライアント座標 `point` で落とす先（一覧の上なら行の間・フォルダの行、ツリーの上ならピン留めの項目）。
-/// 履歴の行は、一覧の上には落とせない（ツリーのピン留めだけ）。
+/// 一覧の上は、一覧に落とせるドラッグ（`RowDrag::list_folder`）だけ。
 unsafe fn drop_mark_at(hwnd: HWND, ctx: &WindowCtx, drag: &RowDrag, point: POINT) -> Option<DropMark> {
     unsafe {
         if let Ok(list) = GetDlgItem(Some(hwnd), ID_LIST) {
             if let Some(p) = point_in_child(hwnd, list, point) {
-                if !drag.target.pinned {
-                    return None;
-                }
+                drag.list_folder?;
                 let mut hit = LVHITTESTINFO { pt: p, ..Default::default() };
                 let index = SendMessageW(list, LVM_HITTEST, Some(WPARAM(0)), Some(LPARAM(&mut hit as *mut _ as isize))).0;
                 let hit = match usize::try_from(index) {
@@ -3197,12 +3208,12 @@ fn set_drag_cursor(droppable: bool) {
     }
 }
 
-/// 一覧の行のドラッグを始める（`LVN_BEGINDRAG`）。ドラッグできる行（ハンドラが決める）だけで、名前の編集中・
-/// メニューやダイアログの表示中・境目のドラッグ中は始めない。ピン留めの行は、一覧に出しているフォルダを
-/// ツリーで選んでいる項目から決める（ピン留めでなければ始めない）。始めたら窓がマウスを捕まえ、離すまで
-/// `WM_MOUSEMOVE`・`WM_LBUTTONUP` を受け取る（境目のドラッグと同じ）。
+/// 一覧の行のドラッグを始める（`LVN_BEGINDRAG`）。ドラッグできる行（ハンドラが決める）だけで、始めない場合は
+/// `can_begin_drag`。ピン留めの行は、一覧に出しているフォルダ（今いるフォルダ）をツリーで選んでいる項目から
+/// 決める（ピン留めでなければ始めない）。履歴の行は一覧の上には落とせない。始めたら窓がマウスを捕まえる
+/// （`start_drag`。境目のドラッグと同じ）。
 fn begin_row_drag(hwnd: HWND, ctx: &WindowCtx, index: i32) {
-    if !can_open_dialog(ctx) || ctx.drag.get().is_some() || ctx.row_drag.get().is_some() {
+    if !can_begin_drag(ctx) {
         return;
     }
     let Some(target) = usize::try_from(index).ok().and_then(|i| ctx.view.borrow().rows.get(i).map(Row::target)) else {
@@ -3223,7 +3234,50 @@ fn begin_row_drag(hwnd: HWND, ctx: &WindowCtx, index: i32) {
     if !handler.can_drag_row(target) {
         return;
     }
-    ctx.row_drag.set(Some(RowDrag { target, folder, mark: None }));
+    let list_folder = target.pinned.then_some(folder);
+    start_drag(hwnd, ctx, RowDrag { target, parent: folder, list_folder, mark: None });
+}
+
+/// ツリーのピン留めのフォルダのドラッグを始める（`TVN_BEGINDRAG`）。ルートの「ピン留め」・履歴の項目は
+/// ドラッグしない。始めない場合は一覧の行と同じ（`can_begin_drag`）。今いるフォルダはツリーの親の項目から
+/// 決める。一覧の上に落とせるのは、一覧にピン留めのフォルダを出していて、行を動かせるとき（ハンドラが決める。
+/// 検索中は動かせない）で、それがドラッグしているフォルダ自身でもその中でもないときだけ。
+fn begin_tree_drag(hwnd: HWND, ctx: &WindowCtx, item: HTREEITEM) {
+    if !can_begin_drag(ctx) {
+        return;
+    }
+    let Ok(tree) = (unsafe { GetDlgItem(Some(hwnd), ID_TREE) }) else {
+        return;
+    };
+    let Some(Source::Pinned(Some(id))) = (unsafe { tree_item_source(ctx, tree, item) }) else {
+        return;
+    };
+    let Some(Source::Pinned(parent)) = (unsafe { tree_item_source(ctx, tree, tree_parent_item(tree, item)) }) else {
+        return;
+    };
+    let target = RowTarget { id, pinned: true, folder: true };
+    let handler = Rc::clone(&ctx.handler);
+    let selected = HTREEITEM(unsafe { SendMessageW(tree, TVM_GETNEXTITEM, Some(WPARAM(TVGN_CARET as usize)), None).0 });
+    let list_folder = match unsafe { tree_item_source(ctx, tree, selected) } {
+        Some(Source::Pinned(folder))
+            if handler.can_drag_row(target) && !unsafe { tree_item_within(ctx, tree, selected, id) } =>
+        {
+            Some(folder)
+        }
+        _ => None,
+    };
+    start_drag(hwnd, ctx, RowDrag { target, parent, list_folder, mark: None });
+}
+
+/// ドラッグを始めてよいか（名前の編集中・メニューやダイアログの表示中・境目や行のドラッグ中・右ボタンでの
+/// 取り消しの後の右ボタンを離す待ちの間は始めない）。
+fn can_begin_drag(ctx: &WindowCtx) -> bool {
+    can_open_dialog(ctx) && ctx.drag.get().is_none() && ctx.row_drag.get().is_none() && !ctx.row_drag_right_up.get()
+}
+
+/// ドラッグを始める: 状態を置いて、窓がマウスを捕まえる（離すまで `WM_MOUSEMOVE`・`WM_LBUTTONUP` を受け取る）。
+fn start_drag(hwnd: HWND, ctx: &WindowCtx, drag: RowDrag) {
+    ctx.row_drag.set(Some(drag));
     unsafe {
         SetCapture(hwnd);
     }
@@ -3857,10 +3911,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         LRESULT(0)
                     }
-                    // 左ボタンでの行のドラッグ（ピン留めの行の移動）。マウスは窓が捕まえる
+                    // 左ボタンでの行のドラッグ（ピン留めの行の移動、履歴の行のピン留め）。マウスは窓が捕まえる
                     (ID_LIST, LVN_BEGINDRAG) => {
                         let nm = &*(lparam.0 as *const NMLISTVIEW);
                         begin_row_drag(hwnd, ctx, nm.iItem);
+                        LRESULT(0)
+                    }
+                    // 左ボタンでのツリーの項目のドラッグ（ピン留めのフォルダの移動）。マウスは窓が捕まえる
+                    (ID_TREE, TVN_BEGINDRAGW) => {
+                        let nm = &*(lparam.0 as *const NMTREEVIEWW);
+                        begin_tree_drag(hwnd, ctx, nm.itemNew.hItem);
                         LRESULT(0)
                     }
                     (ID_LIST, LVN_KEYDOWN) => {
@@ -6687,11 +6747,16 @@ mod tests {
         assert_eq!(at(&b, 0, 30), Some(DropMark::Before(Some(folder.id))));
 
         // ピン留めの行は移動、履歴の行はツリーのピン留めへのピン留めだけ
-        let drag = RowDrag { target: a.target(), folder: Some(Uuid::nil()), mark: None };
+        let drag = RowDrag { target: a.target(), parent: Some(Uuid::nil()), list_folder: Some(Some(Uuid::nil())), mark: None };
         assert_eq!(drag.command(DropMark::Before(None)), Some(RowCommand::Place { to: Some(Uuid::nil()), before: None }));
         assert_eq!(drag.command(DropMark::Into(folder.id)), Some(RowCommand::Place { to: Some(folder.id), before: None }));
         assert_eq!(drag.command(DropMark::Tree(None)), Some(RowCommand::Place { to: None, before: None }));
-        let history = RowDrag { target: row("h").target(), folder: None, mark: None };
+        // 一覧に落とせないドラッグ（検索中のツリーのフォルダなど）は、一覧の上の落とす先を操作にしない
+        let tree_only = RowDrag { list_folder: None, ..drag };
+        assert_eq!(tree_only.command(DropMark::Before(None)), None);
+        assert_eq!(tree_only.command(DropMark::Into(folder.id)), None);
+        assert_eq!(tree_only.command(DropMark::Tree(None)), Some(RowCommand::Place { to: None, before: None }));
+        let history = RowDrag { target: row("h").target(), parent: None, list_folder: None, mark: None };
         assert_eq!(history.command(DropMark::Tree(Some(folder.id))), Some(RowCommand::Pin(Some(folder.id))));
         assert_eq!(history.command(DropMark::Tree(None)), Some(RowCommand::Pin(None)));
         assert_eq!(history.command(DropMark::Before(None)), None);
@@ -6868,6 +6933,153 @@ mod tests {
         );
     }
 
+    /// ツリー（「履歴」、「ピン留め」の下に f（その下に g）と h）と、ルートの中身の一覧（f の行・項目 p の行・h の行）を
+    /// 作り、「ピン留め」を選んで表示する。戻り値の ID は f・g・h・p、ツリーの項目は 履歴・ピン留め・f・g・h の順。
+    fn window_with_folder_tree() -> (ViewerWindow, Rc<Recorder>, HWND, [Uuid; 4], [HTREEITEM; 5]) {
+        use crate::native::model::FolderCounts;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE;
+        let (f, g, h) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (window, recorder) = create_test_window();
+        let hwnd = window.hwnd();
+        let folder_node = |id: Uuid, label: &str, children: Vec<TreeNode>| TreeNode {
+            label: label.into(),
+            source: Source::Pinned(Some(id)),
+            children,
+        };
+        let nodes = vec![
+            TreeNode { label: HISTORY_LABEL.into(), source: Source::History, children: vec![] },
+            TreeNode {
+                label: "ピン留め".into(),
+                source: Source::Pinned(None),
+                children: vec![folder_node(f, "f", vec![folder_node(g, "g", vec![])]), folder_node(h, "h", vec![])],
+            },
+        ];
+        set_tree(hwnd, &nodes, Source::Pinned(None));
+        let tree = unsafe { GetDlgItem(Some(hwnd), ID_TREE).unwrap() };
+        let ctx = unsafe { ctx_ref(hwnd) }.unwrap();
+        let item = |source| unsafe { find_tree_item(ctx, tree, source) }.unwrap();
+        let items = [
+            item(Source::History),
+            item(Source::Pinned(None)),
+            item(Source::Pinned(Some(f))),
+            item(Source::Pinned(Some(g))),
+            item(Source::Pinned(Some(h))),
+        ];
+        unsafe {
+            SendMessageW(tree, TVM_EXPAND, Some(WPARAM(TVE_EXPAND.0 as usize)), Some(LPARAM(items[2].0)));
+        }
+        let folder_row = |id: Uuid, label: &str| Row { id, pinned: true, folder: Some(FolderCounts { items: 0, folders: 0 }), ..row(label) };
+        let p = Row { pinned: true, ..row("p") };
+        let ids = [f, g, h, p.id];
+        set_rows(hwnd, vec![folder_row(f, "f"), p, folder_row(h, "h")], false);
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        pump(hwnd, 20);
+        (window, recorder, tree, ids, items)
+    }
+
+    /// `TVN_BEGINDRAG` を窓へ送る（ツリーの `item` のドラッグの始まり）。
+    fn begin_tree_drag_message(hwnd: HWND, tree: HWND, item: HTREEITEM) {
+        let mut nm = NMTREEVIEWW {
+            hdr: NMHDR { hwndFrom: tree, idFrom: ID_TREE as usize, code: TVN_BEGINDRAGW },
+            itemNew: TVITEMW { hItem: item, ..Default::default() },
+            ..Default::default()
+        };
+        unsafe {
+            SendMessageW(hwnd, WM_NOTIFY, Some(WPARAM(ID_TREE as usize)), Some(LPARAM(&mut nm as *mut _ as isize)));
+        }
+    }
+
+    /// ツリーの `from` をドラッグし、`to`（窓のクライアント座標）へ動かして離す。動かした後の落とす先を返す。離した
+    /// 後はマウスを放し、ツリーの強調が消えている。
+    fn drag_tree_item(window: &ViewerWindow, tree: HWND, from: HTREEITEM, to: POINT) -> Option<DropMark> {
+        let hwnd = window.hwnd();
+        begin_tree_drag_message(hwnd, tree, from);
+        assert_eq!(unsafe { GetCapture() }, hwnd, "ツリーのフォルダのドラッグを始めない");
+        mouse(hwnd, WM_MOUSEMOVE, to);
+        let mark = drop_mark(hwnd);
+        mouse(hwnd, WM_LBUTTONUP, to);
+        assert_ne!(unsafe { GetCapture() }, hwnd, "離した後もマウスを捕まえている");
+        assert_eq!(tree_item_at(tree, TVGN_DROPHILITE).0, 0, "離した後も強調が残っている");
+        mark
+    }
+
+    /// ツリーのピン留めのフォルダのドラッグ: ツリーのほかのフォルダ・ルートの上で離すとその末尾へ、一覧の行の間・
+    /// フォルダの行の上で離すと一覧に出しているフォルダのその位置・そのフォルダの中へ移す。自分・自分の中・今いる
+    /// フォルダ・「履歴」の上には落とせない。
+    #[test]
+    fn dragging_tree_folder_moves_it_into_tree_or_list() {
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let (window, recorder, tree, [f, g, h, p], [history, root, f_item, g_item, h_item]) = window_with_folder_tree();
+        let at = |item| tree_item_point(&window, tree, item);
+        let drag = |from, to| drag_tree_item(&window, tree, from, to);
+
+        assert_eq!(drag(f_item, at(h_item)), Some(DropMark::Tree(Some(h))));
+        assert_eq!(drag(f_item, at(f_item)), None, "自分へ落とせる");
+        assert_eq!(drag(f_item, at(g_item)), None, "自分の中へ落とせる");
+        assert_eq!(drag(f_item, at(root)), None, "今いるフォルダへ落とせる");
+        assert_eq!(drag(f_item, at(history)), None);
+        // 一覧（ルート）: h の行の下端は末尾、真ん中は h の中
+        assert_eq!(drag(f_item, list_row_point(&window, 2, 0.9)), Some(DropMark::Before(None)));
+        assert_eq!(drag(f_item, list_row_point(&window, 2, 0.5)), Some(DropMark::Into(h)));
+        // f の中の g: 今いる f へは落とせず、ルートへは落とせる。一覧（ルート）の p の前へも落とせる
+        assert_eq!(drag(g_item, at(f_item)), None);
+        assert_eq!(drag(g_item, at(root)), Some(DropMark::Tree(None)));
+        assert_eq!(drag(g_item, list_row_point(&window, 1, 0.1)), Some(DropMark::Before(Some(p))));
+        assert_eq!(
+            recorder.commands.borrow().as_slice(),
+            [
+                (f, RowCommand::Place { to: Some(h), before: None }),
+                (f, RowCommand::Place { to: None, before: None }),
+                (f, RowCommand::Place { to: Some(h), before: None }),
+                (g, RowCommand::Place { to: None, before: None }),
+                (g, RowCommand::Place { to: None, before: Some(p) }),
+            ]
+        );
+        assert!(recorder.selected.borrow().is_empty(), "ドラッグでツリーの選択が変わった");
+    }
+
+    /// ツリーのフォルダのドラッグで一覧の上に落とせないのは、一覧にそのフォルダ自身かその中を出しているとき、行を
+    /// 動かせないとき（検索中）、ピン留めでないものを出しているとき。そのときもツリーの上へは落とせる。ルートの
+    /// 「ピン留め」と「履歴」はドラッグを始めない。
+    #[test]
+    fn tree_folder_drag_drops_on_list_only_when_list_is_outside_it() {
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let (window, recorder, tree, [f, _g, h, _p], [history, root, f_item, g_item, h_item]) = window_with_folder_tree();
+        let hwnd = window.hwnd();
+        let select = |item: HTREEITEM| unsafe {
+            SendMessageW(tree, TVM_SELECTITEM, Some(WPARAM(TVGN_CARET as usize)), Some(LPARAM(item.0)));
+        };
+        let on_list = list_row_point(&window, 2, 0.9);
+        let to_h = tree_item_point(&window, tree, h_item);
+        let drag = |from, to| drag_tree_item(&window, tree, from, to);
+
+        select(f_item);
+        assert_eq!(drag(f_item, on_list), None, "自分を出している一覧へ落とせる");
+        select(g_item);
+        assert_eq!(drag(f_item, on_list), None, "自分の中を出している一覧へ落とせる");
+        assert_eq!(drag(f_item, to_h), Some(DropMark::Tree(Some(h))));
+        select(h_item);
+        assert_eq!(drag(f_item, on_list), Some(DropMark::Before(None)), "ほかのフォルダを出している一覧へ落とせない");
+        select(root);
+        recorder.no_drag.set(true);
+        assert_eq!(drag(f_item, on_list), None, "検索中の一覧へ落とせる");
+        recorder.no_drag.set(false);
+        select(history);
+        assert_eq!(drag(f_item, on_list), None, "履歴の一覧へ落とせる");
+
+        for item in [root, history] {
+            begin_tree_drag_message(hwnd, tree, item);
+            assert!(unsafe { ctx_ref(hwnd) }.unwrap().row_drag.get().is_none(), "ルート・履歴のドラッグを始めた");
+            assert_ne!(unsafe { GetCapture() }, hwnd);
+        }
+        assert_eq!(
+            recorder.commands.borrow().as_slice(),
+            [(f, RowCommand::Place { to: Some(h), before: None }), (f, RowCommand::Place { to: Some(h), before: None })]
+        );
+    }
+
     /// 右ボタンでの取り消し: 押すとドラッグを取り消して目印を消すが、右ボタンを離すまでマウスを捕まえたままにし、
     /// その間に左ボタンを離しても落とさない。右ボタンを離すとマウスを放す。待っている間に隠す・終了の要求
     /// （`cancel_modal`）が来ても放す。ドラッグしていないときの右ボタンは扱わない。
@@ -6908,11 +7120,18 @@ mod tests {
         assert!(recorder.commands.borrow().is_empty(), "取り消したドラッグで移動を伝えた");
     }
 
-    /// 実際のマウスの入力で、一覧の `from` の行を押して `over` の行の真ん中まで動かす。押して動かす・離すのは別の
-    /// スレッドから行い（一覧はドラッグを検知するまで押下の処理から戻らない）、このスレッドはメッセージを処理し続ける。
-    /// 動かし終えたときに、窓がマウスを捕まえているかと落とす先の目印を記録して返す。その後、`right_cancel` なら
-    /// 右ボタンを押して離してから、左ボタンを離す（そうでなければ左ボタンを離すだけ）。カーソルは最後に元へ戻す。
-    fn real_mouse_drag(window: &ViewerWindow, from: usize, over: usize, right_cancel: bool) -> Option<(bool, Option<DropMark>)> {
+    /// 実際のマウスの入力で、`from` を押して `over` まで動かす（どちらも窓のクライアント座標。`from` の下は子の窓
+    /// `press_on` のはず）。押して動かす・離すのは別のスレッドから行い（一覧・ツリーはドラッグを検知するまで押下の
+    /// 処理から戻らない）、このスレッドはメッセージを処理し続ける。動かし終えたときに、窓がマウスを捕まえているかと
+    /// 落とす先の目印を記録して返す。その後、`right_cancel` なら右ボタンを押して離してから、左ボタンを離す（そうで
+    /// なければ左ボタンを離すだけ）。カーソルは最後に元へ戻す。
+    fn real_mouse_drag(
+        window: &ViewerWindow,
+        press_on: HWND,
+        from: POINT,
+        over: POINT,
+        right_cancel: bool,
+    ) -> Option<(bool, Option<DropMark>)> {
         use std::sync::mpsc;
         use windows::Win32::UI::Input::KeyboardAndMouse::{
             SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_RIGHTDOWN,
@@ -6929,8 +7148,8 @@ mod tests {
             let _ = unsafe { ClientToScreen(hwnd, &mut p) };
             (p.x, p.y)
         };
-        let from = to_screen(list_row_point(window, from, 0.5));
-        let over = to_screen(list_row_point(window, over, 0.5));
+        let from = to_screen(from);
+        let over = to_screen(over);
         let under = unsafe { windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(POINT { x: from.0, y: from.1 }) };
         let (mut rect, ex) = (RECT::default(), unsafe {
             windows::Win32::UI::WindowsAndMessaging::GetWindowLongW(hwnd, windows::Win32::UI::WindowsAndMessaging::GWL_EXSTYLE)
@@ -6938,8 +7157,8 @@ mod tests {
         let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect) };
         assert_eq!(
             under,
-            list(window),
-            "押す位置 {from:?} の下が一覧ではない（窓 {rect:?}、拡張スタイル {ex:#x}、表示 {}）",
+            press_on,
+            "押す位置 {from:?} の下が押すはずの窓ではない（窓 {rect:?}、拡張スタイル {ex:#x}、表示 {}）",
             is_visible(hwnd)
         );
         let mut saved = POINT::default();
@@ -6958,7 +7177,7 @@ mod tests {
             pause(100);
             // ドラッグと判定される幅を超えるよう、少しずつ動かす
             for step in 1..=10 {
-                unsafe { SetCursorPos(from.0, from.1 + (over.1 - from.1) * step / 10) }.unwrap();
+                unsafe { SetCursorPos(from.0 + (over.0 - from.0) * step / 10, from.1 + (over.1 - from.1) * step / 10) }.unwrap();
                 pause(30);
             }
             pause(100);
@@ -6996,10 +7215,35 @@ mod tests {
     fn real_mouse_drag_moves_row_into_folder() {
         let _gui = crate::tray::lock_gui_resource_tests();
         let (window, recorder, [folder, item, _]) = window_with_folder_row();
-        let during = real_mouse_drag(&window, 1, 0, false);
+        let during = real_mouse_drag(&window, list(&window), list_row_point(&window, 1, 0.5), list_row_point(&window, 0, 0.5), false);
         assert_eq!(during, Some((true, Some(DropMark::Into(folder)))), "ドラッグが始まらない・目印が違う");
         assert_ne!(unsafe { GetCapture() }, window.hwnd());
         assert_eq!(recorder.commands.borrow().as_slice(), [(item, RowCommand::Place { to: Some(folder), before: None })]);
+    }
+
+    /// 実際のマウスの入力で、ツリーのピン留めのフォルダを押して動かすとツリーがドラッグを検知し（`TVN_BEGINDRAG`）、
+    /// 窓がマウスを捕まえる。押してもツリーの選択（一覧に出しているフォルダ）は変わらないので、一覧の上にも落とせる。
+    /// ツリーのほかのフォルダの上で離すとその中へ、一覧の最後の行の下端で離すと一覧のフォルダの末尾へ移す。
+    /// マウスのカーソルを動かす（終わったら戻す）ので、通常の実行では動かさない。
+    #[test]
+    #[ignore]
+    fn real_mouse_tree_folder_drag_moves_into_tree_and_list() {
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let (window, recorder, tree, [f, _g, h, _p], [_history, _root, f_item, _g_item, h_item]) = window_with_folder_tree();
+        let hwnd = window.hwnd();
+        let ctx = unsafe { ctx_ref(hwnd) }.unwrap();
+        let during = real_mouse_drag(&window, tree, tree_item_point(&window, tree, f_item), tree_item_point(&window, tree, h_item), false);
+        assert_eq!(during, Some((true, Some(DropMark::Tree(Some(h))))), "ドラッグが始まらない・目印が違う");
+        assert_eq!(unsafe { selected_tree_source(ctx, tree) }, Some(Source::Pinned(None)), "押してツリーの選択が変わった");
+        let during = real_mouse_drag(&window, tree, tree_item_point(&window, tree, f_item), list_row_point(&window, 2, 0.9), false);
+        assert_eq!(during, Some((true, Some(DropMark::Before(None)))), "一覧の上に落とせない");
+        assert_eq!(unsafe { selected_tree_source(ctx, tree) }, Some(Source::Pinned(None)));
+        assert_ne!(unsafe { GetCapture() }, hwnd);
+        assert!(recorder.selected.borrow().is_empty(), "ドラッグで表示元の切り替えを伝えた");
+        assert_eq!(
+            recorder.commands.borrow().as_slice(),
+            [(f, RowCommand::Place { to: Some(h), before: None }), (f, RowCommand::Place { to: None, before: None })]
+        );
     }
 
     /// 実際のマウスの入力で、ドラッグ中に右クリックすると取り消され、その後に左ボタンを離しても移動を伝えない。
@@ -7010,7 +7254,7 @@ mod tests {
     fn real_mouse_right_click_cancels_drag_without_menu() {
         let _gui = crate::tray::lock_gui_resource_tests();
         let (window, recorder, [folder, ..]) = window_with_folder_row();
-        let during = real_mouse_drag(&window, 1, 0, true);
+        let during = real_mouse_drag(&window, list(&window), list_row_point(&window, 1, 0.5), list_row_point(&window, 0, 0.5), true);
         assert_eq!(during, Some((true, Some(DropMark::Into(folder)))), "ドラッグが始まらない・目印が違う");
         let ctx = unsafe { ctx_ref(window.hwnd()) }.unwrap();
         assert!(ctx.row_drag.get().is_none() && !ctx.row_drag_right_up.get());
