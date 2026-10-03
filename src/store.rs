@@ -204,6 +204,61 @@ pub fn shift_bounds(nodes: &[PinnedNode], id: Uuid) -> Option<(bool, bool)> {
     Some((pos > 0, pos + 1 < siblings.len()))
 }
 
+/// `move_node` で移せない理由。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveError {
+    /// 移すノードが無い
+    NotFound,
+    /// 入れる先のフォルダが無い、または `before` が入れる先の子に無い
+    TargetNotFound,
+    /// フォルダを、それ自身かその中のフォルダへ入れようとした
+    IntoItself,
+    /// 入れる先に同じ名前のフォルダがある（フォルダを別の親へ移すときだけ見る）
+    DuplicateName,
+}
+
+/// 指定idのノード（項目・フォルダ）を、`to`（None はルート）の子の `before` の前（None は末尾）へ移す。
+/// フォルダは中身ごと動く。判定の順: 移すノードが無い → `NotFound`、入れる先のフォルダが無い →
+/// `TargetNotFound`、入れる先が自分かその中 → `IntoItself`、`before` が入れる先の子に無い →
+/// `TargetNotFound`、フォルダを別の親へ移すとき入れる先に同じ名前のフォルダがある → `DuplicateName`
+/// （同じ親の中の並べ替えでは見ない）。今と同じ位置になるなら何もせず Ok(false)。`before` が自分なら、
+/// 今の位置のまま（入れる先が今の親でなければ `TargetNotFound`）。
+pub fn move_node(nodes: &mut Vec<PinnedNode>, id: Uuid, to: Option<Uuid>, before: Option<Uuid>) -> Result<bool, MoveError> {
+    let parent = parent_of(nodes, id).ok_or(MoveError::NotFound)?;
+    if let Some(folder) = to {
+        find_folder(nodes, folder).ok_or(MoveError::TargetNotFound)?;
+        if folder == id || find_folder(nodes, id).is_some_and(|moving| find_folder(&moving.children, folder).is_some()) {
+            return Err(MoveError::IntoItself);
+        }
+    }
+    let siblings = find_children(nodes, to).ok_or(MoveError::TargetNotFound)?;
+    let at = match before {
+        Some(b) if b == id => return if parent == to { Ok(false) } else { Err(MoveError::TargetNotFound) },
+        Some(b) => Some(siblings.iter().position(|n| n.id() == b).ok_or(MoveError::TargetNotFound)?),
+        None => None,
+    };
+    if parent == to {
+        let pos = siblings.iter().position(|n| n.id() == id).ok_or(MoveError::NotFound)?;
+        let unchanged = match at {
+            Some(at) => at == pos + 1,
+            None => pos + 1 == siblings.len(),
+        };
+        if unchanged {
+            return Ok(false);
+        }
+    } else if let Some(moving) = find_folder(nodes, id) {
+        if has_sibling_folder_named(siblings, normalize_folder_name(&moving.title), None) {
+            return Err(MoveError::DuplicateName);
+        }
+    }
+    let node = remove_node(nodes, id).ok_or(MoveError::NotFound)?;
+    let children = children_mut(nodes, to).ok_or(MoveError::TargetNotFound)?;
+    // 取り除いた後の位置で入れる（同じ親の中で前から後ろへ移すと、`before` の位置が1つ詰まる）
+    let at = before.and_then(|b| children.iter().position(|n| n.id() == b)).unwrap_or(children.len());
+    children.insert(at, node);
+    Ok(true)
+}
+
 /// フォルダ名の正規化（前後の空白を除く）。作成・名前の変更・同じ名前の判定で共用する
 /// （比較は正規化した後の完全一致で、大文字小文字を区別する）。
 pub fn normalize_folder_name(name: &str) -> &str {
@@ -549,6 +604,76 @@ mod tests {
         assert_eq!(find_children(&tree, Some(folder_id)).map(ids), Some(vec![nested_folder_id, item_b]));
         assert_eq!(shift_node(&mut tree, item_c, Direction::Up), Some(false));
         assert_eq!(shift_node(&mut tree, Uuid::new_v4(), Direction::Up), None);
+    }
+
+    /// 移動: 同じ親の中では `before` の前（前からも後ろからも）・末尾へ並べ替え、今と同じ位置なら Ok(false)。
+    /// 別の親へは項目もフォルダ（中身ごと）も移す。自分・自分の中へは入れず、入れる先・`before` が無ければ
+    /// 断る。どの失敗でもツリーを変えない。
+    #[test]
+    fn move_node_places_before_sibling_and_refuses_cycles() {
+        let (mut tree, item_a, item_b, item_c, folder_id, nested_folder_id) = nested_tree();
+        let ids = |nodes: &[PinnedNode]| nodes.iter().map(PinnedNode::id).collect::<Vec<_>>();
+        let inside = |tree: &[PinnedNode], folder| find_children(tree, Some(folder)).map(ids).unwrap();
+
+        // 今と同じ位置: 自分の前・すぐ後ろの兄弟の前・末尾の末尾
+        assert_eq!(move_node(&mut tree, item_b, Some(folder_id), Some(item_b)), Ok(false));
+        assert_eq!(move_node(&mut tree, item_b, Some(folder_id), Some(nested_folder_id)), Ok(false));
+        assert_eq!(move_node(&mut tree, nested_folder_id, Some(folder_id), None), Ok(false));
+        // 同じ親の中: 前から後ろ（末尾）へ、後ろから前へ
+        assert_eq!(move_node(&mut tree, item_b, Some(folder_id), None), Ok(true));
+        assert_eq!(inside(&tree, folder_id), [nested_folder_id, item_b]);
+        assert_eq!(move_node(&mut tree, item_b, Some(folder_id), Some(nested_folder_id)), Ok(true));
+        assert_eq!(inside(&tree, folder_id), [item_b, nested_folder_id]);
+
+        // 別の親へ: 入れ子の項目をルートのフォルダの前へ、フォルダを中身ごとルートの末尾へ
+        assert_eq!(move_node(&mut tree, item_c, None, Some(folder_id)), Ok(true));
+        assert_eq!(ids(&tree), [item_a, item_c, folder_id]);
+        let PinnedNode::Folder(nested) = &mut find_children_mut_for_test(&mut tree, folder_id)[1] else { panic!() };
+        nested.title = "中".into();
+        nested.children.push(pinned_item(Uuid::new_v4()));
+        assert_eq!(move_node(&mut tree, nested_folder_id, None, None), Ok(true));
+        assert_eq!(ids(&tree), [item_a, item_c, folder_id, nested_folder_id]);
+        assert_eq!(inside(&tree, nested_folder_id).len(), 1, "フォルダの中身が付いてこない");
+        assert_eq!(inside(&tree, folder_id), [item_b]);
+
+        // 断る（どれもツリーを変えない）
+        assert_eq!(move_node(&mut tree, nested_folder_id, Some(folder_id), None), Ok(true));
+        let before = ids(&tree);
+        assert_eq!(move_node(&mut tree, folder_id, Some(folder_id), None), Err(MoveError::IntoItself));
+        assert_eq!(move_node(&mut tree, folder_id, Some(nested_folder_id), None), Err(MoveError::IntoItself));
+        assert_eq!(move_node(&mut tree, Uuid::new_v4(), None, None), Err(MoveError::NotFound));
+        assert_eq!(move_node(&mut tree, item_a, Some(Uuid::new_v4()), None), Err(MoveError::TargetNotFound));
+        assert_eq!(move_node(&mut tree, item_a, Some(folder_id), Some(item_c)), Err(MoveError::TargetNotFound));
+        assert_eq!(move_node(&mut tree, item_a, Some(folder_id), Some(item_a)), Err(MoveError::TargetNotFound));
+        assert_eq!(ids(&tree), before);
+        assert_eq!(inside(&tree, folder_id), [item_b, nested_folder_id]);
+    }
+
+    /// フォルダを別の親へ移すときは、入れる先に同じ名前（前後の空白を除いて比べる）のフォルダがあれば断る。
+    /// 同じ親の中の並べ替えと項目の移動では見ない（手で書いたファイルにある同名の兄弟でも並べ替えられる）。
+    #[test]
+    fn move_node_refuses_duplicate_folder_name_only_across_parents() {
+        let (mut tree, item_a, item_b, _c, folder_id, nested_folder_id) = nested_tree();
+        let rename_nested = |tree: &mut Vec<PinnedNode>, title: &str| {
+            let PinnedNode::Folder(nested) = &mut find_children_mut_for_test(tree, folder_id)[1] else { panic!() };
+            nested.title = title.into();
+        };
+        // ルートの「folder」と、その中の「folder」（nested_tree はどちらも同じ名前）
+        assert_eq!(move_node(&mut tree, nested_folder_id, None, None), Err(MoveError::DuplicateName));
+        rename_nested(&mut tree, " folder ");
+        assert_eq!(move_node(&mut tree, nested_folder_id, None, None), Err(MoveError::DuplicateName));
+        rename_nested(&mut tree, "Folder");
+        assert_eq!(move_node(&mut tree, nested_folder_id, None, None), Ok(true), "大文字小文字を区別していない");
+        // 項目は名前を見ない
+        assert_eq!(move_node(&mut tree, item_b, None, Some(folder_id)), Ok(true));
+
+        let twin = Uuid::new_v4();
+        let mut dup = vec![pinned_folder(twin, vec![]), pinned_folder(Uuid::new_v4(), vec![]), pinned_item(item_a)];
+        assert_eq!(move_node(&mut dup, twin, None, None), Ok(true), "同じ親の中の並べ替えで同じ名前を見た");
+    }
+
+    fn find_children_mut_for_test(tree: &mut Vec<PinnedNode>, folder: Uuid) -> &mut Vec<PinnedNode> {
+        children_mut(tree, Some(folder)).unwrap()
     }
 
     /// 同じ名前の判定は前後の空白を除いて比べ、大文字小文字を区別し、除く ID は比べない。項目は数えない。

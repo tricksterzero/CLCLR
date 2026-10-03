@@ -1135,7 +1135,8 @@ impl ViewerHandler for App {
     /// 行がピン留めの項目ならピン留めから、そうでなければ履歴から探し、その形式から決める。
     /// ロックの中では読み込み元（メタデータと resident の `Arc`）を写すだけ。
     /// ピン留めの入れる先の並び（ルートとフォルダ）と、ピン留めの行なら今いる所も、メタデータから
-    /// 組み立てる。フォルダの行は、そのフォルダがあれば、開く・名前の変更・削除と並べ替えだけ。
+    /// 組み立てる。フォルダの行は、そのフォルダがあれば、開く・移動・名前の変更・削除と並べ替えだけ（移動の
+    /// 入れる先からは、自分とその中を除く）。
     /// 並べ替えは、ピン留めの行を検索せずに表示しているときだけ（検索の結果はフォルダをまたぐため）。
     fn row_menu(&self, target: RowTarget) -> Option<RowMenu> {
         let RowTarget { id, pinned, folder } = target;
@@ -1147,7 +1148,13 @@ impl ViewerHandler for App {
             return self
                 .core
                 .read(|s| {
-                    store::find_folder(&s.pinned, id).map(|_| RowMenu { folder: true, reorder: reorder_of(s), ..RowMenu::default() })
+                    store::find_folder(&s.pinned, id).map(|_| RowMenu {
+                        folder: true,
+                        reorder: reorder_of(s),
+                        pin_targets: model::pin_targets_except(&s.pinned, Some(id)),
+                        current: store::parent_of(&s.pinned, id),
+                        ..RowMenu::default()
+                    })
                 })
                 .flatten();
         }
@@ -1169,21 +1176,21 @@ impl ViewerHandler for App {
     }
 
     /// 操作スレッドへ依頼する（完了を待たない）。対象の保管先は行が決める（今の表示元からは
-    /// 決めない）。ピン留めは履歴の行だけ、移動はピン留めの項目の行だけ、並べ替えはピン留めの行を検索せずに
-    /// 表示しているときだけ。フォルダの行は並べ替えだけ（開く・名前の変更・確認の後の削除はビューアが扱う）。
+    /// 決めない）。ピン留めは履歴の行だけ、移動はピン留めの行だけ、並べ替えとドラッグでの移動はピン留めの行を
+    /// 検索せずに表示しているときだけ。フォルダの行は移動・並べ替えだけ（開く・名前の変更・確認の後の削除は
+    /// ビューアが扱う）。
     fn on_row_command(&self, _hwnd: HWND, target: RowTarget, command: RowCommand) {
         let RowTarget { id, pinned, folder } = target;
+        let unfiltered = || self.needle.borrow().is_empty();
         let action = match command {
-            RowCommand::Reorder(direction) if pinned && self.needle.borrow().is_empty() => {
-                Action::ReorderPinned { id, direction }
-            }
-            RowCommand::Reorder(_) => return,
+            RowCommand::Reorder(direction) if pinned && unfiltered() => Action::ReorderPinned { id, direction },
+            RowCommand::Place { to, before } if pinned && unfiltered() => Action::MovePinned { id, to, before },
+            RowCommand::Move(to) if pinned => Action::MovePinned { id, to, before: None },
+            RowCommand::Reorder(_) | RowCommand::Place { .. } | RowCommand::Move(_) => return,
             _ if folder => return,
             RowCommand::Send => Action::Send { id, pinned },
             RowCommand::Pin(_) if pinned => return,
             RowCommand::Pin(to) => Action::Pin { id, to },
-            RowCommand::Move(to) if pinned => Action::MovePinned { id, to },
-            RowCommand::Move(_) => return,
             RowCommand::OpenImage => Action::OpenImage { id, pinned },
             RowCommand::OpenImageLocation => Action::OpenImageLocation { id, pinned },
             RowCommand::Transform(transform) => Action::Transform { id, pinned, transform },
@@ -1192,6 +1199,11 @@ impl ViewerHandler for App {
             RowCommand::Rename => return,
         };
         self.request(action);
+    }
+
+    /// ピン留めの行を、検索せずに表示しているときだけ（並べ替えと同じ。検索の結果はフォルダをまたぐため）。
+    fn can_drag_row(&self, target: RowTarget) -> bool {
+        target.pinned && self.needle.borrow().is_empty()
     }
 
     fn pinned_title(&self, id: Uuid) -> Option<Option<String>> {
@@ -1606,8 +1618,8 @@ mod tests {
                 Action::Pin { id, to: Some(folder) },
                 Action::OpenImage { id, pinned: false },
                 Action::Transform { id, pinned: false, transform: TextTransform::ToUpper },
-                Action::MovePinned { id, to: Some(folder) },
-                Action::MovePinned { id, to: None },
+                Action::MovePinned { id, to: Some(folder), before: None },
+                Action::MovePinned { id, to: None, before: None },
                 Action::OpenImageLocation { id, pinned: true },
                 Action::RenamePinned { id, title: "名前".into() },
                 Action::Send { id, pinned: true },
@@ -1698,8 +1710,9 @@ mod tests {
     }
 
     /// ピン留めの並べ替え: メニューの「上へ」「下へ」は同じ親の中の位置で決まり、項目とフォルダを区別しない。
-    /// フォルダの行のメニューは、フォルダがあるときだけ出す。検索中は並べ替えを出さず、依頼もしない。
-    /// フォルダの行は並べ替えだけを依頼し、送る・削除（確認の前）などは依頼しない。
+    /// フォルダの行のメニューは、フォルダがあるときだけ出す。検索中は並べ替えを出さず、並べ替え・ドラッグでの
+    /// 移動を依頼しない。フォルダの行は移動・並べ替えだけを依頼し、送る・削除（確認の前）などは依頼しない。
+    /// 履歴の行は、移動・並べ替えを依頼しない。
     #[test]
     fn reorder_menu_and_commands_follow_position_and_search() {
         use crate::store::Direction::{Down, Up};
@@ -1718,23 +1731,36 @@ mod tests {
         assert!(!menu.folder);
         assert_eq!(
             app.row_menu(folder_row),
-            Some(RowMenu { folder: true, reorder: Some(Reorder { up: true, down: false }), ..RowMenu::default() })
+            Some(RowMenu {
+                folder: true,
+                reorder: Some(Reorder { up: true, down: false }),
+                pin_targets: model::pin_targets(&[]),
+                current: Some(None),
+                ..RowMenu::default()
+            })
         );
         assert_eq!(app.row_menu(RowTarget { id: Uuid::new_v4(), ..folder_row }), None, "無いフォルダのメニューを出した");
 
         let (requests, received) = mpsc::channel();
         app.attach_actions(requests, FailureSink::new(|| {}));
         let hwnd = HWND::default();
+        let history_row = RowTarget { id: item, pinned: false, folder: false };
+        let place = RowCommand::Place { to: Some(folder), before: None };
         app.on_row_command(hwnd, item_row, RowCommand::Reorder(Down));
         app.on_row_command(hwnd, folder_row, RowCommand::Reorder(Up));
-        app.on_row_command(hwnd, RowTarget { id: item, pinned: false, folder: false }, RowCommand::Reorder(Up));
-        for command in [RowCommand::Send, RowCommand::Delete, RowCommand::Move(None), RowCommand::Rename] {
+        app.on_row_command(hwnd, item_row, place);
+        app.on_row_command(hwnd, folder_row, RowCommand::Place { to: None, before: Some(item) });
+        for command in [RowCommand::Reorder(Up), place, RowCommand::Move(None)] {
+            app.on_row_command(hwnd, history_row, command);
+        }
+        for command in [RowCommand::Send, RowCommand::Delete, RowCommand::Rename, RowCommand::Move(None)] {
             app.on_row_command(hwnd, folder_row, command);
         }
         app.on_activate(hwnd, folder_row);
         app.on_delete(hwnd, folder_row);
         *app.needle.borrow_mut() = "項".into();
         app.on_row_command(hwnd, item_row, RowCommand::Reorder(Down));
+        app.on_row_command(hwnd, item_row, place);
         assert_eq!(app.row_menu(item_row).unwrap().reorder, None, "検索中に並べ替えを出した");
         assert_eq!(app.row_menu(folder_row).unwrap().reorder, None);
         assert_eq!(
@@ -1742,6 +1768,9 @@ mod tests {
             [
                 Action::ReorderPinned { id: item, direction: Down },
                 Action::ReorderPinned { id: folder, direction: Up },
+                Action::MovePinned { id: item, to: Some(folder), before: None },
+                Action::MovePinned { id: folder, to: None, before: Some(item) },
+                Action::MovePinned { id: folder, to: None, before: None },
             ]
         );
         drop(app);
@@ -1771,6 +1800,13 @@ mod tests {
         let menu = app.row_menu(RowTarget { id: text_id, pinned: false, folder: false }).unwrap();
         assert_eq!(menu.pin_targets.len(), 3);
         assert_eq!(menu.current, None);
+        // フォルダの行: 入れる先から自分とその中を除き、今いる所を添える
+        let menu = app.row_menu(RowTarget { id: work, pinned: true, folder: true }).unwrap();
+        assert_eq!(menu.pin_targets.iter().map(|t| t.folder).collect::<Vec<_>>(), [None]);
+        assert_eq!(menu.current, Some(None));
+        let menu = app.row_menu(RowTarget { id: nested, pinned: true, folder: true }).unwrap();
+        assert_eq!(menu.pin_targets.iter().map(|t| t.folder).collect::<Vec<_>>(), [None, Some(work)]);
+        assert_eq!(menu.current, Some(Some(work)));
         let _ = std::fs::remove_dir_all(dir);
     }
 

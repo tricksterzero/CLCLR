@@ -30,7 +30,7 @@ pub use crate::data::EntryKind;
 /// 「クリップボードへ送る」（フォルダの行は「開く」）と「削除」はいつも出す。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RowMenu {
-    /// 行がピン留めのフォルダ（「開く」「名前の変更...」「削除...」と並べ替えだけを出す）
+    /// 行がピン留めのフォルダ（「開く」「移動」「名前の変更...」「削除...」と並べ替えだけを出す）
     pub folder: bool,
     /// 「上へ」「下へ」（ピン留めの行を、検索せずに表示しているときだけ）
     pub reorder: Option<Reorder>,
@@ -41,9 +41,10 @@ pub struct RowMenu {
     /// 「テキスト変換」の子メニュー（CF_UNICODETEXT があるときだけ）
     pub has_text: bool,
     /// ピン留めの入れる先（`pin_targets`。先頭はルート）。フォルダがあれば「ピン留めに追加」を入れる先を
-    /// 選ぶ子メニューにし、ピン留めの行には「移動」の子メニューを出す
+    /// 選ぶ子メニューにし、ピン留めの行には「移動」の子メニューを出す（フォルダの行は、自分とその中を除く。
+    /// `pin_targets_except`）
     pub pin_targets: Vec<PinTarget>,
-    /// 行がピン留めの項目なら、今いる所（内の None はルート）。「移動」で灰色にする
+    /// 行がピン留めの項目・フォルダなら、今いる所（内の None はルート）。「移動」で灰色にする
     pub current: Option<Option<Uuid>>,
 }
 
@@ -70,12 +71,18 @@ pub const PIN_ROOT_LABEL: &str = "ピン留め（直下）";
 /// ピン留めの入れる先の並び（ロック中に呼ぶ。メタデータだけ）。先頭はルート、続けてフォルダを
 /// 深さ優先の順（ツリーと同じ順）。線は、フォルダだけを兄弟として数えて引く（項目は並べないため）。
 pub fn pin_targets(nodes: &[PinnedNode]) -> Vec<PinTarget> {
-    fn walk(nodes: &[PinnedNode], depth: usize, lead: &[TreeGuide], out: &mut Vec<PinTarget>) {
+    pin_targets_except(nodes, None)
+}
+
+/// `pin_targets` から、`except` のフォルダとその中を除いた並び（フォルダの行の「移動」の先。自分の中へは
+/// 移せないため）。線は、除いたフォルダを兄弟として数えずに引く。
+pub fn pin_targets_except(nodes: &[PinnedNode], except: Option<Uuid>) -> Vec<PinTarget> {
+    fn walk(nodes: &[PinnedNode], depth: usize, lead: &[TreeGuide], except: Option<Uuid>, out: &mut Vec<PinTarget>) {
         let folders: Vec<&store::PinnedFolder> = nodes
             .iter()
             .filter_map(|node| match node {
-                PinnedNode::Folder(folder) => Some(folder),
-                PinnedNode::Item(_) => None,
+                PinnedNode::Folder(folder) if Some(folder.id) != except => Some(folder),
+                PinnedNode::Folder(_) | PinnedNode::Item(_) => None,
             })
             .collect();
         for (i, folder) in folders.iter().enumerate() {
@@ -85,11 +92,11 @@ pub fn pin_targets(nodes: &[PinnedNode]) -> Vec<PinTarget> {
             out.push(PinTarget { folder: Some(folder.id), title: folder.title.clone(), depth, guide });
             let mut lead = lead.to_vec();
             lead.push(if last { TreeGuide::Blank } else { TreeGuide::Pipe });
-            walk(&folder.children, depth + 1, &lead, out);
+            walk(&folder.children, depth + 1, &lead, except, out);
         }
     }
     let mut out = vec![PinTarget { folder: None, title: PIN_ROOT_LABEL.to_string(), depth: 0, guide: Vec::new() }];
-    walk(nodes, 1, &[], &mut out);
+    walk(nodes, 1, &[], except, &mut out);
     out
 }
 
@@ -126,8 +133,11 @@ pub enum RowCommand {
     Send,
     /// 履歴の行をピン留めへ（内の値は入れる先。None はルート）
     Pin(Option<Uuid>),
-    /// ピン留めの行を移す（入れる先。None はルート）
+    /// ピン留めの行（項目・フォルダ）を、入れる先（None はルート）の末尾へ移す（右クリックの「移動」）
     Move(Option<Uuid>),
+    /// ピン留めの行（項目・フォルダ）を、`to`（None はルート）の `before` の前（None は末尾）へ移す
+    /// （ドラッグで落とした位置）
+    Place { to: Option<Uuid>, before: Option<Uuid> },
     /// ピン留めの行（項目・フォルダ）を、同じ親の中で隣と入れ替える
     Reorder(store::Direction),
     OpenImage,
@@ -716,6 +726,15 @@ mod tests {
             .map(|t| format!("{}{}", t.guide.iter().map(draw).collect::<String>(), t.title))
             .collect();
         assert_eq!(lines, [PIN_ROOT_LABEL, "├仕事", "│├テンプレート", "│└下書き", "│・└古い", "└空のフォルダ", "・└中"]);
+
+        // 除いたフォルダ（「下書き」）はその中ごと出ず、兄弟にも数えない（「テンプレート」が最後の └ になる）
+        let PinnedNode::Folder(work) = &pinned[0] else { unreachable!() };
+        let draft = work.children[1].id();
+        let lines: Vec<String> = pin_targets_except(&pinned, Some(draft))
+            .into_iter()
+            .map(|t| format!("{}{}", t.guide.iter().map(draw).collect::<String>(), t.title))
+            .collect();
+        assert_eq!(lines, [PIN_ROOT_LABEL, "├仕事", "│└テンプレート", "└空のフォルダ", "・└中"]);
     }
 
     #[test]

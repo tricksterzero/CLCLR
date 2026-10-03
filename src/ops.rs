@@ -44,6 +44,8 @@ pub enum OpError {
     InvalidName,
     /// 同じ親の中に同じ名前のフォルダがある
     DuplicateName,
+    /// フォルダを、それ自身かその中のフォルダへ移そうとした
+    IntoItself,
     /// 送る・ピン留めの対象に形式が1つもない
     Empty,
     /// 終了処理で、受け付け済みの操作が期限までに終わらなかった（最後の保存はしていない）
@@ -70,6 +72,7 @@ impl fmt::Display for OpError {
             Self::TargetNotFound => write!(f, "フォルダが見つかりません"),
             Self::InvalidName => write!(f, "フォルダの名前が空です"),
             Self::DuplicateName => write!(f, "同じ場所に同じ名前のフォルダがあります"),
+            Self::IntoItself => write!(f, "フォルダを、そのフォルダ自身やその中へは移せません"),
             Self::Empty => write!(f, "項目に形式がありません"),
             Self::TimedOut => write!(f, "処理中の操作が終わらないため、保存しませんでした"),
             Self::Unsaved(n) => write!(f, "履歴のインデックスから {n} 件を消せていません"),
@@ -467,24 +470,23 @@ impl Core {
         Ok(())
     }
 
-    /// ピン留めの項目を `to`（None はルート）のフォルダの末尾へ移す。移すのは項目だけ
-    /// （フォルダの移動は範囲外。フォルダの ID なら `NotFound`）。対象が無ければ `NotFound`（入れる
-    /// 先も無いときもこちらを優先）、入れる先が無ければ `TargetNotFound`、今いる所と同じなら何も
-    /// しない。blob は触らない。
-    pub fn move_pinned(&self, id: Uuid, to: Option<Uuid>) -> Result<(), OpError> {
+    /// ピン留めの項目・フォルダ（中身ごと）を、`to`（None はルート）のフォルダの `before` の前（None は
+    /// 末尾）へ移す（`store::move_node`）。対象が無ければ `NotFound`（入れる先も無いときもこちらを優先）、
+    /// 入れる先・`before` が無ければ `TargetNotFound`、フォルダを自分かその中へ入れようとしたら
+    /// `IntoItself`、フォルダを別の親へ移すとき入れる先に同じ名前のフォルダがあれば `DuplicateName`。
+    /// 今と同じ位置なら何もしない。blob は触らない。pinned.toml へ書けてからメモリに反映する。
+    pub fn move_pinned(&self, id: Uuid, to: Option<Uuid>, before: Option<Uuid>) -> Result<(), OpError> {
         let _scope = self.begin()?;
         let mut nodes = self.with_service(|s| s.pinned.clone())?;
-        if store::find_item(&nodes, id).is_none() {
-            return Err(OpError::NotFound);
-        }
-        if to.is_some_and(|folder| store::find_folder(&nodes, folder).is_none()) {
-            return Err(OpError::TargetNotFound);
-        }
-        if store::parent_of(&nodes, id) == Some(to) {
+        let moved = store::move_node(&mut nodes, id, to, before).map_err(|e| match e {
+            store::MoveError::NotFound => OpError::NotFound,
+            store::MoveError::TargetNotFound => OpError::TargetNotFound,
+            store::MoveError::IntoItself => OpError::IntoItself,
+            store::MoveError::DuplicateName => OpError::DuplicateName,
+        })?;
+        if !moved {
             return Ok(());
         }
-        let node = store::remove_node(&mut nodes, id).ok_or(OpError::NotFound)?;
-        store::children_mut(&mut nodes, to).ok_or(OpError::TargetNotFound)?.push(node);
         self.inner.storage.save_pinned(&nodes)?;
         self.with_service(|s| s.set_pinned(nodes))?;
         Ok(())
@@ -1797,11 +1799,11 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 移動: 項目だけを、フォルダ・ルートの末尾へ移す。blob は変えない。今いる所なら何もしない。
-    /// 対象が無い（両方無いときも）・フォルダを移そうとした → NotFound、入れる先が無い → TargetNotFound。
+    /// 移動: 項目を、フォルダ・ルートの末尾や兄弟の前へ移す。blob は変えない。今と同じ位置なら保存しない。
+    /// 対象が無い（両方無いときも）→ NotFound、入れる先・`before` が無い → TargetNotFound。
     /// 書けなければメモリを変えない。開き直しても移した先に残る。
     #[test]
-    fn move_pinned_moves_items_only_and_validates() {
+    fn move_pinned_moves_items_and_validates() {
         let (dir, core) = temp_core(Config::default());
         core.capture(text_entry("移す")).unwrap();
         core.pin(front_id(&core), None).unwrap();
@@ -1809,29 +1811,66 @@ pub(crate) mod tests {
         core.create_folder(None, "箱").unwrap();
         let folder = folder_id(&core, "箱");
         let blob = blob_path(&dir, &meta);
+        let root = |core: &Core| core.read(|s| s.pinned.iter().map(PinnedNode::id).collect::<Vec<_>>()).unwrap();
 
         let revision = core.read(|s| s.revision()).unwrap();
-        core.move_pinned(meta.id, None).unwrap();
-        assert_eq!(core.read(|s| s.revision()).unwrap(), revision, "今いる所へ移して保存した");
-        assert!(matches!(core.move_pinned(folder, None), Err(OpError::NotFound)), "フォルダを移した");
-        assert!(matches!(core.move_pinned(Uuid::new_v4(), Some(folder)), Err(OpError::NotFound)));
-        assert!(matches!(core.move_pinned(Uuid::new_v4(), Some(Uuid::new_v4())), Err(OpError::NotFound)));
-        assert!(matches!(core.move_pinned(meta.id, Some(Uuid::new_v4())), Err(OpError::TargetNotFound)));
+        core.move_pinned(meta.id, None, Some(folder)).unwrap();
+        core.move_pinned(folder, None, None).unwrap();
+        assert_eq!(core.read(|s| s.revision()).unwrap(), revision, "今と同じ位置へ移して保存した");
+        assert!(matches!(core.move_pinned(Uuid::new_v4(), Some(folder), None), Err(OpError::NotFound)));
+        assert!(matches!(core.move_pinned(Uuid::new_v4(), Some(Uuid::new_v4()), None), Err(OpError::NotFound)));
+        assert!(matches!(core.move_pinned(meta.id, Some(Uuid::new_v4()), None), Err(OpError::TargetNotFound)));
+        assert!(matches!(core.move_pinned(meta.id, None, Some(Uuid::new_v4())), Err(OpError::TargetNotFound)));
 
         block_write(&dir, "pinned.toml");
-        assert!(core.move_pinned(meta.id, Some(folder)).is_err());
+        assert!(core.move_pinned(meta.id, Some(folder), None).is_err());
         assert_eq!(core.read(|s| store::parent_of(&s.pinned, meta.id)), Some(Some(None)), "書けないのに移した");
         unblock_write(&dir, "pinned.toml");
 
-        core.move_pinned(meta.id, Some(folder)).unwrap();
+        core.move_pinned(meta.id, None, None).unwrap();
+        assert_eq!(root(&core), [folder, meta.id]);
+        core.move_pinned(meta.id, Some(folder), None).unwrap();
         assert_eq!(core.read(|s| store::parent_of(&s.pinned, meta.id)), Some(Some(Some(folder))));
         assert!(blob.exists());
         drop(core);
         let core = reopen(&dir, Config::default());
         assert_eq!(core.read(|s| store::parent_of(&s.pinned, meta.id)), Some(Some(Some(folder))));
-        core.move_pinned(meta.id, None).unwrap();
-        assert_eq!(core.read(|s| store::parent_of(&s.pinned, meta.id)), Some(Some(None)));
+        core.move_pinned(meta.id, None, Some(folder)).unwrap();
+        assert_eq!(root(&core), [meta.id, folder]);
         assert_eq!(core.load_for_send(meta.id, true).unwrap().formats.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// フォルダの移動: 中身ごと別のフォルダへ移り、開き直しても残る。自分・自分の中へは IntoItself、入れる先に
+    /// 同じ名前のフォルダがあれば DuplicateName で、どちらも保存しない。
+    #[test]
+    fn move_pinned_moves_folders_with_contents_and_refuses_cycles() {
+        let (dir, core) = temp_core(Config::default());
+        core.create_folder(None, "外").unwrap();
+        core.create_folder(None, "箱").unwrap();
+        let (outer, folder) = (folder_id(&core, "外"), folder_id(&core, "箱"));
+        core.capture(text_entry("中身")).unwrap();
+        core.pin(front_id(&core), Some(folder)).unwrap();
+        core.create_folder(Some(folder), "小").unwrap();
+        let inner = core.read(|s| store::find_children(&s.pinned, Some(folder)).unwrap()[1].id()).unwrap();
+
+        let revision = core.read(|s| s.revision()).unwrap();
+        assert!(matches!(core.move_pinned(folder, Some(folder), None), Err(OpError::IntoItself)));
+        assert!(matches!(core.move_pinned(folder, Some(inner), None), Err(OpError::IntoItself)));
+        core.create_folder(Some(outer), "箱").unwrap();
+        let revision_with_twin = core.read(|s| s.revision()).unwrap();
+        assert_ne!(revision, revision_with_twin);
+        assert!(matches!(core.move_pinned(folder, Some(outer), None), Err(OpError::DuplicateName)));
+        assert_eq!(core.read(|s| s.revision()).unwrap(), revision_with_twin, "断ったのに保存した");
+
+        core.rename_folder(folder, "箱2").unwrap();
+        core.move_pinned(folder, Some(outer), None).unwrap();
+        assert_eq!(core.read(|s| store::parent_of(&s.pinned, folder)), Some(Some(Some(outer))));
+        assert_eq!(core.read(|s| store::find_children(&s.pinned, Some(folder)).unwrap().len()), Some(2));
+        drop(core);
+        let core = reopen(&dir, Config::default());
+        assert_eq!(core.read(|s| store::parent_of(&s.pinned, inner)), Some(Some(Some(folder))));
+        assert_eq!(core.read(|s| store::parent_of(&s.pinned, folder)), Some(Some(Some(outer))));
         let _ = std::fs::remove_dir_all(dir);
     }
 

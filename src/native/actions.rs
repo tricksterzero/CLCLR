@@ -61,8 +61,9 @@ pub enum Action {
     OpenImageLocation { id: Uuid, pinned: bool },
     /// 履歴の項目をピン留めに複製し、`to`（None はルート）のフォルダへ入れる（`Core::pin`）
     Pin { id: Uuid, to: Option<Uuid> },
-    /// ピン留めの項目を `to`（None はルート）のフォルダへ移す（`Core::move_pinned`）
-    MovePinned { id: Uuid, to: Option<Uuid> },
+    /// ピン留めの項目・フォルダを `to`（None はルート）のフォルダの `before` の前（None は末尾）へ移す
+    /// （`Core::move_pinned`。右クリックの「移動」は末尾、ドラッグは落とした位置）
+    MovePinned { id: Uuid, to: Option<Uuid>, before: Option<Uuid> },
     /// ピン留めの項目・フォルダを、同じ親の中で隣と入れ替える（`Core::reorder_pinned`）
     ReorderPinned { id: Uuid, direction: Direction },
     /// `parent`（None はルート）の中にフォルダを作る（`Core::create_folder`）
@@ -535,7 +536,7 @@ impl<E: Effects> Worker<E> {
             Action::OpenImage { id, pinned } => self.export_image(id, pinned, ShellAction::Open),
             Action::OpenImageLocation { id, pinned } => self.export_image(id, pinned, ShellAction::Reveal),
             Action::Pin { id, to } => self.pin(id, to),
-            Action::MovePinned { id, to } => self.move_pinned(id, to),
+            Action::MovePinned { id, to, before } => self.move_pinned(id, to, before),
             Action::ReorderPinned { id, direction } => self.reorder_pinned(id, direction),
             Action::CreateFolder { parent, title } => self.create_folder(parent, &title),
             Action::RenameFolder { id, title } => self.rename_folder(id, &title),
@@ -593,9 +594,10 @@ impl<E: Effects> Worker<E> {
         Ok(())
     }
 
-    /// ピン留めの項目を移し、ビューアを起こして一覧に反映させる。対象・入れる先が無いときも知らせる。
-    fn move_pinned(&self, id: Uuid, to: Option<Uuid>) -> Result<(), Stop> {
-        self.core.move_pinned(id, to)?;
+    /// ピン留めの項目・フォルダを移し、ビューアを起こして一覧・ツリーに反映させる。対象・入れる先が無いとき、
+    /// フォルダを自分の中へ入れようとしたとき、入れる先に同じ名前のフォルダがあるときも知らせる。
+    fn move_pinned(&self, id: Uuid, to: Option<Uuid>, before: Option<Uuid>) -> Result<(), Stop> {
+        self.core.move_pinned(id, to, before)?;
         self.sink.wake();
         Ok(())
     }
@@ -1286,14 +1288,14 @@ mod tests {
         h.handle(Action::Pin { id, to: Some(folder) });
         assert_eq!(h.wakes(), 1);
         let pinned_id = h.core.read(|s| crate::store::find_folder(&s.pinned, folder).unwrap().children[0].id()).unwrap();
-        h.handle(Action::MovePinned { id: pinned_id, to: None });
+        h.handle(Action::MovePinned { id: pinned_id, to: None, before: None });
         assert_eq!(h.wakes(), 2);
         assert_eq!(h.core.read(|s| crate::store::parent_of(&s.pinned, pinned_id)), Some(Some(None)));
         assert!(h.failures().is_empty());
 
         h.handle(Action::Pin { id, to: Some(Uuid::new_v4()) });
-        h.handle(Action::MovePinned { id: pinned_id, to: Some(Uuid::new_v4()) });
-        h.handle(Action::MovePinned { id: Uuid::new_v4(), to: None });
+        h.handle(Action::MovePinned { id: pinned_id, to: Some(Uuid::new_v4()), before: None });
+        h.handle(Action::MovePinned { id: Uuid::new_v4(), to: None, before: None });
         let kinds: Vec<ActionKind> = h.failures().iter().map(|f| f.kind).collect();
         assert_eq!(kinds, [ActionKind::Pin, ActionKind::MovePinned, ActionKind::MovePinned]);
         // 失敗の知らせも起こす（`FailureSink::report`）ので、成功の 2 回と失敗の 3 回
