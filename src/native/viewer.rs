@@ -133,6 +133,9 @@ use windows::Win32::UI::Controls::{
     TVM_ENDEDITLABELNOW, TVN_BEGINLABELEDITW, TVN_ENDLABELEDITW, TVN_KEYDOWN, TVS_EDITLABELS,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_F2;
+use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_UP};
+use windows::Win32::UI::WindowsAndMessaging::FALT;
+use crate::store::Direction;
 use crate::icons;
 use crate::menu_draw::{self, MenuBar, PopupMenu};
 use crate::tools::text::TextTransform;
@@ -147,6 +150,8 @@ const WM_APP_IMAGE: u32 = WM_APP + 3;
 const WM_APP_SELECTION: u32 = WM_APP + 4;
 /// ツリーの名前の編集の後始末（`TVN_ENDLABELEDIT` から戻った後に行う）
 const WM_APP_EDIT_DONE: u32 = WM_APP + 5;
+/// 一覧のフォルダの行を開く（一覧の通知の処理から戻った後に、ツリーでそのフォルダを選ぶ。`activate_row`）
+const WM_APP_OPEN_FOLDER: u32 = WM_APP + 6;
 
 /// ツリーの仮の項目（フォルダの作成で名前を入れる間だけ置く）の lParam。`tree_tokens` に無いので、
 /// 表示元として扱われない。
@@ -199,6 +204,9 @@ const CMD_ABOUT: u16 = 204;
 const CMD_FIND: u16 = 205;
 /// データのチェック
 const CMD_CHECK_DATA: u16 = 206;
+/// Alt+↑・Alt+↓ で、一覧で選んでいるピン留めの行を上・下へ（アクセラレータだけで、メニューバーには出さない）
+const CMD_MOVE_UP: u16 = 207;
+const CMD_MOVE_DOWN: u16 = 208;
 
 /// 履歴のクリアの確認の「削除」ボタンの ID（`IDCANCEL` などの共通ボタンと重ならない値）。
 const CONFIRM_DELETE: i32 = 1000;
@@ -383,9 +391,10 @@ pub trait ViewerHandler {
     /// メッセージループを抜けた後の終了処理は行われない。保存などはここで済ませる。
     fn on_end_session(&self, hwnd: HWND);
     /// 一覧の行を送る（一覧にフォーカスがあるときの Enter・ダブルクリック）。対象は、その行を
-    /// 作ったときの表示元の項目（`RowTarget`）。
+    /// 作ったときの表示元の項目（`RowTarget`）。フォルダの行では呼ばない（ビューアがツリーでそのフォルダを選ぶ）。
     fn on_activate(&self, hwnd: HWND, target: RowTarget);
-    /// 一覧の行を消す（一覧にフォーカスがあるときの Delete）。
+    /// 一覧の行を消す（一覧にフォーカスがあるときの Delete）。フォルダの行では呼ばない（ビューアが確認してから
+    /// `on_tree_command` で伝える）。
     fn on_delete(&self, hwnd: HWND, target: RowTarget);
     /// 行の右クリックメニューに出す項目。None ならメニューを出さない（項目が見つからないなど）。
     /// サービスのロックは写しを取る間だけ持つ。
@@ -574,7 +583,10 @@ struct WindowCtx {
     dialog_cancel: Cell<bool>,
     /// DPI に合わせたフォントと寸法（`WM_DPICHANGED` で差し替える。借用は描画・配置の間だけ）
     metrics: RefCell<Metrics>,
-    icons: [HICON; 4],
+    /// 一覧の種別アイコン（`EntryKind` の順）と、ピン留めのフォルダの行のアイコン（最後）
+    icons: [HICON; 5],
+    /// 開くフォルダの行（`WM_APP_OPEN_FOLDER` を処理するときにツリーで選ぶ。`activate_row`）
+    open_folder: Cell<Option<Uuid>>,
     /// Ctrl+F などのキー操作（メインのメッセージループが `translate_accelerator` で使う）
     accel: HACCEL,
     /// 最小化・最大化していないときのクライアント領域の大きさ（96 DPI 基準の px）。隠すとき・終了時に
@@ -632,6 +644,11 @@ impl WindowCtx {
             EntryKind::File => 2,
             EntryKind::Other => 3,
         }]
+    }
+
+    /// 一覧の行のアイコン（フォルダの行はフォルダ、ほかは種別）。
+    fn row_icon(&self, row: &Row) -> HICON {
+        if row.folder.is_some() { self.icons[4] } else { self.icon(row.kind) }
     }
 
     /// 画像の読み込みを頼む（読み込みスレッドがまだ無ければ何もしない）。プレビューの依頼は新しい番号を
@@ -708,6 +725,7 @@ impl ViewerWindow {
             dialog_cancel: Cell::new(false),
             metrics: RefCell::new(metrics),
             icons: create_icons(),
+            open_folder: Cell::new(None),
             accel: create_accelerators(),
             normal_size: Cell::new(logical_size),
             history_item: Cell::new(0),
@@ -1231,9 +1249,13 @@ fn rebuild_menu_bar(hwnd: HWND, ctx: &WindowCtx, dpi: u32) {
     }
 }
 
-/// キー操作の表（Ctrl+F）。作れなければ無効なハンドル（Ctrl+F が効かないだけ）。
+/// キー操作の表（Ctrl+F、Alt+↑、Alt+↓）。作れなければ無効なハンドル（これらのキーが効かないだけ）。
 fn create_accelerators() -> HACCEL {
-    let table = [ACCEL { fVirt: FVIRTKEY | FCONTROL, key: u16::from(b'F'), cmd: CMD_FIND }];
+    let table = [
+        ACCEL { fVirt: FVIRTKEY | FCONTROL, key: u16::from(b'F'), cmd: CMD_FIND },
+        ACCEL { fVirt: FVIRTKEY | FALT, key: VK_UP.0, cmd: CMD_MOVE_UP },
+        ACCEL { fVirt: FVIRTKEY | FALT, key: VK_DOWN.0, cmd: CMD_MOVE_DOWN },
+    ];
     unsafe { CreateAcceleratorTableW(&table) }.unwrap_or_default()
 }
 
@@ -1557,12 +1579,25 @@ struct NameDialog<'a> {
 
 /// ピン留めの行の名前の変更: 今の名前を入れたダイアログを出し、「OK」なら入力をハンドラへ伝える。
 /// 履歴の行・メニューやほかのダイアログの表示中・ツリーの名前の編集中は何もしない。今の名前は出す直前に
-/// 取り直し、アイテムが無くなっていれば出さない。
+/// 取り直し、アイテムが無くなっていれば出さない。フォルダの行は、フォルダの名前を聞き、前後の空白を除いて
+/// 空でなければ `on_tree_command` で伝える（空なら何もしない。ツリーの名前の編集と同じ）。
 fn rename_pinned_row(hwnd: HWND, ctx: &WindowCtx, target: RowTarget) {
     if !target.pinned || !can_open_dialog(ctx) {
         return;
     }
     let handler = Rc::clone(&ctx.handler);
+    if target.folder {
+        let Some(TreeMenu::PinnedFolder { title, .. }) = handler.tree_menu(Source::Pinned(Some(target.id))) else {
+            return;
+        };
+        if let Some(name) = ask_name(hwnd, ctx, &title) {
+            let title = name.trim().to_string();
+            if !title.is_empty() {
+                handler.on_tree_command(hwnd, TreeCommand::RenameFolder { id: target.id, title });
+            }
+        }
+        return;
+    }
     let Some(current) = handler.pinned_title(target.id) else {
         return;
     };
@@ -2151,8 +2186,8 @@ fn create_fonts(dpi: u32) -> (HFONT, HFONT, bool) {
     }
 }
 
-fn create_icons() -> [HICON; 4] {
-    [icons::TEXT, icons::IMAGE, icons::FILE, icons::OTHER]
+fn create_icons() -> [HICON; 5] {
+    [icons::TEXT, icons::IMAGE, icons::FILE, icons::OTHER, icons::FOLDER]
         .map(|rgba| crate::tray::icon_from_rgba(rgba, ICON_SIZE).unwrap_or_default())
 }
 
@@ -2619,7 +2654,7 @@ unsafe fn draw_row_contents(ctx: &WindowCtx, dis: &DRAWITEMSTRUCT) -> Option<(Uu
             }
             (thumb, state) => {
                 // 種別アイコンは 32px の素材を DPI に合わせた大きさへ伸縮して描く
-                let _ = DrawIconEx(hdc, icon_left, icon_top, ctx.icon(row.kind), icon, icon, 0, None, DI_NORMAL);
+                let _ = DrawIconEx(hdc, icon_left, icon_top, ctx.row_icon(row), icon, icon, 0, None, DI_NORMAL);
                 if let (Some(name), None) = (thumb, state) {
                     request = Some((row.id, name.clone()));
                 }
@@ -2880,6 +2915,71 @@ fn list_has_focus(hwnd: HWND) -> bool {
     unsafe { GetDlgItem(Some(hwnd), ID_LIST) }.is_ok_and(|list| unsafe { GetFocus() } == list)
 }
 
+/// 一覧の行を送る・開く（Enter・ダブルクリック・右クリックメニュー）。フォルダの行は、一覧の通知の処理から
+/// 戻った後（`WM_APP_OPEN_FOLDER`）に、ツリーでそのフォルダを選んで開く（一覧の通知の中で一覧を作り直さない）。
+fn activate_row(hwnd: HWND, ctx: &WindowCtx, target: RowTarget) {
+    if target.folder {
+        ctx.open_folder.set(Some(target.id));
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_APP_OPEN_FOLDER, WPARAM(0), LPARAM(0));
+        }
+    } else {
+        let handler = Rc::clone(&ctx.handler);
+        handler.on_activate(hwnd, target);
+    }
+}
+
+/// ピン留めのフォルダをツリーで選ぶ（閉じている親は開き、見える位置へスクロールする）。表示元の切り替えは、
+/// ツリーの選択の変化としてハンドラへ伝わる。ツリーの名前の編集中・メニューやダイアログの表示中・ツリーに
+/// そのフォルダが無いときは何もしない。
+fn open_folder(hwnd: HWND, ctx: &WindowCtx, id: Uuid) {
+    if !can_open_dialog(ctx) {
+        return;
+    }
+    let Ok(tree) = (unsafe { GetDlgItem(Some(hwnd), ID_TREE) }) else {
+        return;
+    };
+    unsafe {
+        if let Some(item) = find_tree_item(ctx, tree, Source::Pinned(Some(id))) {
+            SendMessageW(tree, TVM_SELECTITEM, Some(WPARAM(TVGN_CARET as usize)), Some(LPARAM(item.0)));
+            SendMessageW(tree, TVM_ENSUREVISIBLE, None, Some(LPARAM(item.0)));
+        }
+    }
+}
+
+/// 一覧の行を消す（Delete・右クリックメニュー）。フォルダの行は確認してから（`delete_folder_after_confirm`）。
+fn delete_row(hwnd: HWND, ctx: &WindowCtx, target: RowTarget) {
+    if target.folder {
+        delete_folder_after_confirm(hwnd, ctx, target.id);
+    } else {
+        let handler = Rc::clone(&ctx.handler);
+        handler.on_delete(hwnd, target);
+    }
+}
+
+/// ピン留めのフォルダを、確認で「削除」を選んだときだけ消す（ツリー・一覧の右クリックメニュー、一覧の
+/// Delete）。確認に出す名前・件数は確認の直前に取り直し、取れなければ（その間に消えた）確認を出さない。
+fn delete_folder_after_confirm(hwnd: HWND, ctx: &WindowCtx, id: Uuid) {
+    let handler = Rc::clone(&ctx.handler);
+    if let Some(TreeMenu::PinnedFolder { title, items, folders, .. }) = handler.tree_menu(Source::Pinned(Some(id))) {
+        if confirm_delete(hwnd, ctx, "フォルダの削除", &delete_folder_message(&title, items, folders)) {
+            handler.on_tree_command(hwnd, TreeCommand::DeleteFolder(id));
+        }
+    }
+}
+
+/// Alt+↑・Alt+↓: 一覧にフォーカスがあるとき、選んでいる先頭のピン留めの行を上・下へ動かすよう伝える（動かせるか
+/// はハンドラが決める）。ツリーの名前の編集中は何もしない。
+fn reorder_selected_row(hwnd: HWND, ctx: &WindowCtx, direction: Direction) {
+    if !list_has_focus(hwnd) || ctx.edit.get() != EditState::None {
+        return;
+    }
+    if let Some(target) = selected_row(hwnd, ctx).filter(|t| t.pinned) {
+        let handler = Rc::clone(&ctx.handler);
+        handler.on_row_command(hwnd, target, RowCommand::Reorder(direction));
+    }
+}
+
 /// 右クリックメニューのコマンド ID。テキスト変換は `MENU_TRANSFORM_BASE` + `TextTransform::ALL` の添字、
 /// ピン留めの入れる先（「ピン留めに追加」「移動」の子メニュー）は `MENU_TARGET_BASE` + `RowMenu::pin_targets`
 /// の添字（テキスト変換の範囲と重ならない）。
@@ -2889,6 +2989,8 @@ const MENU_OPEN_IMAGE: usize = 3;
 const MENU_DELETE: usize = 4;
 const MENU_RENAME: usize = 5;
 const MENU_OPEN_IMAGE_LOCATION: usize = 6;
+const MENU_MOVE_UP: usize = 7;
+const MENU_MOVE_DOWN: usize = 8;
 const MENU_TRANSFORM_BASE: usize = 100;
 const MENU_TARGET_BASE: usize = 1000;
 /// `TrackPopupMenu` が返すコマンド ID は 16 ビットに収める
@@ -2907,12 +3009,29 @@ fn append_pin_targets(menu: &mut PopupMenu, sub: HMENU, spec: &RowMenu, current:
     }
 }
 
+/// 「上へ」「下へ」を足す（`spec.reorder` があるときだけ。先頭・末尾で選べない方は灰色）。
+fn append_reorder(menu: &mut PopupMenu, root: HMENU, spec: &RowMenu) {
+    if let Some(reorder) = spec.reorder {
+        let flags = |enabled: bool| if enabled { MF_STRING } else { MF_STRING | MF_GRAYED };
+        menu.append_command(root, MENU_MOVE_UP, "上へ", flags(reorder.up), None);
+        menu.append_command(root, MENU_MOVE_DOWN, "下へ", flags(reorder.down), None);
+    }
+}
+
 /// 右クリックメニューを作る（自前描画で、`dpi` はメニューを出す位置のモニターの DPI）。
 /// フォルダがあれば、履歴の行の「ピン留めに追加」は入れる先の子メニューにし、ピン留めの行には「移動」の
-/// 子メニューを出す。破棄は戻り値の `PopupMenu` の破棄（子メニューごと）。
+/// 子メニューを出す。フォルダの行は「開く」・並べ替え・「名前の変更...」・「削除...」だけ。破棄は戻り値の
+/// `PopupMenu` の破棄（子メニューごと）。
 fn build_row_menu(spec: &RowMenu, dpi: u32) -> WinResult<PopupMenu> {
     let mut menu = PopupMenu::new(dpi, None)?;
     let root = menu.handle();
+    if spec.folder {
+        menu.append_command(root, MENU_SEND, "開く", MF_STRING, None);
+        append_reorder(&mut menu, root, spec);
+        menu.append_command(root, MENU_RENAME, "名前の変更...", MF_STRING, None);
+        menu.append_command(root, MENU_DELETE, "削除...", MF_STRING, None);
+        return Ok(menu);
+    }
     let has_folders = spec.pin_targets.len() > 1;
     menu.append_command(root, MENU_SEND, "クリップボードへ送る", MF_STRING, None);
     if spec.can_pin {
@@ -2929,6 +3048,7 @@ fn build_row_menu(spec: &RowMenu, dpi: u32) -> WinResult<PopupMenu> {
             append_pin_targets(&mut menu, sub, spec, Some(current));
         }
     }
+    append_reorder(&mut menu, root, spec);
     // ピン留めの行の名前の変更（名前を聞くダイアログを出す）
     if spec.current.is_some() {
         menu.append_command(root, MENU_RENAME, "名前の変更...", MF_STRING, None);
@@ -2949,8 +3069,8 @@ fn build_row_menu(spec: &RowMenu, dpi: u32) -> WinResult<PopupMenu> {
     Ok(menu)
 }
 
-/// 右クリックメニューのコマンド ID から操作へ（0・知らない ID は None）。入れる先の ID は、メニューを
-/// 作ったときと同じ `spec` の `pin_targets` で引く（ピン留めの行なら移動、履歴の行ならピン留め）。
+/// 右クリックメニューのコマンド ID から操作へ（0・知らない ID・灰色の「上へ」「下へ」は None）。入れる先の
+/// ID は、メニューを作ったときと同じ `spec` の `pin_targets` で引く（ピン留めの行なら移動、履歴の行ならピン留め）。
 fn row_command(id: usize, spec: &RowMenu) -> Option<RowCommand> {
     match id {
         MENU_SEND => Some(RowCommand::Send),
@@ -2958,7 +3078,9 @@ fn row_command(id: usize, spec: &RowMenu) -> Option<RowCommand> {
         MENU_OPEN_IMAGE => Some(RowCommand::OpenImage),
         MENU_OPEN_IMAGE_LOCATION => Some(RowCommand::OpenImageLocation),
         MENU_DELETE => Some(RowCommand::Delete),
-        MENU_RENAME if spec.current.is_some() => Some(RowCommand::Rename),
+        MENU_RENAME if spec.current.is_some() || spec.folder => Some(RowCommand::Rename),
+        MENU_MOVE_UP if spec.reorder.is_some_and(|r| r.up) => Some(RowCommand::Reorder(Direction::Up)),
+        MENU_MOVE_DOWN if spec.reorder.is_some_and(|r| r.down) => Some(RowCommand::Reorder(Direction::Down)),
         _ if id >= MENU_TARGET_BASE => {
             let target = spec.pin_targets.get(id - MENU_TARGET_BASE)?;
             Some(if spec.current.is_some() { RowCommand::Move(target.folder) } else { RowCommand::Pin(target.folder) })
@@ -3047,6 +3169,9 @@ unsafe fn show_row_menu(hwnd: HWND, ctx: &WindowCtx, list: HWND, lparam: LPARAM)
         match row_command(command.0 as usize, &spec) {
             // 名前はメニューが閉じた後にダイアログで聞く（`menu_open` は下りている）
             Some(RowCommand::Rename) => rename_pinned_row(hwnd, ctx, target),
+            // フォルダの行の「開く」と、確認してからの削除
+            Some(RowCommand::Send) if target.folder => activate_row(hwnd, ctx, target),
+            Some(RowCommand::Delete) if target.folder => delete_row(hwnd, ctx, target),
             Some(command) => handler.on_row_command(hwnd, target, command),
             None => {}
         }
@@ -3166,17 +3291,8 @@ unsafe fn show_tree_menu(hwnd: HWND, ctx: &WindowCtx, tree: HWND, lparam: LPARAM
                     handler.on_tool_command(hwnd, ToolCommand::ClearHistory);
                 }
             }
-            // 確認に出す名前・件数は、メニューを出したときの ID で、確認の直前に取り直す。
-            // 取れなければ（その間に消えた）確認を出さない
-            (TREE_MENU_DELETE_FOLDER, TreeMenu::PinnedFolder { id, .. }) => {
-                if let Some(TreeMenu::PinnedFolder { title, items, folders, .. }) =
-                    handler.tree_menu(Source::Pinned(Some(*id)))
-                {
-                    if confirm_delete(hwnd, ctx, "フォルダの削除", &delete_folder_message(&title, items, folders)) {
-                        handler.on_tree_command(hwnd, TreeCommand::DeleteFolder(*id));
-                    }
-                }
-            }
+            // 確認に出す名前・件数は、メニューを出したときの ID で、確認の直前に取り直す
+            (TREE_MENU_DELETE_FOLDER, TreeMenu::PinnedFolder { id, .. }) => delete_folder_after_confirm(hwnd, ctx, *id),
             (TREE_MENU_CREATE_FOLDER, TreeMenu::PinnedRoot) => begin_edit(hwnd, ctx, EditTarget::Create { parent: None }),
             (TREE_MENU_CREATE_FOLDER, TreeMenu::PinnedFolder { id, .. }) => {
                 begin_edit(hwnd, ctx, EditTarget::Create { parent: Some(*id) })
@@ -3370,31 +3486,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         LRESULT(0)
                     }
-                    // ダブルクリックで送る。行の上のときだけで、対象は Enter と同じく選んでいる
-                    // 先頭の行（複数選択は先頭だけ）
+                    // ダブルクリックで送る（フォルダの行は開く）。行の上のときだけで、対象は Enter と同じく
+                    // 選んでいる先頭の行（複数選択は先頭だけ）
                     (ID_LIST, NM_DBLCLK) => {
                         let nm = &*(lparam.0 as *const NMITEMACTIVATE);
                         let on_row = usize::try_from(nm.iItem).is_ok_and(|i| i < ctx.view.borrow().rows.len());
                         if let Some(target) = selected_row(hwnd, ctx).filter(|_| on_row) {
-                            let handler = Rc::clone(&ctx.handler);
-                            handler.on_activate(hwnd, target);
+                            activate_row(hwnd, ctx, target);
                         }
                         LRESULT(0)
                     }
                     // 一覧が Enter を自分で受け取った場合（ふつうは IsDialogMessageW が IDOK にする）
                     (ID_LIST, NM_RETURN) => {
-                        if let Some(id) = selected_row(hwnd, ctx) {
-                            let handler = Rc::clone(&ctx.handler);
-                            handler.on_activate(hwnd, id);
+                        if let Some(target) = selected_row(hwnd, ctx) {
+                            activate_row(hwnd, ctx, target);
                         }
                         LRESULT(0)
                     }
                     (ID_LIST, LVN_KEYDOWN) => {
                         let nm = &*(lparam.0 as *const NMLVKEYDOWN);
                         if nm.wVKey == VK_DELETE.0 {
-                            if let Some(id) = selected_row(hwnd, ctx) {
-                                let handler = Rc::clone(&ctx.handler);
-                                handler.on_delete(hwnd, id);
+                            if let Some(target) = selected_row(hwnd, ctx) {
+                                delete_row(hwnd, ctx, target);
                             }
                         } else if nm.wVKey == VK_F2.0 {
                             // ピン留めの行の名前の変更（履歴の行では何もしない）
@@ -3514,6 +3627,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 LRESULT(0)
             }
+            WM_APP_OPEN_FOLDER => {
+                if let Some(ctx) = ctx_ref(hwnd) {
+                    if let Some(id) = ctx.open_folder.take() {
+                        open_folder(hwnd, ctx, id);
+                    }
+                }
+                LRESULT(0)
+            }
             // 終了の要求の後もメニュー・確認ダイアログが開いていれば、閉じる要求をやり直す（メニューの
             // モーダルループの中でも届く）。閉じていれば止める
             WM_TIMER if wparam.0 == CLOSE_RETRY_TIMER_ID => {
@@ -3556,6 +3677,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let tool = match id as u16 {
                             CMD_FIND => {
                                 focus_search(hwnd);
+                                return LRESULT(0);
+                            }
+                            CMD_MOVE_UP | CMD_MOVE_DOWN => {
+                                let direction = if id as u16 == CMD_MOVE_UP { Direction::Up } else { Direction::Down };
+                                reorder_selected_row(hwnd, ctx, direction);
                                 return LRESULT(0);
                             }
                             CMD_ABOUT => {
@@ -3611,8 +3737,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if list_has_focus(hwnd) {
                         if let Some(ctx) = ctx_ref(hwnd) {
                             if let Some(row) = selected_row(hwnd, ctx) {
-                                let handler = Rc::clone(&ctx.handler);
-                                handler.on_activate(hwnd, row);
+                                activate_row(hwnd, ctx, row);
                             }
                         }
                     }
@@ -3884,6 +4009,7 @@ mod tests {
             kind: EntryKind::Text,
             thumb: None,
             pinned: false,
+            folder: None,
         }
     }
 
@@ -4152,7 +4278,13 @@ mod tests {
         let _gui = crate::tray::lock_gui_resource_tests();
         let (window, _recorder) = create_test_window();
         let empty_title = Row { formats: "CF_UNICODETEXT".into(), modified: crate::native::model::unix_now(), ..row("") };
-        set_rows(window.hwnd(), vec![empty_title, row("")], false);
+        // フォルダの行（フォルダのアイコンと中の数）も描ける
+        let folder = Row {
+            pinned: true,
+            folder: Some(crate::native::model::FolderCounts { items: 1, folders: 0 }),
+            ..row("箱")
+        };
+        set_rows(window.hwnd(), vec![empty_title, row(""), folder], false);
         show_and_paint(&window);
         assert!(unsafe { IsWindow(Some(window.hwnd())) }.as_bool());
     }
@@ -5938,6 +6070,207 @@ mod tests {
         assert_eq!(recorder.tools.borrow().as_slice(), [ToolCommand::ClearHistory]);
         assert_eq!(recorder.tree_commands.borrow().len(), 1);
         assert!(!modal_is_open(hwnd));
+    }
+
+    // --- ピン留めの一覧のフォルダの行と並べ替え ---
+
+    /// ピン留めの項目の行は「移動」の後に「上へ」「下へ」（先頭・末尾の方は灰色で、選んでも操作にならない）。
+    /// フォルダの行は「開く」「上へ」「下へ」「名前の変更...」「削除...」だけ。並べ替えの無い行には出さない。
+    #[test]
+    fn row_menu_offers_reorder_and_folder_items() {
+        use crate::native::model::Reorder;
+        use windows::Win32::UI::WindowsAndMessaging::{GetMenuItemCount, GetMenuItemID, GetMenuState, MF_BYPOSITION};
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let ids_of = |menu: &PopupMenu| unsafe {
+            (0..GetMenuItemCount(Some(menu.handle()))).map(|i| GetMenuItemID(menu.handle(), i) as usize).collect::<Vec<_>>()
+        };
+        let grayed = |menu: &PopupMenu, pos: u32| unsafe { GetMenuState(menu.handle(), pos, MF_BYPOSITION) & MF_GRAYED.0 != 0 };
+
+        let item = RowMenu { current: Some(None), reorder: Some(Reorder { up: false, down: true }), ..RowMenu::default() };
+        let menu = build_row_menu(&item, 96).unwrap();
+        assert_eq!(ids_of(&menu), [MENU_SEND, MENU_MOVE_UP, MENU_MOVE_DOWN, MENU_RENAME, MENU_DELETE]);
+        assert!(grayed(&menu, 1) && !grayed(&menu, 2), "先頭の「上へ」が灰色でない");
+        assert_eq!(row_command(MENU_MOVE_UP, &item), None, "灰色の「上へ」を操作にした");
+        assert_eq!(row_command(MENU_MOVE_DOWN, &item), Some(RowCommand::Reorder(Direction::Down)));
+
+        let folder = RowMenu { folder: true, reorder: Some(Reorder { up: true, down: true }), ..RowMenu::default() };
+        let menu = build_row_menu(&folder, 96).unwrap();
+        assert_eq!(ids_of(&menu), [MENU_SEND, MENU_MOVE_UP, MENU_MOVE_DOWN, MENU_RENAME, MENU_DELETE]);
+        assert!(!grayed(&menu, 1) && !grayed(&menu, 2));
+        assert_eq!(row_command(MENU_MOVE_UP, &folder), Some(RowCommand::Reorder(Direction::Up)));
+        assert_eq!(row_command(MENU_RENAME, &folder), Some(RowCommand::Rename));
+        let folder_while_searching = RowMenu { folder: true, ..RowMenu::default() };
+        assert_eq!(ids_of(&build_row_menu(&folder_while_searching, 96).unwrap()), [MENU_SEND, MENU_RENAME, MENU_DELETE]);
+        assert_eq!(row_command(MENU_MOVE_DOWN, &RowMenu::default()), None);
+    }
+
+    /// ツリー（「ピン留め」の下にフォルダ）と、一覧にフォルダの行・ピン留めの項目の行・履歴の行を入れ、
+    /// 先頭（フォルダの行）を選んで一覧にフォーカスを置く。戻り値の ID は フォルダ・項目・履歴の順。
+    fn window_with_folder_row() -> (ViewerWindow, Rc<Recorder>, [Uuid; 3]) {
+        use crate::native::model::FolderCounts;
+        let folder = Uuid::new_v4();
+        let (window, recorder, _tree, _items) = window_with_tree(Source::Pinned(None), folder);
+        let folder_row = Row { id: folder, pinned: true, folder: Some(FolderCounts { items: 0, folders: 0 }), ..row("f") };
+        let item_row = Row { pinned: true, ..row("p") };
+        let history_row = row("h");
+        let ids = [folder, item_row.id, history_row.id];
+        set_rows(window.hwnd(), vec![folder_row, item_row, history_row], false);
+        unsafe {
+            set_item_state(list(&window), 0, LVIS_SELECTED.0 | LVIS_FOCUSED.0);
+            let _ = SetFocus(Some(list(&window)));
+        }
+        pump(window.hwnd(), 20);
+        *recorder.tree_menu.borrow_mut() = Some(TreeMenu::PinnedFolder { id: folder, title: "f".into(), items: 0, folders: 0 });
+        (window, recorder, ids)
+    }
+
+    fn select_row(window: &ViewerWindow, index: i32) {
+        unsafe {
+            set_item_state(list(window), -1, 0);
+            set_item_state(list(window), index, LVIS_SELECTED.0 | LVIS_FOCUSED.0);
+        }
+    }
+
+    /// フォルダの行の Enter・ダブルクリックは送らず、通知の処理から戻った後にツリーでそのフォルダを選ぶ
+    /// （表示元の切り替えとして伝わる）。項目の行はいつもどおり送る。
+    #[test]
+    fn activating_folder_row_selects_folder_in_tree() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let (window, recorder, [folder, item, _]) = window_with_folder_row();
+        let hwnd = window.hwnd();
+        press_through_dialog_manager(&window, list(&window), VK_RETURN.0);
+        assert!(recorder.selected.borrow().is_empty(), "一覧の通知の処理の中でフォルダを開いた");
+        pump(hwnd, 30);
+        assert_eq!(recorder.selected.borrow().as_slice(), [Source::Pinned(Some(folder))]);
+        let tree = unsafe { GetDlgItem(Some(hwnd), ID_TREE).unwrap() };
+        let ctx = unsafe { ctx_ref(hwnd) }.unwrap();
+        assert_eq!(unsafe { selected_tree_source(ctx, tree) }, Some(Source::Pinned(Some(folder))));
+        assert!(recorder.activated.borrow().is_empty(), "フォルダの行を送った");
+
+        // ダブルクリックも同じ（ツリーの選択は済んでいるので、選び直しでは伝わらない。一度「ピン留め」へ戻す）
+        unsafe {
+            if let Some(item) = find_tree_item(ctx, tree, Source::Pinned(None)) {
+                SendMessageW(tree, TVM_SELECTITEM, Some(WPARAM(TVGN_CARET as usize)), Some(LPARAM(item.0)));
+            }
+        }
+        recorder.selected.borrow_mut().clear();
+        let mut nm = NMITEMACTIVATE { hdr: NMHDR { hwndFrom: list(&window), idFrom: ID_LIST as usize, code: NM_DBLCLK }, iItem: 0, ..Default::default() };
+        unsafe {
+            SendMessageW(hwnd, WM_NOTIFY, Some(WPARAM(ID_LIST as usize)), Some(LPARAM(&mut nm as *mut _ as isize)));
+        }
+        pump(hwnd, 30);
+        assert_eq!(recorder.selected.borrow().as_slice(), [Source::Pinned(Some(folder))]);
+
+        select_row(&window, 1);
+        press_through_dialog_manager(&window, list(&window), VK_RETURN.0);
+        assert_eq!(recorder.activated.borrow().as_slice(), [item]);
+    }
+
+    /// フォルダの行の Delete は確認を出し、「削除」のときだけフォルダの削除（`on_tree_command`）を伝える。
+    /// `on_delete` には来ない。
+    #[test]
+    fn deleting_folder_row_asks_for_confirmation() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let (window, recorder, [folder, ..]) = window_with_folder_row();
+        let hwnd = window.hwnd();
+        let press_delete = || unsafe {
+            SendMessageW(list(&window), WM_KEYDOWN, Some(WPARAM(VK_DELETE.0 as usize)), Some(LPARAM(0)));
+        };
+        during_dialog(hwnd, move || click_dialog_button(hwnd, IDCANCEL.0));
+        press_delete();
+        assert!(!finish_menu_test(), "確認がキャンセルで閉じなかった");
+        assert!(recorder.tree_commands.borrow().is_empty(), "キャンセルなのに伝えた");
+        during_dialog(hwnd, move || click_dialog_button(hwnd, CONFIRM_DELETE));
+        press_delete();
+        assert!(!finish_menu_test(), "確認が「削除」で閉じなかった");
+        assert_eq!(recorder.tree_commands.borrow().as_slice(), [TreeCommand::DeleteFolder(folder)]);
+        assert!(recorder.deleted.borrow().is_empty(), "フォルダの行を確認なしの削除で伝えた");
+    }
+
+    /// フォルダの行の F2 はフォルダの名前を聞き、前後の空白を除いて空でなければ名前の変更（`on_tree_command`）を
+    /// 伝える。空なら伝えない。アイテムの名前の変更（`on_rename_pinned`）には来ない。
+    #[test]
+    fn renaming_folder_row_reports_trimmed_name() {
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let (window, recorder, [folder, ..]) = window_with_folder_row();
+        let hwnd = window.hwnd();
+        let answer = move |text: &'static str| {
+            move || {
+                let edit = name_edit(hwnd);
+                let ctx = unsafe { ctx_ref(hwnd) }.unwrap();
+                let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+                unsafe {
+                    let _ = SetWindowTextW(edit, PCWSTR(wide.as_ptr()));
+                    SendMessageW(HWND(ctx.dialog.get() as *mut _), WM_COMMAND, Some(WPARAM(IDOK.0 as usize)), Some(LPARAM(0)));
+                }
+            }
+        };
+        let seen = Rc::new(RefCell::new(String::new()));
+        let seen_in = Rc::clone(&seen);
+        during_dialog(hwnd, move || {
+            let mut buf = [0u16; 64];
+            let n = unsafe { GetWindowTextW(name_edit(hwnd), &mut buf) } as usize;
+            *seen_in.borrow_mut() = String::from_utf16_lossy(&buf[..n]);
+            answer(" 新しい ")();
+        });
+        press_f2(&window);
+        assert!(!finish_menu_test(), "「OK」で閉じなかった");
+        assert_eq!(seen.borrow().as_str(), "f", "今の名前を入れていない");
+        during_dialog(hwnd, answer("  "));
+        press_f2(&window);
+        assert!(!finish_menu_test());
+        assert_eq!(
+            recorder.tree_commands.borrow().as_slice(),
+            [TreeCommand::RenameFolder { id: folder, title: "新しい".into() }]
+        );
+        assert!(recorder.renamed.borrow().is_empty());
+    }
+
+    /// Alt+↑・Alt+↓ はアクセラレータで並べ替えのコマンドになり、一覧にフォーカスがあるときだけ、選んでいる
+    /// ピン留めの行（フォルダの行を含む）の並べ替えを伝える。履歴の行・一覧の外では伝えない。Alt を押して
+    /// いなければ変換しない。Alt の状態は、このスレッドのキーの状態を書き換えて作る。
+    #[test]
+    fn alt_arrows_reorder_selected_pinned_row_only_in_list() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState, VK_MENU};
+        use windows::Win32::UI::WindowsAndMessaging::WM_SYSKEYDOWN;
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let (window, recorder, [folder, item, _]) = window_with_folder_row();
+        let hwnd = window.hwnd();
+        // lParam の 29 ビット目は Alt を押している印（WM_SYSKEYDOWN の説明）
+        let key = |vk: u16| MSG { hwnd: list(&window), message: WM_SYSKEYDOWN, wParam: WPARAM(vk as usize), lParam: LPARAM(0x2148_0001), ..Default::default() };
+        let mut saved = [0u8; 256];
+        unsafe {
+            GetKeyboardState(&mut saved).unwrap();
+        }
+        let with_alt = |down: bool| {
+            let mut state = saved;
+            state[VK_MENU.0 as usize] = if down { 0x80 } else { 0 };
+            unsafe { SetKeyboardState(&state).unwrap() };
+        };
+        with_alt(false);
+        let plain = translate_accelerator(hwnd, &key(VK_DOWN.0));
+        with_alt(true);
+        let down = translate_accelerator(hwnd, &key(VK_DOWN.0));
+        select_row(&window, 1);
+        let up = translate_accelerator(hwnd, &key(VK_UP.0));
+        select_row(&window, 2);
+        translate_accelerator(hwnd, &key(VK_UP.0));
+        select_row(&window, 1);
+        unsafe {
+            let _ = SetFocus(Some(search(&window)));
+        }
+        translate_accelerator(hwnd, &key(VK_UP.0));
+        unsafe {
+            SetKeyboardState(&saved).unwrap();
+        }
+        assert!(!plain, "Alt なしの ↓ を変換した");
+        assert!(down && up, "Alt+↑・Alt+↓ を変換しなかった");
+        assert_eq!(
+            recorder.commands.borrow().as_slice(),
+            [(folder, RowCommand::Reorder(Direction::Down)), (item, RowCommand::Reorder(Direction::Up))]
+        );
     }
 
     // --- ツリーの名前の編集 ---

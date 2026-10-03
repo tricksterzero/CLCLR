@@ -490,6 +490,20 @@ impl Core {
         Ok(())
     }
 
+    /// ピン留めの項目（またはフォルダ）を、同じ親の中で隣と入れ替える（`store::shift_node`。隣が項目か
+    /// フォルダかは問わない）。対象が無ければ `NotFound`、先頭・末尾で動かせなければ何もしない。blob は
+    /// 触らない。pinned.toml へ書けてからメモリに反映する。
+    pub fn reorder_pinned(&self, id: Uuid, direction: store::Direction) -> Result<(), OpError> {
+        let _scope = self.begin()?;
+        let mut nodes = self.with_service(|s| s.pinned.clone())?;
+        if !store::shift_node(&mut nodes, id, direction).ok_or(OpError::NotFound)? {
+            return Ok(());
+        }
+        self.inner.storage.save_pinned(&nodes)?;
+        self.with_service(|s| s.set_pinned(nodes))?;
+        Ok(())
+    }
+
     // --- 読む操作 ---
 
     /// 送るために項目を読む（厳密な読み込み）。読んでいる間は操作用のロックを持つので、押し出し・
@@ -1818,6 +1832,41 @@ pub(crate) mod tests {
         core.move_pinned(meta.id, None).unwrap();
         assert_eq!(core.read(|s| store::parent_of(&s.pinned, meta.id)), Some(Some(None)));
         assert_eq!(core.load_for_send(meta.id, true).unwrap().formats.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 並べ替え: 同じ親の中で、項目もフォルダも隣と入れ替える。端では保存せず、無い ID は NotFound。
+    /// 書けなければメモリを変えない。開き直しても並びが残る。
+    #[test]
+    fn reorder_pinned_swaps_items_and_folders_and_persists() {
+        use store::Direction::{Down, Up};
+        let (dir, core) = temp_core(Config::default());
+        core.capture(text_entry("項目")).unwrap();
+        core.pin(front_id(&core), None).unwrap();
+        let item = pinned_item(&core, 0).id;
+        core.create_folder(None, "箱").unwrap();
+        let folder = folder_id(&core, "箱");
+        let order = |core: &Core| core.read(|s| s.pinned.iter().map(PinnedNode::id).collect::<Vec<_>>()).unwrap();
+        assert_eq!(order(&core), [item, folder]);
+
+        let revision = core.read(|s| s.revision()).unwrap();
+        core.reorder_pinned(item, Up).unwrap();
+        core.reorder_pinned(folder, Down).unwrap();
+        assert_eq!(core.read(|s| s.revision()).unwrap(), revision, "端で保存した");
+        assert!(matches!(core.reorder_pinned(Uuid::new_v4(), Up), Err(OpError::NotFound)));
+
+        block_write(&dir, "pinned.toml");
+        assert!(core.reorder_pinned(folder, Up).is_err());
+        assert_eq!(order(&core), [item, folder], "書けないのに並べ替えた");
+        unblock_write(&dir, "pinned.toml");
+
+        core.reorder_pinned(folder, Up).unwrap();
+        assert_eq!(order(&core), [folder, item]);
+        drop(core);
+        let core = reopen(&dir, Config::default());
+        assert_eq!(order(&core), [folder, item]);
+        core.reorder_pinned(folder, Down).unwrap();
+        assert_eq!(order(&core), [item, folder]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

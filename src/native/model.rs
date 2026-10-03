@@ -27,9 +27,13 @@ pub enum Source {
 pub use crate::data::EntryKind;
 
 /// 行の右クリックメニューに出す項目。
-/// 「クリップボードへ送る」と「削除」はいつも出す。
+/// 「クリップボードへ送る」（フォルダの行は「開く」）と「削除」はいつも出す。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RowMenu {
+    /// 行がピン留めのフォルダ（「開く」「名前の変更...」「削除...」と並べ替えだけを出す）
+    pub folder: bool,
+    /// 「上へ」「下へ」（ピン留めの行を、検索せずに表示しているときだけ）
+    pub reorder: Option<Reorder>,
     /// 「ピン留めに追加」（履歴・階層表示のフォルダを表示しているときだけ）
     pub can_pin: bool,
     /// 「画像を関連付けで開く」「画像を書き出してフォルダで表示」（CF_DIB があるときだけ）
@@ -51,6 +55,13 @@ pub struct PinTarget {
     pub title: String,
     pub depth: usize,
     pub guide: Vec<TreeGuide>,
+}
+
+/// 「上へ」「下へ」をそれぞれ選べるか（同じ親の中の先頭・末尾では選べない）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reorder {
+    pub up: bool,
+    pub down: bool,
 }
 
 /// 入れる先のルートの表示名。
@@ -85,7 +96,7 @@ pub fn pin_targets(nodes: &[PinnedNode]) -> Vec<PinTarget> {
 impl RowMenu {
     /// 形式名の一覧から作る（入れる先は空。呼び出し側が `pin_targets`・`current` を入れる）。
     pub fn from_formats<'a>(names: impl IntoIterator<Item = &'a str>, can_pin: bool) -> Self {
-        let mut menu = Self { can_pin, has_image: false, has_text: false, pin_targets: Vec::new(), current: None };
+        let mut menu = Self { can_pin, ..Self::default() };
         for name in names {
             match name {
                 "CF_DIB" => menu.has_image = true,
@@ -99,27 +110,35 @@ impl RowMenu {
 
 /// 操作の対象の行。`pinned` は、その行がピン留めの項目か（表示元の今の設定ではなく、行を作った
 /// ときの表示元で決まる。検索の結果を待つ間に表示元を切り替えても、画面の行と対象がずれない）。
+/// `folder` は、その行がピン留めのフォルダか（そのとき `pinned` も立つ）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowTarget {
     pub id: Uuid,
     pub pinned: bool,
+    pub folder: bool,
 }
 
-/// 行に対する操作（Enter・ダブルクリック・Delete・右クリックメニュー）。
+/// 行に対する操作（Enter・ダブルクリック・Delete・Alt+↑・Alt+↓・右クリックメニュー）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowCommand {
+    /// 項目を送る。フォルダの行では開く（ビューアがツリーでそのフォルダを選ぶので、`on_row_command` には
+    /// 来ない）
     Send,
     /// 履歴の行をピン留めへ（内の値は入れる先。None はルート）
     Pin(Option<Uuid>),
     /// ピン留めの行を移す（入れる先。None はルート）
     Move(Option<Uuid>),
+    /// ピン留めの行（項目・フォルダ）を、同じ親の中で隣と入れ替える
+    Reorder(store::Direction),
     OpenImage,
     /// 画像を書き出し、そのファイルを選んだ状態でフォルダを開く
     OpenImageLocation,
     Transform(crate::tools::text::TextTransform),
+    /// 削除。フォルダの行は、ビューアが確認してから `ViewerHandler::on_tree_command` で伝えるので、
+    /// `on_row_command` には来ない
     Delete,
-    /// ピン留めの行の名前の変更。ビューアが名前を聞いてから `ViewerHandler::on_rename_pinned` で
-    /// 伝えるので、`on_row_command` には来ない
+    /// ピン留めの行の名前の変更。ビューアが名前を聞いてから `ViewerHandler::on_rename_pinned`（フォルダの
+    /// 行は `on_tree_command`）で伝えるので、`on_row_command` には来ない
     Rename,
 }
 
@@ -146,18 +165,43 @@ pub struct Row {
     pub kind: EntryKind,
     /// サムネイルのファイル名
     pub thumb: Option<String>,
-    /// ピン留めの項目か（操作の対象をピン留めから探す。RowTarget）
+    /// ピン留めの項目か（操作の対象をピン留めから探す。RowTarget）。フォルダの行も立つ
     pub pinned: bool,
+    /// ピン留めのフォルダの行なら、直下の項目・フォルダの数（2行目に出す）
+    pub folder: Option<FolderCounts>,
+}
+
+/// ピン留めのフォルダの行の、直下の項目とフォルダの数。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FolderCounts {
+    pub items: usize,
+    pub folders: usize,
+}
+
+impl FolderCounts {
+    /// フォルダの行の2行目（「フォルダ — 項目 2 件、フォルダ 1 個」。空なら「フォルダ — 空」）。
+    fn detail(self) -> String {
+        let inside = match (self.items, self.folders) {
+            (0, 0) => "空".to_string(),
+            (i, 0) => format!("項目 {i} 件"),
+            (0, f) => format!("フォルダ {f} 個"),
+            (i, f) => format!("項目 {i} 件、フォルダ {f} 個"),
+        };
+        format!("フォルダ — {inside}")
+    }
 }
 
 impl Row {
     /// 操作の対象。
     pub fn target(&self) -> RowTarget {
-        RowTarget { id: self.id, pinned: self.pinned }
+        RowTarget { id: self.id, pinned: self.pinned, folder: self.folder.is_some() }
     }
 
-    /// 2行目（経過時間 — 形式名の一覧）。`now` は UNIX 秒。形式名が無ければ空。
+    /// 2行目（経過時間 — 形式名の一覧。フォルダの行は中の数）。`now` は UNIX 秒。形式名が無ければ空。
     pub fn detail(&self, now: f64) -> String {
+        if let Some(counts) = self.folder {
+            return counts.detail();
+        }
         if self.formats.is_empty() {
             return String::new();
         }
@@ -216,10 +260,30 @@ pub fn row_from_meta(meta: &EntryMeta, extra_formats: &[&str]) -> Row {
         kind: EntryKind::from_format_names(names.iter().copied()),
         thumb: meta.formats.iter().find_map(|f| f.thumb.clone()),
         pinned: false,
+        folder: None,
     }
 }
 
-/// 表示対象の行を作る（検索なし）。サービスのロックを取った状態で呼ぶ。
+/// ピン留めのフォルダの行（名前と、直下の項目・フォルダの数）。
+fn folder_row(folder: &store::PinnedFolder) -> Row {
+    let counts = folder.children.iter().fold(FolderCounts { items: 0, folders: 0 }, |c, node| match node {
+        PinnedNode::Item(_) => FolderCounts { items: c.items + 1, ..c },
+        PinnedNode::Folder(_) => FolderCounts { folders: c.folders + 1, ..c },
+    });
+    Row {
+        id: folder.id,
+        label: folder.title.clone(),
+        modified: 0.0,
+        formats: String::new(),
+        kind: EntryKind::Other,
+        thumb: None,
+        pinned: true,
+        folder: Some(counts),
+    }
+}
+
+/// 表示対象の行を作る（検索なし）。サービスのロックを取った状態で呼ぶ。ピン留めは、項目とフォルダを
+/// 保存した順に混ぜて並べる（ポップアップメニューと同じ順。並べ替えで前後を変えられる）。
 pub fn rows_for(service: &HistoryService, source: Source, grouping: &HistoryGroupingConfig) -> Vec<Row> {
     let history_row = |item: &store::HistoryItem| {
         let extra: Vec<&str> = item.resident.iter().map(|f| f.format_name.as_str()).collect();
@@ -242,10 +306,9 @@ pub fn rows_for(service: &HistoryService, source: Source, grouping: &HistoryGrou
         Source::Pinned(folder) => store::find_children(&service.pinned, folder)
             .unwrap_or(&[])
             .iter()
-            .filter_map(|node| match node {
-                PinnedNode::Item(meta) => Some(Row { pinned: true, ..row_from_meta(meta, &[]) }),
-                // フォルダはツリー側から辿る
-                PinnedNode::Folder(_) => None,
+            .map(|node| match node {
+                PinnedNode::Item(meta) => Row { pinned: true, ..row_from_meta(meta, &[]) },
+                PinnedNode::Folder(folder) => folder_row(folder),
             })
             .collect(),
     }
@@ -520,6 +583,28 @@ mod tests {
         assert_eq!(row.detail(1000.0 + 3600.0 * 2.0), "2時間前 — CF_UNICODETEXT");
         let no_formats = Row { formats: String::new(), ..row };
         assert_eq!(no_formats.detail(5000.0), "");
+    }
+
+    /// フォルダの行の2行目は、直下の項目・フォルダの数（経過時間は出さない）。操作の対象はフォルダ。
+    #[test]
+    fn folder_row_detail_counts_direct_children() {
+        let row = row_from_meta(&meta(None, Some("x"), &["CF_UNICODETEXT"], 1000.0), &[]);
+        let detail = |items, folders| Row { folder: Some(FolderCounts { items, folders }), ..row.clone() }.detail(5000.0);
+        assert_eq!(detail(0, 0), "フォルダ — 空");
+        assert_eq!(detail(2, 0), "フォルダ — 項目 2 件");
+        assert_eq!(detail(0, 1), "フォルダ — フォルダ 1 個");
+        assert_eq!(detail(3, 2), "フォルダ — 項目 3 件、フォルダ 2 個");
+        let folder = PinnedFolder {
+            id: Uuid::new_v4(),
+            title: "箱".into(),
+            children: vec![
+                PinnedNode::Item(meta(None, Some("a"), &["CF_UNICODETEXT"], 0.0)),
+                PinnedNode::Folder(PinnedFolder { id: Uuid::new_v4(), title: "中".into(), children: vec![] }),
+            ],
+        };
+        let row = folder_row(&folder);
+        assert_eq!((row.label.as_str(), row.detail(0.0).as_str()), ("箱", "フォルダ — 項目 1 件、フォルダ 1 個"));
+        assert_eq!(row.target(), RowTarget { id: folder.id, pinned: true, folder: true });
     }
 
     #[test]

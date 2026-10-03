@@ -41,6 +41,7 @@ use crate::data::{utf16_bytes, utf16_text, Format};
 use crate::datacheck::{CleanResult, DataReport};
 use crate::ops::{Core, OpError};
 use crate::service::ImageData;
+use crate::store::Direction;
 use crate::tools::text::{convert_entry_date, TextTransform};
 
 /// 同時に起動中にできる「関連付けで開く」の数（ダイアログを閉じずに開き続けても、Shell
@@ -62,6 +63,8 @@ pub enum Action {
     Pin { id: Uuid, to: Option<Uuid> },
     /// ピン留めの項目を `to`（None はルート）のフォルダへ移す（`Core::move_pinned`）
     MovePinned { id: Uuid, to: Option<Uuid> },
+    /// ピン留めの項目・フォルダを、同じ親の中で隣と入れ替える（`Core::reorder_pinned`）
+    ReorderPinned { id: Uuid, direction: Direction },
     /// `parent`（None はルート）の中にフォルダを作る（`Core::create_folder`）
     CreateFolder { parent: Option<Uuid>, title: String },
     /// フォルダの名前を変える（`Core::rename_folder`）
@@ -90,6 +93,7 @@ pub enum ActionKind {
     OpenImageLocation,
     Pin,
     MovePinned,
+    ReorderPinned,
     CreateFolder,
     RenameFolder,
     RenamePinned,
@@ -123,6 +127,7 @@ impl ActionKind {
             Self::OpenImageLocation => "画像を書き出してフォルダで表示できませんでした",
             Self::Pin => "ピン留めに追加できませんでした",
             Self::MovePinned => "移動できませんでした",
+            Self::ReorderPinned => "並べ替えられませんでした",
             Self::CreateFolder => "フォルダを作成できませんでした",
             Self::RenameFolder | Self::RenamePinned => "名前を変更できませんでした",
             Self::Delete => "削除できませんでした",
@@ -145,6 +150,7 @@ impl Action {
             Self::OpenImageLocation { .. } => ActionKind::OpenImageLocation,
             Self::Pin { .. } => ActionKind::Pin,
             Self::MovePinned { .. } => ActionKind::MovePinned,
+            Self::ReorderPinned { .. } => ActionKind::ReorderPinned,
             Self::CreateFolder { .. } => ActionKind::CreateFolder,
             Self::RenameFolder { .. } => ActionKind::RenameFolder,
             Self::RenamePinned { .. } => ActionKind::RenamePinned,
@@ -530,6 +536,7 @@ impl<E: Effects> Worker<E> {
             Action::OpenImageLocation { id, pinned } => self.export_image(id, pinned, ShellAction::Reveal),
             Action::Pin { id, to } => self.pin(id, to),
             Action::MovePinned { id, to } => self.move_pinned(id, to),
+            Action::ReorderPinned { id, direction } => self.reorder_pinned(id, direction),
             Action::CreateFolder { parent, title } => self.create_folder(parent, &title),
             Action::RenameFolder { id, title } => self.rename_folder(id, &title),
             Action::RenamePinned { id, title } => self.rename_pinned(id, &title),
@@ -589,6 +596,14 @@ impl<E: Effects> Worker<E> {
     /// ピン留めの項目を移し、ビューアを起こして一覧に反映させる。対象・入れる先が無いときも知らせる。
     fn move_pinned(&self, id: Uuid, to: Option<Uuid>) -> Result<(), Stop> {
         self.core.move_pinned(id, to)?;
+        self.sink.wake();
+        Ok(())
+    }
+
+    /// ピン留めの項目・フォルダを並べ替え、ビューアを起こして一覧・ツリーに反映させる。対象が無いとき
+    /// （削除と入れ違った）・保存できないときは知らせる。
+    fn reorder_pinned(&self, id: Uuid, direction: Direction) -> Result<(), Stop> {
+        self.core.reorder_pinned(id, direction)?;
         self.sink.wake();
         Ok(())
     }
@@ -1283,6 +1298,26 @@ mod tests {
         assert_eq!(kinds, [ActionKind::Pin, ActionKind::MovePinned, ActionKind::MovePinned]);
         // 失敗の知らせも起こす（`FailureSink::report`）ので、成功の 2 回と失敗の 3 回
         assert_eq!(h.wakes(), 5);
+    }
+
+    /// 並べ替え: 成功（端で動かないときも）はビューアを起こす。項目が無いときは知らせる。
+    #[test]
+    fn reorder_pinned_wakes_viewer_and_reports_missing_item() {
+        let h = Harness::new(Fake::default());
+        h.core.capture(text_entry("並べる")).unwrap();
+        h.core.pin(front_id(&h.core), None).unwrap();
+        h.core.create_folder(None, "箱").unwrap();
+        let item = pinned_item(&h.core, 0).id;
+        h.handle(Action::ReorderPinned { id: item, direction: Direction::Down });
+        assert_eq!(h.wakes(), 1);
+        assert_eq!(h.core.read(|s| s.pinned[1].id()), Some(item));
+        h.handle(Action::ReorderPinned { id: item, direction: Direction::Down });
+        assert_eq!(h.wakes(), 2);
+        assert!(h.failures().is_empty());
+
+        h.handle(Action::ReorderPinned { id: Uuid::new_v4(), direction: Direction::Up });
+        let kinds: Vec<ActionKind> = h.failures().iter().map(|f| f.kind).collect();
+        assert_eq!(kinds, [ActionKind::ReorderPinned]);
     }
 
     /// フォルダの作成・名前の変更: 成功したらビューアを起こす。同じ名前・無い親・無いフォルダは

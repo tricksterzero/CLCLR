@@ -167,6 +167,43 @@ pub fn parent_of(nodes: &[PinnedNode], id: Uuid) -> Option<Option<Uuid>> {
     search(nodes, id, None)
 }
 
+/// ピン留めの並べ替えの向き（`shift_node`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// 前（一覧・メニューの上）へ
+    Up,
+    /// 後ろ（一覧・メニューの下）へ
+    Down,
+}
+
+/// 指定idのノード（項目・フォルダ）を、同じ親の中で隣のノード（`Up` は前、`Down` は後ろ）と入れ替える。
+/// 隣が項目かフォルダかは問わない（ポップアップメニューは項目とフォルダを保存した順に混ぜて並べるため）。
+/// 見つからなければ None、先頭・末尾で動かせなければ何もせず Some(false)。
+pub fn shift_node(nodes: &mut [PinnedNode], id: Uuid, direction: Direction) -> Option<bool> {
+    if let Some(pos) = nodes.iter().position(|n| n.id() == id) {
+        let neighbor = match direction {
+            Direction::Up => pos.checked_sub(1),
+            Direction::Down => Some(pos + 1).filter(|&i| i < nodes.len()),
+        };
+        return Some(neighbor.is_some_and(|other| {
+            nodes.swap(pos, other);
+            true
+        }));
+    }
+    nodes.iter_mut().find_map(|node| match node {
+        PinnedNode::Folder(folder) => shift_node(&mut folder.children, id, direction),
+        PinnedNode::Item(_) => None,
+    })
+}
+
+/// 指定idのノードを同じ親の中で前・後ろへ動かせるか（`shift_node` で動くか）。見つからなければ None。
+pub fn shift_bounds(nodes: &[PinnedNode], id: Uuid) -> Option<(bool, bool)> {
+    let parent = parent_of(nodes, id)?;
+    let siblings = find_children(nodes, parent)?;
+    let pos = siblings.iter().position(|n| n.id() == id)?;
+    Some((pos > 0, pos + 1 < siblings.len()))
+}
+
 /// フォルダ名の正規化（前後の空白を除く）。作成・名前の変更・同じ名前の判定で共用する
 /// （比較は正規化した後の完全一致で、大文字小文字を区別する）。
 pub fn normalize_folder_name(name: &str) -> &str {
@@ -486,6 +523,32 @@ mod tests {
         assert_eq!(children_mut(&mut tree, Some(nested_folder_id)).map(|c| c.len()), Some(1));
         assert!(children_mut(&mut tree, Some(item_a)).is_none());
         assert!(children_mut(&mut tree, Some(Uuid::new_v4())).is_none());
+    }
+
+    /// 並べ替え: 同じ親の中で、隣が項目でもフォルダでも入れ替える（フォルダは中身ごと動く）。入れ子の中も
+    /// 探す。先頭の上へ・末尾の下へは何もせず Some(false)、無い ID は None。動かせるかの判定と合う。
+    #[test]
+    fn shift_node_swaps_with_neighbor_of_any_kind() {
+        let (mut tree, item_a, item_b, item_c, folder_id, nested_folder_id) = nested_tree();
+        let ids = |nodes: &[PinnedNode]| nodes.iter().map(PinnedNode::id).collect::<Vec<_>>();
+        assert_eq!(shift_bounds(&tree, item_a), Some((false, true)));
+        assert_eq!(shift_bounds(&tree, folder_id), Some((true, false)));
+        assert_eq!(shift_bounds(&tree, item_c), Some((false, false)));
+        assert_eq!(shift_bounds(&tree, Uuid::new_v4()), None);
+
+        // ルート: 項目A・フォルダ → フォルダ・項目A（フォルダの中身は変わらない）
+        assert_eq!(shift_node(&mut tree, item_a, Direction::Down), Some(true));
+        assert_eq!(ids(&tree), [folder_id, item_a]);
+        assert_eq!(find_children(&tree, Some(folder_id)).map(ids), Some(vec![item_b, nested_folder_id]));
+        assert_eq!(shift_node(&mut tree, item_a, Direction::Down), Some(false));
+        assert_eq!(shift_node(&mut tree, folder_id, Direction::Up), Some(false));
+        assert_eq!(ids(&tree), [folder_id, item_a]);
+
+        // 入れ子: 中のフォルダを項目Bの前へ
+        assert_eq!(shift_node(&mut tree, nested_folder_id, Direction::Up), Some(true));
+        assert_eq!(find_children(&tree, Some(folder_id)).map(ids), Some(vec![nested_folder_id, item_b]));
+        assert_eq!(shift_node(&mut tree, item_c, Direction::Up), Some(false));
+        assert_eq!(shift_node(&mut tree, Uuid::new_v4(), Direction::Up), None);
     }
 
     /// 同じ名前の判定は前後の空白を除いて比べ、大文字小文字を区別し、除く ID は比べない。項目は数えない。

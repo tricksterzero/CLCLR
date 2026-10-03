@@ -36,7 +36,7 @@ use crate::native::actions::{Action, ActionFailure, ActionKind, FailureSink, Not
 use crate::native::settings::{self, SettingsWindow};
 use crate::native::images::ImageSource;
 use crate::native::model::{
-    self, Row, RowCommand, RowMenu, RowTarget, Source, ToolCommand, TreeCommand, TreeMenu, TreeNode,
+    self, Reorder, Row, RowCommand, RowMenu, RowTarget, Source, ToolCommand, TreeCommand, TreeMenu, TreeNode,
 };
 use crate::native::search::{self, SearchResult, TextSource};
 use crate::native::viewer::{self, ViewerHandler};
@@ -1135,15 +1135,28 @@ impl ViewerHandler for App {
     /// 行がピン留めの項目ならピン留めから、そうでなければ履歴から探し、その形式から決める。
     /// ロックの中では読み込み元（メタデータと resident の `Arc`）を写すだけ。
     /// ピン留めの入れる先の並び（ルートとフォルダ）と、ピン留めの行なら今いる所も、メタデータから
-    /// 組み立てる。
+    /// 組み立てる。フォルダの行は、そのフォルダがあれば、開く・名前の変更・削除と並べ替えだけ。
+    /// 並べ替えは、ピン留めの行を検索せずに表示しているときだけ（検索の結果はフォルダをまたぐため）。
     fn row_menu(&self, target: RowTarget) -> Option<RowMenu> {
-        let RowTarget { id, pinned } = target;
-        let (source, targets, current) = self
+        let RowTarget { id, pinned, folder } = target;
+        let reorderable = pinned && self.needle.borrow().is_empty();
+        let reorder_of = |s: &HistoryService| {
+            reorderable.then(|| store::shift_bounds(&s.pinned, id)).flatten().map(|(up, down)| Reorder { up, down })
+        };
+        if folder {
+            return self
+                .core
+                .read(|s| {
+                    store::find_folder(&s.pinned, id).map(|_| RowMenu { folder: true, reorder: reorder_of(s), ..RowMenu::default() })
+                })
+                .flatten();
+        }
+        let (source, targets, current, reorder) = self
             .core
             .read(|s| {
                 let source = if pinned { s.pinned_source(id) } else { s.history_source(id) };
                 let current = if pinned { store::parent_of(&s.pinned, id) } else { None };
-                (source, model::pin_targets(&s.pinned), current)
+                (source, model::pin_targets(&s.pinned), current, reorder_of(s))
             })?;
         let source = source?;
         let names = source.meta.formats.iter().map(|f| f.format_name.as_str());
@@ -1151,14 +1164,21 @@ impl ViewerHandler for App {
         let mut menu = RowMenu::from_formats(names.chain(resident), !pinned);
         menu.pin_targets = targets;
         menu.current = current;
+        menu.reorder = reorder;
         Some(menu)
     }
 
     /// 操作スレッドへ依頼する（完了を待たない）。対象の保管先は行が決める（今の表示元からは
-    /// 決めない）。ピン留めは履歴の行だけ、移動はピン留めの行だけ。
+    /// 決めない）。ピン留めは履歴の行だけ、移動はピン留めの項目の行だけ、並べ替えはピン留めの行を検索せずに
+    /// 表示しているときだけ。フォルダの行は並べ替えだけ（開く・名前の変更・確認の後の削除はビューアが扱う）。
     fn on_row_command(&self, _hwnd: HWND, target: RowTarget, command: RowCommand) {
-        let RowTarget { id, pinned } = target;
+        let RowTarget { id, pinned, folder } = target;
         let action = match command {
+            RowCommand::Reorder(direction) if pinned && self.needle.borrow().is_empty() => {
+                Action::ReorderPinned { id, direction }
+            }
+            RowCommand::Reorder(_) => return,
+            _ if folder => return,
             RowCommand::Send => Action::Send { id, pinned },
             RowCommand::Pin(_) if pinned => return,
             RowCommand::Pin(to) => Action::Pin { id, to },
@@ -1555,8 +1575,8 @@ mod tests {
         let (requests, received) = mpsc::channel();
         app.attach_actions(requests, FailureSink::new(|| {}));
         let hwnd = HWND::default();
-        let history_row = RowTarget { id, pinned: false };
-        let pinned_row = RowTarget { id, pinned: true };
+        let history_row = RowTarget { id, pinned: false, folder: false };
+        let pinned_row = RowTarget { id, pinned: true, folder: false };
         // 表示元はピン留めに切り替わっているが、画面には履歴の行が残っている
         app.source.set(Source::Pinned(None));
         app.on_activate(hwnd, history_row);
@@ -1647,21 +1667,24 @@ mod tests {
         core.capture(dib_entry()).unwrap();
         let image_id = crate::ops::tests::front_id(&core);
         let app = test_app(&core);
-        let history = |id| RowTarget { id, pinned: false };
-        let pinned = |id| RowTarget { id, pinned: true };
+        let history = |id| RowTarget { id, pinned: false, folder: false };
+        let pinned = |id| RowTarget { id, pinned: true, folder: false };
         let root_only = model::pin_targets(&[]);
-        let expect = |can_pin, has_image, has_text, current| RowMenu {
+        let expect = |can_pin, has_image, has_text, current, reorder| RowMenu {
             can_pin,
             has_image,
             has_text,
             pin_targets: root_only.clone(),
             current,
+            reorder,
+            folder: false,
         };
-        assert_eq!(app.row_menu(history(text_id)), Some(expect(true, false, true, None)));
-        assert_eq!(app.row_menu(history(image_id)), Some(expect(true, true, false, None)));
+        assert_eq!(app.row_menu(history(text_id)), Some(expect(true, false, true, None, None)));
+        assert_eq!(app.row_menu(history(image_id)), Some(expect(true, true, false, None, None)));
         core.pin(text_id, None).unwrap();
         let pinned_id = crate::ops::tests::pinned_item(&core, 0).id;
-        assert_eq!(app.row_menu(pinned(pinned_id)), Some(expect(false, false, true, Some(None))));
+        let alone = Some(Reorder { up: false, down: false });
+        assert_eq!(app.row_menu(pinned(pinned_id)), Some(expect(false, false, true, Some(None), alone)));
         assert_eq!(app.row_menu(pinned(text_id)), None, "ピン留めの行を履歴から探した");
         let _ = std::fs::remove_dir_all(dir);
 
@@ -1670,7 +1693,58 @@ mod tests {
         core.capture(text_entry("メモリだけ")).unwrap();
         let id = crate::ops::tests::front_id(&core);
         let app = test_app(&core);
-        assert_eq!(app.row_menu(history(id)), Some(expect(true, false, true, None)));
+        assert_eq!(app.row_menu(history(id)), Some(expect(true, false, true, None, None)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// ピン留めの並べ替え: メニューの「上へ」「下へ」は同じ親の中の位置で決まり、項目とフォルダを区別しない。
+    /// フォルダの行のメニューは、フォルダがあるときだけ出す。検索中は並べ替えを出さず、依頼もしない。
+    /// フォルダの行は並べ替えだけを依頼し、送る・削除（確認の前）などは依頼しない。
+    #[test]
+    fn reorder_menu_and_commands_follow_position_and_search() {
+        use crate::store::Direction::{Down, Up};
+        let (dir, core) = temp_service(Config::default());
+        core.capture(text_entry("項目")).unwrap();
+        core.pin(crate::ops::tests::front_id(&core), None).unwrap();
+        let item = crate::ops::tests::pinned_item(&core, 0).id;
+        core.create_folder(None, "箱").unwrap();
+        let folder = crate::ops::tests::folder_id(&core, "箱");
+        let app = test_app(&core);
+        let item_row = RowTarget { id: item, pinned: true, folder: false };
+        let folder_row = RowTarget { id: folder, pinned: true, folder: true };
+
+        let menu = app.row_menu(item_row).unwrap();
+        assert_eq!(menu.reorder, Some(Reorder { up: false, down: true }));
+        assert!(!menu.folder);
+        assert_eq!(
+            app.row_menu(folder_row),
+            Some(RowMenu { folder: true, reorder: Some(Reorder { up: true, down: false }), ..RowMenu::default() })
+        );
+        assert_eq!(app.row_menu(RowTarget { id: Uuid::new_v4(), ..folder_row }), None, "無いフォルダのメニューを出した");
+
+        let (requests, received) = mpsc::channel();
+        app.attach_actions(requests, FailureSink::new(|| {}));
+        let hwnd = HWND::default();
+        app.on_row_command(hwnd, item_row, RowCommand::Reorder(Down));
+        app.on_row_command(hwnd, folder_row, RowCommand::Reorder(Up));
+        app.on_row_command(hwnd, RowTarget { id: item, pinned: false, folder: false }, RowCommand::Reorder(Up));
+        for command in [RowCommand::Send, RowCommand::Delete, RowCommand::Move(None), RowCommand::Rename] {
+            app.on_row_command(hwnd, folder_row, command);
+        }
+        app.on_activate(hwnd, folder_row);
+        app.on_delete(hwnd, folder_row);
+        *app.needle.borrow_mut() = "項".into();
+        app.on_row_command(hwnd, item_row, RowCommand::Reorder(Down));
+        assert_eq!(app.row_menu(item_row).unwrap().reorder, None, "検索中に並べ替えを出した");
+        assert_eq!(app.row_menu(folder_row).unwrap().reorder, None);
+        assert_eq!(
+            received.try_iter().collect::<Vec<_>>(),
+            [
+                Action::ReorderPinned { id: item, direction: Down },
+                Action::ReorderPinned { id: folder, direction: Up },
+            ]
+        );
+        drop(app);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1689,12 +1763,12 @@ mod tests {
         let pinned_id = core.read(|s| store::find_folder(&s.pinned, nested).unwrap().children[0].id()).unwrap();
         let app = test_app(&core);
 
-        let menu = app.row_menu(RowTarget { id: pinned_id, pinned: true }).unwrap();
+        let menu = app.row_menu(RowTarget { id: pinned_id, pinned: true, folder: false }).unwrap();
         let listed: Vec<(Option<Uuid>, &str, usize)> =
             menu.pin_targets.iter().map(|t| (t.folder, t.title.as_str(), t.depth)).collect();
         assert_eq!(listed, [(None, model::PIN_ROOT_LABEL, 0), (Some(work), "仕事", 1), (Some(nested), "中", 2)]);
         assert_eq!(menu.current, Some(Some(nested)));
-        let menu = app.row_menu(RowTarget { id: text_id, pinned: false }).unwrap();
+        let menu = app.row_menu(RowTarget { id: text_id, pinned: false, folder: false }).unwrap();
         assert_eq!(menu.pin_targets.len(), 3);
         assert_eq!(menu.current, None);
         let _ = std::fs::remove_dir_all(dir);
@@ -1720,6 +1794,37 @@ mod tests {
             assert!(!rows.is_empty());
             assert!(rows.iter().all(|r| r.pinned == matches!(source, Source::Pinned(_))), "{source:?}");
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// ピン留めの一覧は、項目とフォルダを保存した順に混ぜて並べる（ポップアップメニューと同じ順）。フォルダの
+    /// 行の操作の対象はそのフォルダで、2行目は直下の数。検索の候補にはフォルダを入れない（項目だけ）。
+    #[test]
+    fn pinned_rows_interleave_folders_in_saved_order() {
+        use crate::ops::tests::{folder_id, front_id};
+        let (dir, core) = temp_service(Config::default());
+        core.capture(text_entry("前")).unwrap();
+        core.pin(front_id(&core), None).unwrap();
+        core.create_folder(None, "箱").unwrap();
+        let folder = folder_id(&core, "箱");
+        core.capture(text_entry("中")).unwrap();
+        core.pin(front_id(&core), Some(folder)).unwrap();
+        core.create_folder(Some(folder), "小").unwrap();
+        core.capture(text_entry("後")).unwrap();
+        core.pin(front_id(&core), None).unwrap();
+        let grouping = crate::config::HistoryGroupingConfig::default();
+        let rows = core.read(|s| model::rows_for(s, Source::Pinned(None), &grouping)).unwrap();
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["前", "箱", "後"]);
+        assert_eq!(rows[1].target(), RowTarget { id: folder, pinned: true, folder: true });
+        assert_eq!(rows[1].detail(0.0), "フォルダ — 項目 1 件、フォルダ 1 個");
+        assert!(rows[0].folder.is_none() && rows[2].folder.is_none());
+        let inside = core.read(|s| model::rows_for(s, Source::Pinned(Some(folder)), &grouping)).unwrap();
+        assert_eq!(inside.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["中", "小"]);
+
+        let (candidates, _rows) = core.read(|s| search_candidates(s, Source::Pinned(None))).unwrap();
+        let titles: Vec<Option<&str>> = candidates.iter().map(|c| c.title.as_deref()).collect();
+        assert_eq!(titles, [Some("前"), Some("中"), Some("後")]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
