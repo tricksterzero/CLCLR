@@ -1711,8 +1711,9 @@ mod tests {
     }
 
     /// ピン留めの並べ替え: メニューの「上へ」「下へ」は同じ親の中の位置で決まり、項目とフォルダを区別しない。
-    /// フォルダの行のメニューは、フォルダがあるときだけ出す。検索中は並べ替えを出さず、並べ替え・ドラッグでの
-    /// 移動を依頼せず、ピン留めの行のドラッグもさせない（履歴の行のドラッグはピン留めなので、検索中もさせる）。
+    /// フォルダの行のメニューは、フォルダがあるときだけ出す。検索中は並べ替えを出さず、項目・フォルダの行の並べ替え・
+    /// ドラッグでの移動を依頼せず、ピン留めの行のドラッグもさせない（履歴の行のドラッグはピン留めなので、検索中も
+    /// させる）。検索中も、右クリックの「移動」と履歴の行のピン留めは依頼する。
     /// フォルダの行は移動・並べ替えだけを依頼し、送る・削除（確認の前）などは依頼しない。
     /// 履歴の行は、移動・並べ替えを依頼しない。
     #[test]
@@ -1764,6 +1765,12 @@ mod tests {
         *app.needle.borrow_mut() = "項".into();
         app.on_row_command(hwnd, item_row, RowCommand::Reorder(Down));
         app.on_row_command(hwnd, item_row, place);
+        app.on_row_command(hwnd, folder_row, RowCommand::Reorder(Up));
+        app.on_row_command(hwnd, folder_row, RowCommand::Place { to: None, before: Some(item) });
+        // 検索中も、右クリックの「移動」（末尾へ）と履歴の行のピン留めはできる
+        app.on_row_command(hwnd, item_row, RowCommand::Move(Some(folder)));
+        app.on_row_command(hwnd, folder_row, RowCommand::Move(None));
+        app.on_row_command(hwnd, history_row, RowCommand::Pin(Some(folder)));
         assert_eq!(app.row_menu(item_row).unwrap().reorder, None, "検索中に並べ替えを出した");
         assert!(!app.can_drag_row(item_row) && !app.can_drag_row(folder_row), "検索中にピン留めの行をドラッグできる");
         assert!(app.can_drag_row(history_row), "検索中に履歴の行をドラッグできない（ピン留めはできる）");
@@ -1776,6 +1783,9 @@ mod tests {
                 Action::MovePinned { id: item, to: Some(folder), before: None },
                 Action::MovePinned { id: folder, to: None, before: Some(item) },
                 Action::MovePinned { id: folder, to: None, before: None },
+                Action::MovePinned { id: item, to: Some(folder), before: None },
+                Action::MovePinned { id: folder, to: None, before: None },
+                Action::Pin { id: item, to: Some(folder) },
             ]
         );
         drop(app);

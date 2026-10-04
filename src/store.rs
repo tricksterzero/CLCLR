@@ -672,6 +672,21 @@ mod tests {
         assert_eq!(move_node(&mut dup, twin, None, None), Ok(true), "同じ親の中の並べ替えで同じ名前を見た");
     }
 
+    /// 同じ親の中で前から後ろの兄弟の前へ移すと、取り除いた後の位置に入る（[A,B,C,D] の A を D の前へ →
+    /// [B,C,A,D]。取り除く前の位置で入れると [B,C,D,A] になる）。後ろから前の兄弟の前へも、件数を変えずに入る。
+    #[test]
+    fn move_node_forward_lands_before_later_sibling() {
+        let [a, b, c, d] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let mut tree = vec![pinned_item(a), pinned_item(b), pinned_item(c), pinned_item(d)];
+        let ids = |nodes: &[PinnedNode]| nodes.iter().map(PinnedNode::id).collect::<Vec<_>>();
+        assert_eq!(move_node(&mut tree, a, None, Some(d)), Ok(true));
+        assert_eq!(ids(&tree), [b, c, a, d]);
+        assert_eq!(move_node(&mut tree, d, None, Some(b)), Ok(true));
+        assert_eq!(ids(&tree), [d, b, c, a]);
+        assert_eq!(move_node(&mut tree, b, None, Some(a)), Ok(true));
+        assert_eq!(ids(&tree), [d, c, b, a]);
+    }
+
     fn find_children_mut_for_test(tree: &mut Vec<PinnedNode>, folder: Uuid) -> &mut Vec<PinnedNode> {
         children_mut(tree, Some(folder)).unwrap()
     }
