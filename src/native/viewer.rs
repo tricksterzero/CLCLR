@@ -136,7 +136,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::VK_F2;
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_UP};
 use windows::Win32::UI::WindowsAndMessaging::FALT;
 use crate::store::Direction;
-use windows::Win32::Graphics::Gdi::{MapWindowPoints, UpdateWindow};
+use windows::Win32::Graphics::Gdi::{CreateCompatibleBitmap, MapWindowPoints, UpdateWindow, DT_CALCRECT};
 use windows::Win32::UI::Controls::{LVN_BEGINDRAG, TVGN_PARENT, TVN_BEGINDRAGW};
 use windows::Win32::UI::WindowsAndMessaging::IDC_NO;
 use crate::icons;
@@ -613,6 +613,8 @@ struct WindowCtx {
     /// 行のドラッグを右ボタンで取り消し、右ボタンを離すのを待っている（その間もマウスを捕まえておく。
     /// `cancel_row_drag_by_right_button`）
     row_drag_right_up: Cell<bool>,
+    /// ドラッグ中の行の絵の小窓（`drag_image`。HWND は `Send` でないので整数で持つ。0 は無し）
+    drag_image: Cell<isize>,
     /// 窓に付けているメニューバー（ドロップダウンは自前描画。`menu_draw::MenuBar` の説明）。窓の破棄の前に
     /// 外す（`ViewerWindow` の `Drop`）。借用はメニューバーを差し替える間だけ
     menu_bar: RefCell<Option<MenuBar>>,
@@ -747,6 +749,7 @@ impl ViewerWindow {
             drag: Cell::new(None),
             row_drag: Cell::new(None),
             row_drag_right_up: Cell::new(false),
+            drag_image: Cell::new(0),
             menu_bar: RefCell::new(Some(menu)),
             menu_bar_pending: Cell::new(false),
             topmost: Cell::new(false),
@@ -3216,7 +3219,13 @@ fn begin_row_drag(hwnd: HWND, ctx: &WindowCtx, index: i32) {
     if !can_begin_drag(ctx) {
         return;
     }
-    let Some(target) = usize::try_from(index).ok().and_then(|i| ctx.view.borrow().rows.get(i).map(Row::target)) else {
+    let Some((target, look)) = usize::try_from(index).ok().and_then(|i| {
+        let view = ctx.view.borrow();
+        view.rows.get(i).map(|row| {
+            let look = DragLook { icon: ctx.row_icon(row), thumb: row.thumb.as_ref().map(|_| row.id), label: row.label.clone() };
+            (row.target(), look)
+        })
+    }) else {
         return;
     };
     let folder = if target.pinned {
@@ -3235,7 +3244,7 @@ fn begin_row_drag(hwnd: HWND, ctx: &WindowCtx, index: i32) {
         return;
     }
     let list_folder = target.pinned.then_some(folder);
-    start_drag(hwnd, ctx, RowDrag { target, parent: folder, list_folder, mark: None });
+    start_drag(hwnd, ctx, RowDrag { target, parent: folder, list_folder, mark: None }, &look);
 }
 
 /// ツリーのピン留めのフォルダのドラッグを始める（`TVN_BEGINDRAG`）。ルートの「ピン留め」・履歴の項目は
@@ -3266,7 +3275,25 @@ fn begin_tree_drag(hwnd: HWND, ctx: &WindowCtx, item: HTREEITEM) {
         }
         _ => None,
     };
-    start_drag(hwnd, ctx, RowDrag { target, parent, list_folder, mark: None });
+    let look = DragLook { icon: ctx.icons[4], thumb: None, label: unsafe { tree_item_text(tree, item) } };
+    start_drag(hwnd, ctx, RowDrag { target, parent, list_folder, mark: None }, &look);
+}
+
+/// ツリーの項目の文字（取れなければ空）。
+unsafe fn tree_item_text(tree: HWND, item: HTREEITEM) -> String {
+    let mut buf = [0u16; 512];
+    let mut tv = TVITEMW {
+        mask: TVIF_HANDLE | TVIF_TEXT,
+        hItem: item,
+        pszText: PWSTR(buf.as_mut_ptr()),
+        cchTextMax: buf.len() as i32,
+        ..Default::default()
+    };
+    unsafe {
+        SendMessageW(tree, TVM_GETITEMW, None, Some(LPARAM(&mut tv as *mut _ as isize)));
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
 }
 
 /// ドラッグを始めてよいか（名前の編集中・メニューやダイアログの表示中・境目や行のドラッグ中・右ボタンでの
@@ -3275,13 +3302,120 @@ fn can_begin_drag(ctx: &WindowCtx) -> bool {
     can_open_dialog(ctx) && ctx.drag.get().is_none() && ctx.row_drag.get().is_none() && !ctx.row_drag_right_up.get()
 }
 
-/// ドラッグを始める: 状態を置いて、窓がマウスを捕まえる（離すまで `WM_MOUSEMOVE`・`WM_LBUTTONUP` を受け取る）。
-fn start_drag(hwnd: HWND, ctx: &WindowCtx, drag: RowDrag) {
+/// ドラッグを始める: 状態を置いて、窓がマウスを捕まえ（離すまで `WM_MOUSEMOVE`・`WM_LBUTTONUP` を受け取る）、
+/// 行の絵を出す。
+fn start_drag(hwnd: HWND, ctx: &WindowCtx, drag: RowDrag, look: &DragLook) {
     ctx.row_drag.set(Some(drag));
     unsafe {
         SetCapture(hwnd);
     }
     set_drag_cursor(false);
+    let mut cursor = POINT::default();
+    if unsafe { GetCursorPos(&mut cursor) }.is_ok() {
+        show_drag_image(hwnd, ctx, look, cursor);
+    }
+}
+
+/// ドラッグ中の行の絵の文字の幅の上限と、カーソルから右へずらす量（96 DPI 基準の px）。
+const DRAG_LABEL_MAX: i32 = 240;
+const DRAG_IMAGE_OFFSET_X: i32 = 16;
+
+/// ドラッグ中の行の絵の中身: アイコン、サムネイルを持つ項目（読み込んであれば、アイコンの代わりに描く）、名前。
+struct DragLook {
+    icon: HICON,
+    thumb: Option<Uuid>,
+    label: String,
+}
+
+/// ドラッグ中の行の絵を描く: 選んだ行と同じ色の地に、アイコン（`look.thumb` のサムネイルを読み込んであれば
+/// それ）と太字の名前を1行で。寸法は一覧の行と同じ（`Metrics`）で、名前の幅は `DRAG_LABEL_MAX` まで（長ければ
+/// 末尾を省く）。ビットマップとその大きさを返す。借用はこの中だけ。
+unsafe fn render_drag_image(hwnd: HWND, ctx: &WindowCtx, look: &DragLook) -> Option<(HBITMAP, i32, i32)> {
+    let view = ctx.view.borrow();
+    let m = ctx.metrics.borrow();
+    let (icon, pad) = (m.icon_size, m.pad);
+    unsafe {
+        let max_label = crate::menu_tooltip::scale_for_dpi(DRAG_LABEL_MAX, GetDpiForWindow(hwnd));
+        let screen = GetDC(Some(hwnd));
+        let mem = CreateCompatibleDC(Some(screen));
+        let old_font = SelectObject(mem, m.bold_font.into());
+        let mut label: Vec<u16> = look.label.encode_utf16().collect();
+        let label_width = if label.is_empty() {
+            0
+        } else {
+            let mut rc = RECT::default();
+            DrawTextW(mem, &mut label, &mut rc, DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT);
+            (rc.right - rc.left).min(max_label)
+        };
+        let width = pad * 2 + icon + if label_width > 0 { pad + label_width } else { 0 };
+        let height = icon + pad * 2;
+        let bitmap = CreateCompatibleBitmap(screen, width, height);
+        ReleaseDC(Some(hwnd), screen);
+        if bitmap.is_invalid() {
+            SelectObject(mem, old_font);
+            let _ = DeleteDC(mem);
+            return None;
+        }
+        let old_bitmap = SelectObject(mem, bitmap.into());
+        FillRect(mem, &RECT { left: 0, top: 0, right: width, bottom: height }, GetSysColorBrush(COLOR_HIGHLIGHT));
+        match look.thumb.and_then(|id| view.thumbs.get(&id)) {
+            // サムネイルは長辺 icon に収めてあるので、アイコンの枠の中央に原寸で描く（一覧の行と同じ）
+            Some(Some(bmp)) => bmp.draw(mem, pad + (icon - bmp.width) / 2, pad + (icon - bmp.height) / 2, bmp.width, bmp.height),
+            _ => {
+                let _ = DrawIconEx(mem, pad, pad, look.icon, icon, icon, 0, None, DI_NORMAL);
+            }
+        }
+        SetBkMode(mem, TRANSPARENT);
+        SetTextColor(mem, windows::Win32::Foundation::COLORREF(GetSysColor(COLOR_HIGHLIGHTTEXT)));
+        let mut rc = RECT { left: pad * 2 + icon, top: 0, right: width - pad, bottom: height };
+        draw_text(mem, &look.label, &mut rc, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX | DT_VCENTER);
+        SelectObject(mem, old_bitmap);
+        SelectObject(mem, old_font);
+        let _ = DeleteDC(mem);
+        Some((bitmap, width, height))
+    }
+}
+
+/// 行の絵の左上（画面座標）: カーソルの右へ `DRAG_IMAGE_OFFSET_X`、下へ行の高さの半分と余白。一覧の行の間の線は
+/// カーソルから行の高さの半分（と線の太さ）までの所に出るので、絵がその線に重ならないようにする。
+fn drag_image_origin(hwnd: HWND, ctx: &WindowCtx, cursor: POINT) -> (i32, i32) {
+    let m = ctx.metrics.borrow();
+    let dx = crate::menu_tooltip::scale_for_dpi(DRAG_IMAGE_OFFSET_X, unsafe { GetDpiForWindow(hwnd) });
+    (cursor.x + dx, cursor.y + m.row_height / 2 + m.pad)
+}
+
+/// 行の絵を、カーソル（画面座標）の右下に出す。作れなければ出さずにドラッグを続ける。
+fn show_drag_image(hwnd: HWND, ctx: &WindowCtx, look: &DragLook, cursor: POINT) {
+    hide_drag_image(ctx);
+    let Some((bitmap, width, height)) = (unsafe { render_drag_image(hwnd, ctx, look) }) else {
+        return;
+    };
+    let (x, y) = drag_image_origin(hwnd, ctx, cursor);
+    if let Some(image) = crate::native::drag_image::show(hwnd, bitmap, width, height, x, y) {
+        ctx.drag_image.set(image.0 as isize);
+    }
+}
+
+/// 行の絵を、カーソル（窓のクライアント座標）に合わせて動かす。
+fn move_drag_image(hwnd: HWND, ctx: &WindowCtx, x: i32, y: i32) {
+    let image = ctx.drag_image.get();
+    if image == 0 {
+        return;
+    }
+    let mut cursor = POINT { x, y };
+    unsafe {
+        let _ = ClientToScreen(hwnd, &mut cursor);
+    }
+    let (x, y) = drag_image_origin(hwnd, ctx, cursor);
+    crate::native::drag_image::move_to(HWND(image as *mut _), x, y);
+}
+
+/// 行の絵を消す。出していなければ何もしない（ドラッグの終わり方が重なっても、破棄は1回だけ）。
+fn hide_drag_image(ctx: &WindowCtx) {
+    let image = ctx.drag_image.replace(0);
+    if image != 0 {
+        crate::native::drag_image::destroy(HWND(image as *mut _));
+    }
 }
 
 /// ドラッグ中にマウスが動いた（窓のクライアント座標）: 落とす先を決め直し、変わったら目印を出し直す。ツリーの
@@ -3290,6 +3424,7 @@ fn drag_row_to(hwnd: HWND, ctx: &WindowCtx, x: i32, y: i32) {
     let Some(drag) = ctx.row_drag.get() else {
         return;
     };
+    move_drag_image(hwnd, ctx, x, y);
     let mark = unsafe { drop_mark_at(hwnd, ctx, &drag, POINT { x, y }) };
     if mark != drag.mark {
         ctx.row_drag.set(Some(RowDrag { mark, ..drag }));
@@ -3310,8 +3445,9 @@ fn finish_row_drag(hwnd: HWND, ctx: &WindowCtx, x: i32, y: i32) {
         return;
     };
     let mark = unsafe { drop_mark_at(hwnd, ctx, &drag, POINT { x, y }) };
-    // 印を先に下ろす（放すと WM_CAPTURECHANGED が来る）
+    // 印を先に下ろす（放すと WM_CAPTURECHANGED が来る）。行の絵はハンドラへ伝える前に消す
     ctx.row_drag.set(None);
+    hide_drag_image(ctx);
     unsafe {
         refresh_drop_mark(hwnd, ctx, drag.mark, false);
         if GetCapture() == hwnd {
@@ -3324,11 +3460,12 @@ fn finish_row_drag(hwnd: HWND, ctx: &WindowCtx, x: i32, y: i32) {
     }
 }
 
-/// ドラッグを取り消す（Esc・マウスを失った・隠す・終了）。目印を消し、まだ捕まえていればマウスを放す（右ボタンでの
-/// 取り消しの後、右ボタンを離すのを待っている間も放す）。どちらでもなければ何もしない。
+/// ドラッグを取り消す（Esc・マウスを失った・隠す・終了）。目印と行の絵を消し、まだ捕まえていればマウスを放す（右
+/// ボタンでの取り消しの後、右ボタンを離すのを待っている間も放す）。どちらでもなければ何もしない。
 fn cancel_row_drag(hwnd: HWND, ctx: &WindowCtx) {
     let drag = ctx.row_drag.take();
     let waiting = ctx.row_drag_right_up.replace(false);
+    hide_drag_image(ctx);
     if drag.is_none() && !waiting {
         return;
     }
@@ -3342,14 +3479,15 @@ fn cancel_row_drag(hwnd: HWND, ctx: &WindowCtx) {
     }
 }
 
-/// ドラッグ中に右ボタンを押した: ドラッグを取り消して目印を消す。マウスは右ボタンを離すまで捕まえたままにし、離す
-/// 操作は窓が受け取って捨てる（`WM_RBUTTONUP`）。すぐに放すと、離す操作が下の一覧・ツリーへ届き、右クリックの
-/// メニューが出うるため。ドラッグしていなければ何もしない（false）。
+/// ドラッグ中に右ボタンを押した: ドラッグを取り消して目印と行の絵を消す。マウスは右ボタンを離すまで捕まえたままに
+/// し、離す操作は窓が受け取って捨てる（`WM_RBUTTONUP`）。すぐに放すと、離す操作が下の一覧・ツリーへ届き、右クリック
+/// のメニューが出うるため。ドラッグしていなければ何もしない（false）。
 fn cancel_row_drag_by_right_button(hwnd: HWND, ctx: &WindowCtx) -> bool {
     let Some(drag) = ctx.row_drag.take() else {
         return false;
     };
     ctx.row_drag_right_up.set(true);
+    hide_drag_image(ctx);
     unsafe {
         refresh_drop_mark(hwnd, ctx, drag.mark, false);
     }
@@ -6811,6 +6949,34 @@ mod tests {
         unsafe { ctx_ref(hwnd) }.unwrap().row_drag.get().and_then(|drag| drag.mark)
     }
 
+    /// ドラッグ中の行の絵の小窓（出ていて見えていること）。
+    fn shown_drag_image(hwnd: HWND) -> HWND {
+        let image = unsafe { ctx_ref(hwnd) }.unwrap().drag_image.get();
+        assert_ne!(image, 0, "行の絵を出していない");
+        let image = HWND(image as *mut _);
+        assert!(unsafe { IsWindowVisible(image) }.as_bool(), "行の絵が見えていない");
+        image
+    }
+
+    /// 行の絵が、カーソル（窓のクライアント座標 `to`）の右下にある。
+    fn assert_drag_image_at(hwnd: HWND, image: HWND, to: POINT) {
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let mut screen = to;
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = ClientToScreen(hwnd, &mut screen);
+            GetWindowRect(image, &mut rc).unwrap();
+        }
+        let expected = drag_image_origin(hwnd, unsafe { ctx_ref(hwnd) }.unwrap(), screen);
+        assert_eq!((rc.left, rc.top), expected, "行の絵がカーソルに付いて動かない");
+    }
+
+    /// 行の絵が消えている（小窓を破棄した）。
+    fn assert_drag_image_gone(hwnd: HWND, image: HWND) {
+        assert!(!unsafe { IsWindow(Some(image)) }.as_bool(), "行の絵が残っている");
+        assert_eq!(unsafe { ctx_ref(hwnd) }.unwrap().drag_image.get(), 0);
+    }
+
     /// ピン留めの行のドラッグ: 窓がマウスを捕まえ、動かすと落とす先の目印が変わり、離すとマウスを放して、その位置への
     /// 移動を伝える（フォルダの行の中央 → そのフォルダの末尾、フォルダの行の上端 → 一覧のフォルダのその前、
     /// ツリーのフォルダ → その末尾）。ツリーの強調は離すと消える。フォルダを自分のツリーの項目へは落とせない。
@@ -6824,10 +6990,13 @@ mod tests {
         let drag_to = |index: i32, to: POINT| {
             begin_drag(&window, index);
             assert_eq!(unsafe { GetCapture() }, hwnd, "マウスを捕まえていない");
+            let image = shown_drag_image(hwnd);
             mouse(hwnd, WM_MOUSEMOVE, to);
+            assert_drag_image_at(hwnd, image, to);
             let mark = drop_mark(hwnd);
             let hilite = tree_item_at(tree, TVGN_DROPHILITE);
             mouse(hwnd, WM_LBUTTONUP, to);
+            assert_drag_image_gone(hwnd, image);
             assert_ne!(unsafe { GetCapture() }, hwnd, "離した後もマウスを捕まえている");
             assert!(unsafe { ctx_ref(hwnd) }.unwrap().row_drag.get().is_none());
             assert_eq!(tree_item_at(tree, TVGN_DROPHILITE).0, 0, "離した後も強調が残っている");
@@ -6873,9 +7042,11 @@ mod tests {
         ];
         for cancel in cancels {
             begin_drag(&window, 1);
+            let image = shown_drag_image(hwnd);
             mouse(hwnd, WM_MOUSEMOVE, over_tree);
             assert_eq!(drop_mark(hwnd), Some(DropMark::Tree(Some(folder))));
             cancel();
+            assert_drag_image_gone(hwnd, image);
             assert!(unsafe { ctx_ref(hwnd) }.unwrap().row_drag.get().is_none(), "取り消されていない");
             assert_ne!(unsafe { GetCapture() }, hwnd);
             assert_eq!(tree_item_at(tree, TVGN_DROPHILITE).0, 0, "取り消した後も強調が残っている");
@@ -6997,9 +7168,12 @@ mod tests {
         let hwnd = window.hwnd();
         begin_tree_drag_message(hwnd, tree, from);
         assert_eq!(unsafe { GetCapture() }, hwnd, "ツリーのフォルダのドラッグを始めない");
+        let image = shown_drag_image(hwnd);
         mouse(hwnd, WM_MOUSEMOVE, to);
+        assert_drag_image_at(hwnd, image, to);
         let mark = drop_mark(hwnd);
         mouse(hwnd, WM_LBUTTONUP, to);
+        assert_drag_image_gone(hwnd, image);
         assert_ne!(unsafe { GetCapture() }, hwnd, "離した後もマウスを捕まえている");
         assert_eq!(tree_item_at(tree, TVGN_DROPHILITE).0, 0, "離した後も強調が残っている");
         mark
@@ -7095,9 +7269,11 @@ mod tests {
         let ctx = unsafe { ctx_ref(hwnd) }.unwrap();
 
         begin_drag(&window, 1);
+        let image = shown_drag_image(hwnd);
         mouse(hwnd, WM_MOUSEMOVE, over_tree);
         assert_eq!(drop_mark(hwnd), Some(DropMark::Tree(Some(folder))));
         mouse(hwnd, WM_RBUTTONDOWN, over_tree);
+        assert_drag_image_gone(hwnd, image);
         assert!(ctx.row_drag.get().is_none(), "右ボタンで取り消されない");
         assert_eq!(tree_item_at(tree, TVGN_DROPHILITE).0, 0, "取り消した後も強調が残っている");
         assert_eq!(unsafe { GetCapture() }, hwnd, "右ボタンを離す前にマウスを放した");
