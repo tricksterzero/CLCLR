@@ -1544,7 +1544,7 @@ pub(crate) fn folder_report_text(report: &FolderReport) -> (String, String) {
     }
     if report.findings.iter().any(|f| f.ancestor) {
         content.push_str(
-            "\n親のフォルダが、ほかのアカウントから削除・改名・権限の変更をできる設定になっています（フォルダごと差し替えられるおそれがあります）。",
+            "\n親のフォルダが、ほかのアカウントから削除・改名か権限の変更をできる設定になっています（フォルダごと差し替えられるおそれがあります。できることは「詳細」にあります）。",
         );
     }
     if !report.unverified.is_empty() {
@@ -1559,9 +1559,10 @@ pub(crate) fn folder_report_text(report: &FolderReport) -> (String, String) {
     let findings = report.findings.iter().map(|f| {
         let what = match f.concern {
             Concern::Read => format!("{} が中身を読めます", names(&f.sids)),
-            Concern::Write => format!("{} が書き換え・削除・権限の変更をできます", names(&f.sids)),
+            Concern::Write => format!("{} が書き換え・削除をできます", names(&f.sids)),
             Concern::Inherit => format!("中に作るファイル・フォルダで、{} に読み取りか書き込みが許可されます", names(&f.sids)),
-            Concern::Replace => format!("{} が、このフォルダかその中の項目を削除・改名したり、権限を変えたりできます", names(&f.sids)),
+            Concern::Replace => format!("{} が、このフォルダかその中の項目を削除・改名できます", names(&f.sids)),
+            Concern::Permissions => format!("{} が権限・所有者を変えられます", names(&f.sids)),
             Concern::Owner => format!("所有者が {} です（所有者は権限を変えられます）", names(&f.sids)),
             Concern::NullDacl => "権限の設定が無く、誰でもすべての操作ができます".to_string(),
         };
@@ -6309,6 +6310,9 @@ mod tests {
         assert!(content.contains("親のフォルダが") && content.contains("確かめられないところ"), "{content}");
         assert!(details.contains("見つかったこと:") && details.contains("確かめられなかったこと:"), "{details}");
         assert!(details.contains(r"C:\Tools\CLCLR\blobs: リンク"), "{details}");
+        // 削除・改名だけのときは、権限を変えられるとは書かない
+        assert!(details.contains(r"C:\Tools: S-1-5-11 が、このフォルダかその中の項目を削除・改名できます"), "{details}");
+        assert!(!details.contains("権限・所有者"), "{details}");
     }
 
     /// ピン留めの行（先頭）と履歴の行を入れ、先頭を選んで表示する。

@@ -64,8 +64,11 @@ const FILE_GENERIC_EXECUTE: u32 = 0x12_00A0;
 const FILE_ALL_ACCESS: u32 = 0x1F_01FF;
 
 /// 書き換え・削除・権限の変更に当たる権限。
-const WRITE_RIGHTS: u32 =
-    FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_DELETE_CHILD | FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER;
+const WRITE_RIGHTS: u32 = CONTENT_RIGHTS | PERMISSION_RIGHTS;
+/// 書き換え・削除に当たる権限（`WRITE_RIGHTS` のうち権限・所有者の変更でないもの）。
+const CONTENT_RIGHTS: u32 = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_DELETE_CHILD | FILE_WRITE_ATTRIBUTES | DELETE;
+/// 権限・所有者の変更に当たる権限。
+const PERMISSION_RIGHTS: u32 = WRITE_DAC | WRITE_OWNER;
 
 /// 汎用の権限（GENERIC_*）を、ファイルの個別の権限へ広げる（`MapGenericMask` と同じ読み替え）。
 fn map_generic(mask: u32) -> u32 {
@@ -146,12 +149,14 @@ pub enum Role {
 pub enum Concern {
     /// ほかの主体が中身を読める
     Read,
-    /// ほかの主体が書き換え・削除・権限の変更をできる
+    /// ほかの主体が書き換え・削除をできる（フォルダでは、中の項目の追加・削除を含む）
     Write,
     /// 中に新しく作るファイル・フォルダへ、ほかの主体への許可が引き継がれる
     Inherit,
-    /// 親のフォルダで、ほかの主体が削除・改名・権限の変更をできる
+    /// 親のフォルダで、ほかの主体がそのフォルダかその中の項目を削除・改名できる
     Replace,
+    /// ほかの主体が権限・所有者を変えられる
+    Permissions,
     /// 所有者が信頼する主体でない（所有者は権限を変えられる）
     Owner,
     /// DACL が無い（誰でもすべての操作ができる）
@@ -235,17 +240,17 @@ pub fn evaluate(security: &Security, role: Role, trusted: &Trusted) -> Evaluatio
                 if effective && mask & FILE_READ_DATA != 0 {
                     out.add(Concern::Read, &ace.sid);
                 }
-                if effective && mask & WRITE_RIGHTS != 0 {
+                if effective && mask & CONTENT_RIGHTS != 0 {
                     out.add(Concern::Write, &ace.sid);
                 }
             }
             Role::Exe => {
-                if effective && mask & WRITE_RIGHTS != 0 {
+                if effective && mask & CONTENT_RIGHTS != 0 {
                     out.add(Concern::Write, &ace.sid);
                 }
             }
             Role::Folder => {
-                if effective && mask & WRITE_RIGHTS != 0 {
+                if effective && mask & CONTENT_RIGHTS != 0 {
                     out.add(Concern::Write, &ace.sid);
                 }
                 // ファイルへ引き継がれる ACE は読み取り・書き込みのどちらも、フォルダだけへ引き継がれる ACE は書き込みを
@@ -258,10 +263,14 @@ pub fn evaluate(security: &Security, role: Role, trusted: &Trusted) -> Evaluatio
             }
             Role::Ancestor { root } => {
                 let delete_self = if root { 0 } else { DELETE };
-                if effective && mask & (delete_self | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER) != 0 {
+                if effective && mask & (delete_self | FILE_DELETE_CHILD) != 0 {
                     out.add(Concern::Replace, &ace.sid);
                 }
             }
+        }
+        // どの役目でも、権限・所有者を変えられれば、ほかの許可を自分に付けられる
+        if effective && mask & PERMISSION_RIGHTS != 0 {
+            out.add(Concern::Permissions, &ace.sid);
         }
     }
     out
@@ -840,10 +849,31 @@ mod tests {
         let deletes = sec(SID_SYSTEM, vec![allow(OTHER, 0, DELETE)]);
         assert_eq!(evaluate(&deletes, Role::Ancestor { root: true }, &t), Evaluation::default());
         assert_eq!(concerns(&evaluate(&deletes, Role::Ancestor { root: false }, &t)), [Concern::Replace]);
-        for mask in [FILE_DELETE_CHILD, WRITE_DAC, WRITE_OWNER, GENERIC_ALL] {
+        let cases: [(u32, &[Concern]); 4] = [
+            (FILE_DELETE_CHILD, &[Concern::Replace]),
+            (WRITE_DAC, &[Concern::Permissions]),
+            (WRITE_OWNER, &[Concern::Permissions]),
+            (GENERIC_ALL, &[Concern::Replace, Concern::Permissions]),
+        ];
+        for (mask, expected) in cases {
             let s = sec(SID_SYSTEM, vec![allow(OTHER, 0, mask)]);
-            assert_eq!(concerns(&evaluate(&s, Role::Ancestor { root: true }, &t)), [Concern::Replace], "{mask:#x}");
+            assert_eq!(concerns(&evaluate(&s, Role::Ancestor { root: true }, &t)), expected, "{mask:#x}");
         }
+    }
+
+    /// 書き換え・削除と、権限・所有者の変更は別の問題として出す（「変更」の権限 M では権限を変えられない）。
+    #[test]
+    fn permission_change_is_reported_separately() {
+        let t = trusted();
+        let m = 0x0013_01BF;
+        for role in [Role::DataFile, Role::Exe, Role::Folder, Role::Ancestor { root: false }] {
+            let only_dac = evaluate(&sec(ME, vec![allow(OTHER, 0, WRITE_DAC)]), role, &t);
+            assert_eq!(concerns(&only_dac), [Concern::Permissions], "{role:?}");
+            let modify = evaluate(&sec(ME, vec![allow(OTHER, 0, m)]), role, &t);
+            assert!(!concerns(&modify).contains(&Concern::Permissions), "{role:?}");
+        }
+        let full = evaluate(&sec(ME, vec![allow(OTHER, 0, FILE_ALL_ACCESS)]), Role::DataFile, &t);
+        assert_eq!(concerns(&full), [Concern::Read, Concern::Write, Concern::Permissions]);
     }
 
     /// DACL が無い・所有者がほかの主体・解釈できない ACE・OWNER RIGHTS・拒否の ACE。

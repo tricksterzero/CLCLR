@@ -97,7 +97,8 @@ pub struct GeneralConfig {
     /// 知らせる（false ならログだけ）
     pub notify_action_errors: bool,
     /// 起動時に、保存先のフォルダ（exe のフォルダ）の権限を確かめ、ほかのアカウントから読み書きできそうなら警告する
-    /// （`folder_security`）。既定は true（`GeneralConfig::default`。項目の無い以前の設定ファイルも true になる）
+    /// （`folder_security`）。既定は false（`GeneralConfig::default`。zip を展開したフォルダでそのまま使えるように、
+    /// 置き場所の見直しを求めるのは、設定でオンにした人だけにする。項目の無い設定ファイルも false になる）
     pub check_folder_permissions: bool,
     /// ビューアの前回のウィンドウサイズ（論理px）。ウィンドウを隠す時・終了時に
     /// 更新し、次回起動で復元する。最小化・最大化中の値は記録しない
@@ -432,7 +433,7 @@ impl Default for GeneralConfig {
             start_hidden: false,
             startup_clipboard_sync: true,
             notify_action_errors: true,
-            check_folder_permissions: true,
+            check_folder_permissions: false,
             // ビューアのクライアント領域の既定の大きさ
             viewer_width: 900,
             viewer_height: 700,
@@ -822,15 +823,15 @@ mod tests {
         assert_eq!(got, [("capture_total_limit", None)]);
     }
 
-    /// 項目の無い以前の設定ファイルでも、保存先のフォルダの権限は確かめる（既定値 true）。
+    /// 保存先のフォルダの権限は、設定でオンにしたときだけ確かめる（既定値 false。項目の無い設定ファイルも同じ）。
     #[test]
-    fn check_folder_permissions_defaults_to_true_for_older_files() {
+    fn check_folder_permissions_defaults_to_false() {
         let config: Config = toml::from_str("[general]\nclipboard_watch = false\n").unwrap();
-        assert!(config.general.check_folder_permissions);
-        let config: Config = toml::from_str("").unwrap();
-        assert!(config.general.check_folder_permissions);
-        let config: Config = toml::from_str("[general]\ncheck_folder_permissions = false\n").unwrap();
         assert!(!config.general.check_folder_permissions);
+        let config: Config = toml::from_str("").unwrap();
+        assert!(!config.general.check_folder_permissions);
+        let config: Config = toml::from_str("[general]\ncheck_folder_permissions = true\n").unwrap();
+        assert!(config.general.check_folder_permissions);
     }
 
     #[test]

@@ -1652,7 +1652,7 @@ mod tests {
         c.general.clipboard_watch = false;
         c.general.start_hidden = true;
         c.general.notify_action_errors = false;
-        c.general.check_folder_permissions = false;
+        c.general.check_folder_permissions = true;
         c.history.max = 77;
         c.history.grouping.enabled = true;
         c.history.grouping.visible_items = 12;

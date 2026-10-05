@@ -2143,8 +2143,8 @@ mod tests {
     #[test]
     fn folder_report_reveals_hidden_viewer_and_saves_stop_checking() {
         use crate::folder_security::Unverified;
-        let config = memory_only_config();
-        assert!(config.general.check_folder_permissions, "前提: 既定は確かめる");
+        let mut config = memory_only_config();
+        config.general.check_folder_permissions = true;
         let (dir, core) = temp_service(config.clone());
         let (_tray, tray_rx) = mpsc::channel();
         let (_hotkey, hotkey_rx) = mpsc::channel();
@@ -2228,7 +2228,8 @@ mod tests {
     #[test]
     fn folder_report_stop_checking_reports_save_failure() {
         use crate::folder_security::Unverified;
-        let config = memory_only_config();
+        let mut config = memory_only_config();
+        config.general.check_folder_permissions = true;
         let (dir, core) = temp_service(config.clone());
         let (_tray, tray_rx) = mpsc::channel();
         let (_hotkey, hotkey_rx) = mpsc::channel();
