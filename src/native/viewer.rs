@@ -82,6 +82,7 @@ use windows::Win32::UI::WindowsAndMessaging::{ICON_BIG, ICON_SMALL, SM_CXICON, S
 use windows::Win32::UI::Controls::{EM_LIMITTEXT, TD_INFORMATION_ICON};
 use windows::Win32::UI::WindowsAndMessaging::IDCLOSE;
 use crate::datacheck::{CleanResult, DataReport, TempPlace};
+use crate::folder_security::{Concern, FolderReport, Unverified};
 use windows::Win32::UI::WindowsAndMessaging::{
     DialogBoxParamW, EndDialog, WINDOW_LONG_PTR_INDEX, WM_INITDIALOG,
 };
@@ -213,6 +214,9 @@ const CMD_MOVE_DOWN: u16 = 208;
 
 /// 履歴のクリアの確認の「削除」ボタンの ID（`IDCANCEL` などの共通ボタンと重ならない値）。
 const CONFIRM_DELETE: i32 = 1000;
+/// 保存先のフォルダの権限の警告の「このまま使う」「今後は確かめない」ボタンの ID。
+const FOLDER_CONTINUE: i32 = 1001;
+const FOLDER_STOP_CHECKING: i32 = 1002;
 
 /// ビューア窓のスタイル（大きさの換算 `AdjustWindowRectExForDpi` でも使う）。
 const VIEWER_STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 | WS_CLIPCHILDREN.0);
@@ -1471,6 +1475,116 @@ pub fn show_clean_result(hwnd: HWND, result: &CleanResult) {
     if let Err(e) = run_task_dialog(hwnd, ctx, config, None) {
         eprintln!("データの削除の結果を出せませんでした: {e}");
     }
+}
+
+/// 保存先のフォルダの権限の警告で選ばれたこと。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderChoice {
+    /// 「このまま使う」・×・Esc・隠す・終了の要求で閉じた（次の起動でまた確かめる）
+    Continue,
+    /// 「今後は確かめない」
+    StopChecking,
+    /// 出せなかった（メニュー・ほかのダイアログの表示中など。呼び出し側は後で出し直す）
+    NotShown,
+    /// TaskDialog を作れなかった（呼び出し側はメッセージボックスで代わりに知らせる。出し直すと繰り返すため）
+    Failed,
+}
+
+/// 保存先のフォルダの権限の警告（起動時の確認で安全と確かめられなかったとき）。既定は「このまま使う」で、×・Esc・
+/// 隠す・終了の要求（`cancel_modal`）で閉じたときも同じ。表示中の扱いは確認ダイアログと同じ（`dialog` の追跡）。
+pub fn show_folder_report(hwnd: HWND, report: &FolderReport) -> FolderChoice {
+    let Some(ctx) = (unsafe { ctx_ref(hwnd) }) else {
+        return FolderChoice::NotShown;
+    };
+    if !can_open_dialog(ctx) {
+        eprintln!("保存先のフォルダの権限の警告を出せませんでした（ほかの表示中）");
+        return FolderChoice::NotShown;
+    }
+    let (content, details) = folder_report_text(report);
+    let content = HSTRING::from(content);
+    let details = HSTRING::from(details);
+    let buttons = [
+        TASKDIALOG_BUTTON { nButtonID: FOLDER_CONTINUE, pszButtonText: w!("このまま使う") },
+        TASKDIALOG_BUTTON { nButtonID: FOLDER_STOP_CHECKING, pszButtonText: w!("今後は確かめない") },
+    ];
+    let config = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: hwnd,
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW,
+        pszWindowTitle: w!("保存先のフォルダの権限"),
+        Anonymous1: TASKDIALOGCONFIG_0 { pszMainIcon: TD_WARNING_ICON },
+        pszMainInstruction: w!("保存先のフォルダの権限を見直してください"),
+        pszContent: PCWSTR(content.as_ptr()),
+        pszExpandedInformation: if details.is_empty() { PCWSTR::null() } else { PCWSTR(details.as_ptr()) },
+        pszFooter: w!("拒否の設定を含めた実際のアクセスまでは確かめていません。この確認は「設定」の「全般」で止められます。"),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: FOLDER_CONTINUE,
+        ..Default::default()
+    };
+    let mut pressed = 0i32;
+    match run_task_dialog(hwnd, ctx, config, Some(&mut pressed)) {
+        Ok(()) if pressed == FOLDER_STOP_CHECKING => FolderChoice::StopChecking,
+        Ok(()) => FolderChoice::Continue,
+        Err(e) => {
+            eprintln!("保存先のフォルダの権限の警告を出せませんでした: {e}");
+            FolderChoice::Failed
+        }
+    }
+}
+
+/// 保存先のフォルダの権限の警告の本文と「詳細」。
+pub(crate) fn folder_report_text(report: &FolderReport) -> (String, String) {
+    let mut content = format!(
+        "CLCLR は、コピーした内容の履歴を、暗号化せずに次のフォルダへ保存しています。\n{}\n",
+        report.dir.display()
+    );
+    if report.findings.iter().any(|f| !f.ancestor) {
+        content.push_str("\nほかのアカウントから、履歴を読んだり書き換えたり、CLCLR.exe を差し替えたりできる設定になっています。");
+    }
+    if report.findings.iter().any(|f| f.ancestor) {
+        content.push_str(
+            "\n親のフォルダが、ほかのアカウントから削除・改名・権限の変更をできる設定になっています（フォルダごと差し替えられるおそれがあります）。",
+        );
+    }
+    if !report.unverified.is_empty() {
+        content.push_str("\n権限を確かめられないところがあります。");
+    }
+    content.push_str(
+        "\n\nCLCLR を終了してから、自分のユーザーフォルダの中（例: %LOCALAPPDATA%\\Programs\\CLCLR）へフォルダごと移すことをお勧めします。\
+         手順は README の「置き場所と権限」を見てください。",
+    );
+
+    let names = |sids: &[String]| sids.iter().map(|s| report.name(s).to_string()).collect::<Vec<_>>().join("、");
+    let findings = report.findings.iter().map(|f| {
+        let what = match f.concern {
+            Concern::Read => format!("{} が中身を読めます", names(&f.sids)),
+            Concern::Write => format!("{} が書き換え・削除・権限の変更をできます", names(&f.sids)),
+            Concern::Inherit => format!("中に作るファイル・フォルダで、{} に読み取りか書き込みが許可されます", names(&f.sids)),
+            Concern::Replace => format!("{} が、このフォルダかその中の項目を削除・改名したり、権限を変えたりできます", names(&f.sids)),
+            Concern::Owner => format!("所有者が {} です（所有者は権限を変えられます）", names(&f.sids)),
+            Concern::NullDacl => "権限の設定が無く、誰でもすべての操作ができます".to_string(),
+        };
+        format!("{}: {what}", f.path.display())
+    });
+    let unverified = report.unverified.iter().map(|u| match u {
+        Unverified::Remote => "ネットワーク上のフォルダなので、権限を確かめられません".to_string(),
+        Unverified::NoAcl => "このドライブ（FAT・exFAT など）は権限を設定できないため、誰でも読み書きできます".to_string(),
+        Unverified::OtherPath(actual) => {
+            format!("実際のパス（{}）が、起動したパスと違います（リンク・別名のドライブを経由しています）", actual.display())
+        }
+        Unverified::Link(path) => format!("{}: リンク（ジャンクション・シンボリックリンクなど）なので、確かめていません", path.display()),
+        Unverified::Unreadable { path, error } => format!("{}: 権限を読めません（{error}）", path.display()),
+        Unverified::UnknownAce(path) => format!("{}: 解釈できない種類の権限の設定があります", path.display()),
+    });
+    let mut details = Vec::new();
+    if !report.findings.is_empty() {
+        details.push(list_names("見つかったこと", findings));
+    }
+    if !report.unverified.is_empty() {
+        details.push(list_names("確かめられなかったこと", unverified));
+    }
+    (content, details.join("\n"))
 }
 
 /// 結果の「詳細」に並べる名前の数（種類ごと）。
@@ -6063,6 +6177,54 @@ mod tests {
         assert!(!modal_is_open(hwnd));
     }
 
+    /// 保存先のフォルダの権限の警告: 「今後は確かめない」のときだけ `StopChecking`。「このまま使う」・Esc（キャンセル）・
+    /// `cancel_modal`（隠す・終了の要求）は `Continue`。表示中は `modal_is_open`。ほかのダイアログの表示中は出さない
+    /// （`NotShown`）。
+    #[test]
+    fn folder_report_dialog_choices() {
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let (window, _recorder) = create_test_window();
+        let hwnd = window.hwnd();
+        let report = FolderReport {
+            dir: std::path::PathBuf::from(r"C:\Tools\CLCLR"),
+            unverified: vec![Unverified::NoAcl],
+            ..FolderReport::default()
+        };
+        let click = move |id: i32| {
+            move || {
+                assert!(modal_is_open(hwnd), "警告の表示中になっていない");
+                let ctx = unsafe { ctx_ref(hwnd) }.unwrap();
+                unsafe {
+                    SendMessageW(HWND(ctx.dialog.get() as *mut _), TDM_CLICK_BUTTON.0 as u32, Some(WPARAM(id as usize)), Some(LPARAM(0)));
+                }
+            }
+        };
+        during_dialog(hwnd, click(FOLDER_STOP_CHECKING));
+        assert_eq!(show_folder_report(hwnd, &report), FolderChoice::StopChecking);
+        assert!(!finish_menu_test());
+        during_dialog(hwnd, click(FOLDER_CONTINUE));
+        assert_eq!(show_folder_report(hwnd, &report), FolderChoice::Continue);
+        assert!(!finish_menu_test());
+        during_dialog(hwnd, click(IDCANCEL.0));
+        assert_eq!(show_folder_report(hwnd, &report), FolderChoice::Continue);
+        assert!(!finish_menu_test());
+        during_dialog(hwnd, move || cancel_modal(hwnd));
+        assert_eq!(show_folder_report(hwnd, &report), FolderChoice::Continue);
+        assert!(!finish_menu_test(), "cancel_modal で閉じなかった");
+        // ほかのダイアログ（警告そのもの）の表示中は出さない
+        during_dialog(hwnd, move || {
+            assert_eq!(show_folder_report(hwnd, &report_clone()), FolderChoice::NotShown);
+            cancel_modal(hwnd);
+        });
+        assert_eq!(show_folder_report(hwnd, &report), FolderChoice::Continue);
+        assert!(!finish_menu_test());
+        assert!(!modal_is_open(hwnd));
+
+        fn report_clone() -> FolderReport {
+            FolderReport { unverified: vec![Unverified::Remote], ..FolderReport::default() }
+        }
+    }
+
     /// 結果の本文: 件数・大きさ・履歴とピン留めの内訳・対象外・調べていないこと（中身の破損）を書き、名前は「詳細」に
     /// 先頭 20 件ずつ（残りは数）。
     #[test]
@@ -6113,6 +6275,40 @@ mod tests {
         assert_eq!(total_size([u64::MAX, 1].into_iter()), u64::MAX);
         let huge = DataReport { orphans: vec![FileEntry { name: "a".into(), size: u64::MAX }, FileEntry { name: "b".into(), size: 1 }], ..DataReport::default() };
         assert!(data_report_text(&huge).0.contains("MB"));
+    }
+
+    /// 保存先のフォルダの権限の警告: 保存先・親のフォルダ・確かめられないものを本文で分けて書き、詳細には項目ごとの
+    /// 内容をアカウント名（引けなければ SID）で並べる。
+    #[test]
+    fn folder_report_text_separates_folder_ancestor_and_unverified() {
+        use crate::folder_security::Finding;
+        use std::path::PathBuf;
+        let mut report = FolderReport { dir: PathBuf::from(r"C:\Tools\CLCLR"), ..FolderReport::default() };
+        report.names.insert("S-1-5-11".into(), r"NT AUTHORITY\Authenticated Users".into());
+        report.findings.push(Finding {
+            path: PathBuf::from(r"C:\Tools\CLCLR\history.toml"),
+            concern: Concern::Read,
+            sids: vec!["S-1-5-11".into(), "S-1-5-21-9".into()],
+            ancestor: false,
+        });
+        let (content, details) = folder_report_text(&report);
+        assert!(content.contains(r"C:\Tools\CLCLR"), "{content}");
+        assert!(content.contains("履歴を読んだり書き換えたり"), "{content}");
+        assert!(!content.contains("親のフォルダ"), "{content}");
+        assert!(!content.contains("確かめられない"), "{content}");
+        assert!(details.contains(r"C:\Tools\CLCLR\history.toml: NT AUTHORITY\Authenticated Users、S-1-5-21-9 が中身を読めます"), "{details}");
+
+        let report = FolderReport {
+            dir: PathBuf::from(r"C:\Tools\CLCLR"),
+            findings: vec![Finding { path: PathBuf::from(r"C:\Tools"), concern: Concern::Replace, sids: vec!["S-1-5-11".into()], ancestor: true }],
+            unverified: vec![Unverified::Link(PathBuf::from(r"C:\Tools\CLCLR\blobs"))],
+            ..FolderReport::default()
+        };
+        let (content, details) = folder_report_text(&report);
+        assert!(!content.contains("履歴を読んだり"), "{content}");
+        assert!(content.contains("親のフォルダが") && content.contains("確かめられないところ"), "{content}");
+        assert!(details.contains("見つかったこと:") && details.contains("確かめられなかったこと:"), "{details}");
+        assert!(details.contains(r"C:\Tools\CLCLR\blobs: リンク"), "{details}");
     }
 
     /// ピン留めの行（先頭）と履歴の行を入れ、先頭を選んで表示する。

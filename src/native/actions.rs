@@ -39,6 +39,7 @@ use crate::clipboard::ClipboardPort;
 use crate::config::Config;
 use crate::data::{utf16_bytes, utf16_text, Format};
 use crate::datacheck::{CleanResult, DataReport};
+use crate::folder_security::FolderReport;
 use crate::ops::{Core, OpError};
 use crate::service::ImageData;
 use crate::store::Direction;
@@ -172,6 +173,8 @@ pub enum Notice {
     Failure(ActionFailure),
     CheckReport(DataReport),
     CleanResult(CleanResult),
+    /// 起動時の保存先のフォルダの権限の確認で、安全と確かめられなかった（`spawn_folder_check`）
+    FolderReport(FolderReport),
 }
 
 impl fmt::Display for Notice {
@@ -196,6 +199,7 @@ impl fmt::Display for Notice {
                 r.failures.len(),
                 if r.interrupted { "、途中でやめた" } else { "" }
             ),
+            Self::FolderReport(r) => write!(f, "{r}"),
         }
     }
 }
@@ -465,6 +469,43 @@ fn write_new_file(dir: &Path, id: Uuid, extension: &str, data: &[u8]) -> Result<
         .map_err(|e| format!("一時ファイルを作れません（{e}）"))?;
     file.write_all(data).map_err(|e| format!("一時ファイルへ書けません（{e}）"))?;
     Ok(path)
+}
+
+/// 保存先のフォルダ（`exe` のフォルダ）の権限を確かめるスレッドを起こす（起動時）。安全と確かめられなければ
+/// `Notice::FolderReport` を積んでビューアを起こす。exe の場所が分からない・スレッドを作れないときも、確かめられない
+/// こととして知らせる。読むだけ（何も変えない）なので、受け付けには登録せず、join もしない（`blobs` の全部を見るので、
+/// 操作スレッドに載せると送るなどの操作を待たせる）。
+pub fn spawn_folder_check(sink: FailureSink, exe: std::io::Result<PathBuf>) {
+    use crate::folder_security::Unverified;
+    let unverified = |dir: PathBuf, error: String| {
+        Notice::FolderReport(FolderReport {
+            unverified: vec![Unverified::Unreadable { path: dir.clone(), error }],
+            dir,
+            ..FolderReport::default()
+        })
+    };
+    let (dir, exe_name) = match exe.as_ref().map(|exe| (exe.parent(), exe.file_name())) {
+        Ok((Some(dir), Some(name))) => (dir.to_path_buf(), name.to_os_string()),
+        Ok(_) => {
+            sink.post(unverified(PathBuf::new(), "CLCLR.exe の場所が分かりません".to_string()));
+            return;
+        }
+        Err(e) => {
+            sink.post(unverified(PathBuf::new(), format!("CLCLR.exe の場所が分かりません（{e}）")));
+            return;
+        }
+    };
+    let thread_sink = sink.clone();
+    let thread_dir = dir.clone();
+    let spawned = thread::Builder::new().name("clclr-folder-check".to_string()).spawn(move || {
+        let report = crate::folder_security::check(&thread_dir, &exe_name);
+        if !report.is_clean() {
+            thread_sink.post(Notice::FolderReport(report));
+        }
+    });
+    if let Err(e) = spawned {
+        sink.post(unverified(dir, format!("確かめるスレッドを作れません（{e}）")));
+    }
 }
 
 /// 操作スレッドを起こす。依頼の送り手がすべて無くなると終わる。join はしない（モジュールの説明）。
@@ -1071,6 +1112,23 @@ mod tests {
         assert_eq!(exported(&h).len(), 1, "壊れた WebP を書き出した");
         let failures = h.failures();
         assert_eq!(failures.iter().map(|f| f.kind).collect::<Vec<_>>(), [ActionKind::OpenImage]);
+    }
+
+    /// 保存先のフォルダの権限の確認: exe の場所が分からないときも、確かめられないこととして知らせる（黙って
+    /// 確かめずに終わらない）。
+    #[test]
+    fn folder_check_reports_unknown_exe_location() {
+        use crate::folder_security::Unverified;
+        let sink = FailureSink::new(|| {});
+        spawn_folder_check(sink.clone(), Err(std::io::Error::other("テスト")));
+        spawn_folder_check(sink.clone(), Ok(PathBuf::from(r"C:\")));
+        let notices = sink.drain();
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        for notice in notices {
+            let Notice::FolderReport(report) = notice else { panic!("{notice:?}") };
+            assert!(!report.is_clean());
+            assert!(matches!(&report.unverified[..], [Unverified::Unreadable { error, .. }] if error.starts_with("CLCLR.exe の場所が分かりません")), "{report:?}");
+        }
     }
 
     #[test]

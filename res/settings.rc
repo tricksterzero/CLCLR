@@ -28,6 +28,8 @@ BEGIN
     AUTOCHECKBOX "起動時にクリップボードを同期する(&S)", IDC_GEN_SYNC, 7, 64, 266, 10, WS_TABSTOP
     LTEXT "（空なら最新の履歴を戻し、データがあれば取り込む）", -1, 19, 76, 254, 8
     AUTOCHECKBOX "ビューアの操作の失敗を知らせる(&N)", IDC_GEN_NOTIFY, 7, 91, 266, 10, WS_TABSTOP
+    AUTOCHECKBOX "起動時に保存先のフォルダの権限を確かめる(&P)", IDC_GEN_FOLDER_CHECK, 7, 106, 266, 10, WS_TABSTOP
+    LTEXT "（ほかのアカウントから履歴を読み書きできそうなら知らせる。次の起動から有効）", -1, 19, 118, 254, 8
 END
 
 IDD_PAGE_HISTORY DIALOGEX 0, 0, 280, 232

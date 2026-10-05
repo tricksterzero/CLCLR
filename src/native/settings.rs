@@ -43,7 +43,8 @@ include!(concat!(env!("OUT_DIR"), "/resource_ids.rs"));
 
 /// 設定を反映するときに、その場で行うこと（`effects`）。ここに無い設定（ツールチップ・メニューの件数・
 /// 音・フィルタ・追加の間隔・操作の失敗の知らせ方など）は、使う時点で共有の設定を読むので、反映の処理は
-/// 要らない。`start_hidden` は起動時だけ、保存の有無（完全メモリモードとの切り替え）は次の起動から効く。
+/// 要らない。`start_hidden`・`check_folder_permissions` は起動時だけ、保存の有無（完全メモリモードとの切り替え）は
+/// 次の起動から効く。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Effects {
     /// ホットキーの登録・キーフックを設定に合わせ直す（`popup_menu`・`double_press_*` が変わった）
@@ -594,6 +595,7 @@ fn load(ctx: &Ctx) {
     set_check(general, IDC_GEN_START_HIDDEN, c.general.start_hidden);
     set_check(general, IDC_GEN_SYNC, c.general.startup_clipboard_sync);
     set_check(general, IDC_GEN_NOTIFY, c.general.notify_action_errors);
+    set_check(general, IDC_GEN_FOLDER_CHECK, c.general.check_folder_permissions);
 
     let h = &c.history;
     let values: [u64; 10] = [
@@ -969,6 +971,7 @@ fn read_draft(pages: &[HWND], base: &Config, formats: &[FormatRow], windows: &[W
     c.general.start_hidden = get_check(general, IDC_GEN_START_HIDDEN);
     c.general.startup_clipboard_sync = get_check(general, IDC_GEN_SYNC);
     c.general.notify_action_errors = get_check(general, IDC_GEN_NOTIFY);
+    c.general.check_folder_permissions = get_check(general, IDC_GEN_FOLDER_CHECK);
 
     let n: Vec<u64> = NUMS.iter().map(|num| read_num(pages, num, &mut issues)).collect();
     let as_u32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
@@ -1455,6 +1458,7 @@ mod tests {
         c.hotkey.menu_max_items = 5;
         c.history.sound_on_add = !base.history.sound_on_add;
         c.general.notify_action_errors = !base.general.notify_action_errors;
+        c.general.check_folder_permissions = !base.general.check_folder_permissions;
         c.general.clipboard_watch = !base.general.clipboard_watch;
         c.general.show_trayicon = !base.general.show_trayicon;
         assert_eq!(effects(&base, &c), Effects::default());
@@ -1618,6 +1622,7 @@ mod tests {
         c.general.clipboard_watch = false;
         c.general.start_hidden = true;
         c.general.notify_action_errors = false;
+        c.general.check_folder_permissions = false;
         c.history.max = 77;
         c.history.grouping.enabled = true;
         c.history.grouping.visible_items = 12;

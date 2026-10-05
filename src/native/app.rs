@@ -32,6 +32,7 @@ use crate::config::{merge_edit, Config, ConfigIssue};
 use crate::data::{utf16_text, Format};
 use crate::hotkey::{HotkeyEvent, Hotkeys};
 use crate::datacheck::{CleanResult, DataReport};
+use crate::folder_security::FolderReport;
 use crate::native::actions::{Action, ActionFailure, ActionKind, FailureSink, Notice};
 use crate::native::settings::{self, SettingsWindow};
 use crate::native::images::ImageSource;
@@ -100,6 +101,10 @@ pub struct App {
     show_check: RefCell<Rc<dyn Fn(HWND, &DataReport) -> bool>>,
     /// データの削除の結果の出し方（テストでは差し替える）
     show_clean: RefCell<Rc<dyn Fn(HWND, &CleanResult)>>,
+    /// 保存先のフォルダの権限の警告の出し方（テストでは差し替える）
+    show_folder: RefCell<Rc<dyn Fn(HWND, &FolderReport) -> viewer::FolderChoice>>,
+    /// 警告を出すために隠したビューアを出す方法（`viewer::show`。テストでは差し替える）
+    reveal_viewer: RefCell<Rc<dyn Fn(HWND)>>,
     /// ビューアを隠している（`on_hidden` から `on_shown` まで）。この間は知らせを出さずに残し、表示したときに
     /// 出す（隠す操作で閉じた結果の後に、残りの結果が隠れた窓の上に続けて出ないように）
     viewer_hidden: Cell<bool>,
@@ -241,6 +246,8 @@ impl App {
             show_failures: RefCell::new(Rc::new(show_failure_box)),
             show_check: RefCell::new(Rc::new(viewer::show_data_report)),
             show_clean: RefCell::new(Rc::new(viewer::show_clean_result)),
+            show_folder: RefCell::new(Rc::new(viewer::show_folder_report)),
+            reveal_viewer: RefCell::new(Rc::new(viewer::show)),
             viewer_hidden: Cell::new(false),
             exiting: Cell::new(false),
             session_ended: Cell::new(false),
@@ -387,7 +394,7 @@ impl App {
             let notify = !self.exiting.get()
                 && match &notice {
                     Notice::Failure(failure) => notify_actions || failure.kind.always_notified(),
-                    Notice::CheckReport(_) | Notice::CleanResult(_) => true,
+                    Notice::CheckReport(_) | Notice::CleanResult(_) | Notice::FolderReport(_) => true,
                 };
             if notify {
                 self.notifier.borrow_mut().pending.push_back(notice);
@@ -472,6 +479,51 @@ impl App {
                     let show = Rc::clone(&self.show_clean.borrow());
                     show(hwnd, &result);
                 }
+                Some(Notice::FolderReport(report)) => {
+                    let show = Rc::clone(&self.show_folder.borrow());
+                    match show(hwnd, &report) {
+                        // 閉じている間に終了の要求が来ていたら保存しない
+                        viewer::FolderChoice::StopChecking if !self.exiting.get() => self.stop_folder_check(),
+                        viewer::FolderChoice::StopChecking | viewer::FolderChoice::Continue => {}
+                        // ダイアログを作れなかった: 本文だけをメッセージボックスで知らせる（警告を見ないまま終わらない）
+                        viewer::FolderChoice::Failed => {
+                            let show = Rc::clone(&self.show_failures.borrow());
+                            show(hwnd, &format!("保存先のフォルダの権限を見直してください\n\n{}", viewer::folder_report_text(&report).0));
+                        }
+                        // 出せなかった（ほかの表示中）: 先頭へ戻し、次の起床で出し直す
+                        viewer::FolderChoice::NotShown => {
+                            self.notifier.borrow_mut().pending.push_front(Notice::FolderReport(report));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 保存先のフォルダの権限の警告がまだ出ていないのにビューアを隠していれば（非表示で起動したなど）、ビューアを出す
+    /// （警告は表示したときにしか出ないため。安全と確かめられなかったときだけで、終了の要求の後は出さない）。
+    fn reveal_for_folder_report(&self, hwnd: HWND) {
+        let waiting = self.notifier.borrow().pending.iter().any(|n| matches!(n, Notice::FolderReport(_)));
+        if waiting && self.viewer_hidden.get() && !self.exiting.get() {
+            // 借用を放してから出す（表示で `on_shown` が呼ばれる）
+            let reveal = Rc::clone(&self.reveal_viewer.borrow());
+            reveal(hwnd);
+        }
+    }
+
+    /// 「今後は確かめない」: 設定ファイルに書けてから共有の設定に反映する。書けなければ知らせる（次の起動でまた確かめる）。
+    fn stop_folder_check(&self) {
+        let mut next = self.config.read().unwrap().clone();
+        next.general.check_folder_permissions = false;
+        match next.save(&self.config_path) {
+            Ok(()) => self.config.write().unwrap().general.check_folder_permissions = false,
+            Err(e) => {
+                let message = format!("「今後は確かめない」を設定ファイルに保存できませんでした（次の起動でまた確かめます）: {e}");
+                self.notifier
+                    .borrow_mut()
+                    .pending
+                    .push_back(Notice::Failure(ActionFailure { kind: ActionKind::ApplySettings, message }));
             }
         }
     }
@@ -499,6 +551,17 @@ impl App {
     fn set_check_display(&self, check: impl Fn(HWND, &DataReport) -> bool + 'static, clean: impl Fn(HWND, &CleanResult) + 'static) {
         *self.show_check.borrow_mut() = Rc::new(check);
         *self.show_clean.borrow_mut() = Rc::new(clean);
+    }
+
+    /// テスト用: 保存先のフォルダの権限の警告の出し方と、警告のためにビューアを出す方法を差し替える。
+    #[cfg(test)]
+    fn set_folder_display(
+        &self,
+        show: impl Fn(HWND, &FolderReport) -> viewer::FolderChoice + 'static,
+        reveal: impl Fn(HWND) + 'static,
+    ) {
+        *self.show_folder.borrow_mut() = Rc::new(show);
+        *self.reveal_viewer.borrow_mut() = Rc::new(reveal);
     }
 
     /// 検索スレッドとつなぐ。結果が届いたら検索スレッドがビューアを起こす（`on_wake` で受け取る）。
@@ -1035,6 +1098,7 @@ impl ViewerHandler for App {
         // 操作の失敗は最後に知らせる（メッセージボックスのモーダルループの中で再入が起きても、
         // この起床の処理は終わっている）
         self.collect_failures();
+        self.reveal_for_folder_report(hwnd);
         self.show_pending_failures(hwnd);
     }
 
@@ -2005,6 +2069,130 @@ mod tests {
         let got: Vec<Action> = received.try_iter().collect();
         assert_eq!(got, [Action::CleanData(report(2))]);
         assert!(app.exiting.get());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 保存先のフォルダの権限の警告: 非表示で起動していれば、ビューアを出してから出す。出せなかった（ほかの表示中）
+    /// ときは残して次の起床で出す。「今後は確かめない」は設定ファイルに書けてから共有の設定に反映する。終了の要求の
+    /// 後に届いたものは出さず、ビューアも出さない。
+    #[test]
+    fn folder_report_reveals_hidden_viewer_and_saves_stop_checking() {
+        use crate::folder_security::Unverified;
+        let config = memory_only_config();
+        assert!(config.general.check_folder_permissions, "前提: 既定は確かめる");
+        let (dir, core) = temp_service(config.clone());
+        let (_tray, tray_rx) = mpsc::channel();
+        let (_hotkey, hotkey_rx) = mpsc::channel();
+        let mut app = App::new(Arc::new(RwLock::new(config)), core, tray_rx, hotkey_rx);
+        app.set_config_path(dir.join("config.toml"));
+        let app = Rc::new(app);
+        let sink = FailureSink::new(|| {});
+        let (requests, _received) = mpsc::channel();
+        app.attach_actions(requests, sink.clone());
+        let log: Rc<RefCell<Vec<String>>> = Rc::default();
+        // 1回目は出せない（ほかの表示中）、2回目は「今後は確かめない」
+        let answers = Rc::new(RefCell::new(VecDeque::from([viewer::FolderChoice::NotShown, viewer::FolderChoice::StopChecking])));
+        {
+            let (log_f, log_s, log_r, weak) = (Rc::clone(&log), Rc::clone(&log), Rc::clone(&log), Rc::downgrade(&app));
+            app.set_failure_display(move |_hwnd, text| log_f.borrow_mut().push(format!("F:{text}")));
+            app.set_folder_display(
+                move |_hwnd, report| {
+                    log_s.borrow_mut().push(format!("S:{}", report.dir.display()));
+                    answers.borrow_mut().pop_front().unwrap()
+                },
+                move |hwnd| {
+                    log_r.borrow_mut().push("reveal".to_string());
+                    // `viewer::show` は窓を表示し、`WM_SHOWWINDOW` で `on_shown` が呼ばれる
+                    weak.upgrade().unwrap().on_shown(hwnd);
+                },
+            );
+        }
+        let report = FolderReport { dir: PathBuf::from("X"), unverified: vec![Unverified::Remote], ..FolderReport::default() };
+        app.mark_viewer_hidden();
+        sink.post(Notice::FolderReport(report.clone()));
+        app.on_wake(HWND::default());
+        assert_eq!(log.borrow().as_slice(), ["reveal", "S:X"], "隠したまま出した・出さなかった");
+        assert!(app.config.read().unwrap().general.check_folder_permissions);
+        // 出せなかった分を次の起床で出す（もう表示しているので出し直さない）
+        app.on_wake(HWND::default());
+        assert_eq!(log.borrow().as_slice(), ["reveal", "S:X", "S:X"]);
+        assert!(!app.config.read().unwrap().general.check_folder_permissions, "共有の設定に反映していない");
+        assert!(!Config::load(&dir.join("config.toml")).unwrap().general.check_folder_permissions, "設定ファイルに書いていない");
+
+        // 終了の要求の後（トレイなしで閉じる）は、届いても出さず、ビューアも出さない
+        app.mark_viewer_hidden();
+        app.on_close(HWND::default());
+        sink.post(Notice::FolderReport(report));
+        app.on_wake(HWND::default());
+        assert_eq!(log.borrow().len(), 3, "終了の要求の後に出した");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 警告のダイアログを作れなかったときは、本文をメッセージボックスで知らせる（警告を見ないまま捨てない）。
+    #[test]
+    fn folder_report_falls_back_to_message_box_when_dialog_fails() {
+        use crate::folder_security::Unverified;
+        let config = memory_only_config();
+        let (dir, core) = temp_service(config.clone());
+        let (_tray, tray_rx) = mpsc::channel();
+        let (_hotkey, hotkey_rx) = mpsc::channel();
+        let app = Rc::new(App::new(Arc::new(RwLock::new(config)), core, tray_rx, hotkey_rx));
+        let sink = FailureSink::new(|| {});
+        let (requests, _received) = mpsc::channel();
+        app.attach_actions(requests, sink.clone());
+        let log: Rc<RefCell<Vec<String>>> = Rc::default();
+        {
+            let log_f = Rc::clone(&log);
+            app.set_failure_display(move |_hwnd, text| log_f.borrow_mut().push(text.to_string()));
+            app.set_folder_display(|_hwnd, _report| viewer::FolderChoice::Failed, |_hwnd| {});
+        }
+        sink.post(Notice::FolderReport(FolderReport {
+            dir: PathBuf::from(r"C:\Tools\CLCLR"),
+            unverified: vec![Unverified::NoAcl],
+            ..FolderReport::default()
+        }));
+        app.on_wake(HWND::default());
+        app.on_wake(HWND::default());
+        let log = log.borrow();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert!(log[0].starts_with("保存先のフォルダの権限を見直してください") && log[0].contains(r"C:\Tools\CLCLR"), "{log:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 「今後は確かめない」を設定ファイルに書けなければ、共有の設定を変えずに知らせる。
+    #[test]
+    fn folder_report_stop_checking_reports_save_failure() {
+        use crate::folder_security::Unverified;
+        let config = memory_only_config();
+        let (dir, core) = temp_service(config.clone());
+        let (_tray, tray_rx) = mpsc::channel();
+        let (_hotkey, hotkey_rx) = mpsc::channel();
+        let mut app = App::new(Arc::new(RwLock::new(config)), core, tray_rx, hotkey_rx);
+        // 設定ファイルの場所にフォルダを置いて、書けないようにする
+        std::fs::create_dir_all(dir.join("config.toml")).unwrap();
+        app.set_config_path(dir.join("config.toml"));
+        let app = Rc::new(app);
+        let sink = FailureSink::new(|| {});
+        let (requests, _received) = mpsc::channel();
+        app.attach_actions(requests, sink.clone());
+        let log: Rc<RefCell<Vec<String>>> = Rc::default();
+        {
+            let (log_f, log_s) = (Rc::clone(&log), Rc::clone(&log));
+            app.set_failure_display(move |_hwnd, text| log_f.borrow_mut().push(format!("F:{text}")));
+            app.set_folder_display(
+                move |_hwnd, _report| {
+                    log_s.borrow_mut().push("S".to_string());
+                    viewer::FolderChoice::StopChecking
+                },
+                |_hwnd| {},
+            );
+        }
+        sink.post(Notice::FolderReport(FolderReport { unverified: vec![Unverified::NoAcl], ..FolderReport::default() }));
+        app.on_wake(HWND::default());
+        let log = log.borrow();
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert!(log[1].starts_with("F:設定の一部を反映できませんでした: 「今後は確かめない」を設定ファイルに保存できませんでした"), "{log:?}");
+        assert!(app.config.read().unwrap().general.check_folder_permissions, "書けないのに共有の設定を変えた");
         let _ = std::fs::remove_dir_all(dir);
     }
 

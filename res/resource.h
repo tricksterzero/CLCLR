@@ -20,6 +20,7 @@
 #define IDC_GEN_START_HIDDEN 1102
 #define IDC_GEN_SYNC        1103
 #define IDC_GEN_NOTIFY      1104
+#define IDC_GEN_FOLDER_CHECK 1105
 
 // 履歴
 #define IDC_HIS_MAX         1200

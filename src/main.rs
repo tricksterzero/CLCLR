@@ -7,6 +7,7 @@ mod config;
 mod data;
 mod datacheck;
 mod dib;
+mod folder_security;
 mod hdrop;
 mod hotkey;
 mod icons;
@@ -358,7 +359,14 @@ fn main() {
             failures.clone(),
             request_rx,
         ) {
-            Ok(_detached) => app.attach_actions(request_tx, failures),
+            Ok(_detached) => {
+                // 保存先のフォルダの権限を確かめる（作業スレッド。起動は待たない）。結果は失敗の通知先に届き、
+                // ビューアが警告する（非表示で起動していても、警告があればビューアを出す）
+                if config.read().unwrap().general.check_folder_permissions {
+                    native::actions::spawn_folder_check(failures.clone(), std::env::current_exe());
+                }
+                app.attach_actions(request_tx, failures)
+            }
             Err(e) => report_error(&format!(
                 "ビューアの操作（送る・変換・ピン留めなど）のスレッドを作れないため、これらの操作は使えません。\n\n{e}"
             )),
