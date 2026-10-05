@@ -328,16 +328,24 @@ fn main() {
         handle
     };
 
+    // 操作の失敗・知らせの通知先。監視からの取り込みの失敗もここへ積むので、監視より先に作る
+    let failures = native::actions::FailureSink::new(move || waker.wake());
+
     let watcher = {
         let core = core.clone();
-        match ClipboardWatcher::spawn(Arc::clone(&config), move |entry| {
-            match core.capture(entry) {
-                // 終了処理が始まった後の取り込みは保存しない（締め切り）
-                Ok(()) | Err(OpError::Closing) => {}
-                Err(e) => eprintln!("履歴への取り込みに失敗: {e}"),
-            }
-            waker.wake();
-        }) {
+        let reporter = Arc::new(native::actions::CaptureReporter::new(failures.clone()));
+        let panic_reporter = Arc::clone(&reporter);
+        match ClipboardWatcher::spawn(
+            Arc::clone(&config),
+            move |entry| {
+                // 終了処理が始まった後の取り込みは保存しない（締め切り。`failed` は知らせない）
+                if let Err(e) = core.capture(entry) {
+                    reporter.failed(&e);
+                }
+                waker.wake();
+            },
+            move |stopped| panic_reporter.panicked(&stopped),
+        ) {
             Ok(w) => w,
             Err(e) => {
                 report_error(&format!("クリップボードの監視を始められないため、終了します。\n\n{e}"));
@@ -351,7 +359,6 @@ fn main() {
     // `core.shutdown(None)` が成功したときは、受け付けの中の処理はそれが待ち終えている）
     {
         let (request_tx, request_rx) = mpsc::channel();
-        let failures = native::actions::FailureSink::new(move || waker.wake());
         match native::actions::spawn(
             core.clone(),
             Arc::clone(&config),

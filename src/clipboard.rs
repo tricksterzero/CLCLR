@@ -6,6 +6,7 @@
 //! ウィンドウプロシージャは Win32 API 呼び出しを最小限にとどめ、
 //! 業務ロジック（デバウンス・フィルタ・キャプチャ）は通常の安全な Rust コードに閉じ込める。
 
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -559,21 +560,60 @@ pub(crate) enum Outcome {
     Failed,
     /// まとめ待ちの間に監視が切られた（開いていない）
     WatchOff,
+    /// 読み取りか取り込み（`on_entry`）がパニックした（監視を止め、`on_panic` を呼んだ後）
+    Panicked,
+}
+
+/// 監視の登録（`AddClipboardFormatListener`）の切り替え。ビューア（`set_watch`）と、取り込みがパニックした
+/// ワーカー（監視を止める）の両方から切り替えるので、登録・解除と状態の更新を1つのロックの中で行う。
+struct WatchSwitch {
+    hwnd: HWND,
+    lock: Mutex<()>,
+    /// 今クリップボードの変更の通知に登録しているか（実際の状態。登録・解除が成功したときだけ変える）
+    listening: Arc<AtomicBool>,
+}
+
+// HWND はハンドル（不透明な識別子）で、参照外しはしない。登録・解除に渡すだけ
+unsafe impl Send for WatchSwitch {}
+unsafe impl Sync for WatchSwitch {}
+
+impl WatchSwitch {
+    /// 今の実際の状態と同じなら何もせず `Ok`。違えば登録・解除し、成功したときだけ状態を変える。
+    fn set(&self, enabled: bool) -> WinResult<()> {
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        if self.listening.load(Ordering::SeqCst) == enabled {
+            return Ok(());
+        }
+        unsafe {
+            if enabled {
+                AddClipboardFormatListener(self.hwnd)?;
+            } else {
+                RemoveClipboardFormatListener(self.hwnd)?;
+            }
+        }
+        self.listening.store(enabled, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn listening(&self) -> bool {
+        self.listening.load(Ordering::SeqCst)
+    }
 }
 
 fn worker_loop(
     rx: Receiver<()>,
     config: Arc<RwLock<Config>>,
     port: Arc<ClipboardPort>,
-    listening: Arc<AtomicBool>,
+    switch: Arc<WatchSwitch>,
     on_entry: impl Fn(Entry),
+    on_panic: impl Fn(WinResult<()>),
     on_outcome: impl Fn(Outcome),
 ) {
     while rx.recv().is_ok() {
         // 設定は変更イベントごとにスナップショットを取る（設定画面からの
         // 実行時変更を次のキャプチャから反映しつつ、Win32呼び出し中に
         // ロックを保持しないため）
-        let config = config.read().unwrap().clone();
+        let config = config.read().unwrap_or_else(|p| p.into_inner()).clone();
         let interval = Duration::from_millis(config.history.add_interval_ms.max(1));
 
         // デバウンス: interval 内に届いた後続イベントは1回にまとめる
@@ -587,7 +627,7 @@ fn worker_loop(
 
         // まとめ待ちの間に監視が切られていたら取り込まない（切った後に、待っていた変更を取り込まない）。
         // 起動時の同期（`capture_now`）は監視がオンのときだけ頼まれる
-        if !listening.load(Ordering::SeqCst) {
+        if !switch.listening() {
             on_outcome(Outcome::WatchOff);
             continue;
         }
@@ -597,8 +637,12 @@ fn worker_loop(
         }
 
         // 抑止は、まとめた後の最後の状態の変更番号で見分ける（`capture_clipboard`）。自分の
-        // 抑止つきの書き込みの後に、変換・ほかのコピーが書かれていれば番号が違うので取り込む
-        let outcome = match capture_clipboard(&config, &port) {
+        // 抑止つきの書き込みの後に、変換・ほかのコピーが書かれていれば番号が違うので取り込む。
+        // 読み取りと取り込みのパニックは、この1回の中で捕まえる（捕まえないとワーカーのスレッドが終わり、
+        // 以後のコピーを黙って取り込まなくなる）。開いたクリップボードは巻き戻しで閉じ、`CLIPBOARD_LOCK`・
+        // `Core` のロックは poison しても取れる（`Core` は以後の変更と保存を断る）ので、続けても壊れた状態は
+        // 使わない。捕まえたら監視を止め（同じ不具合で繰り返さない。戻すのは利用者）、知らせる
+        let captured = panic::catch_unwind(AssertUnwindSafe(|| match capture_clipboard(&config, &port) {
             Ok(Capture::Suppressed(seq)) => Outcome::Suppressed { seq },
             Ok(Capture::Read(seq, Some(entry))) => {
                 on_entry(entry);
@@ -606,7 +650,11 @@ fn worker_loop(
             }
             Ok(Capture::Read(seq, None)) => Outcome::Empty { seq },
             Err(_) => Outcome::Failed,
-        };
+        }));
+        let outcome = captured.unwrap_or_else(|_| {
+            on_panic(switch.set(false));
+            Outcome::Panicked
+        });
         on_outcome(outcome);
     }
 }
@@ -729,20 +777,23 @@ pub struct ClipboardWatcher {
     changed_tx: Option<mpsc::Sender<()>>,
     window_thread: Option<JoinHandle<()>>,
     worker_thread: Option<JoinHandle<()>>,
-    /// 監視の窓を今クリップボードの変更の通知に登録しているか（実際の状態。`set_watch` が成功したときだけ
-    /// 変える）。トレイのアイコン・メニューのチェックもこれで決める（設定の値と食い違いうるため）
-    listening: Arc<AtomicBool>,
+    /// 監視の窓を今クリップボードの変更の通知に登録しているか（実際の状態）と、その切り替え。
+    /// トレイのアイコン・メニューのチェックもこれで決める（設定の値と食い違いうるため）
+    switch: Arc<WatchSwitch>,
 }
 
 impl ClipboardWatcher {
     /// 監視を開始する。`on_entry` はキャプチャされた `Entry` ごとに呼ばれる
     /// （ワーカースレッド上で実行されるため、呼び出し先はスレッドセーフである必要がある）。
+    /// `on_panic` は、読み取りか `on_entry` がパニックし、監視を止めた後に呼ばれる（引数は止めた結果。
+    /// 失敗したら監視は登録されたまま）。ワーカーは続くので、監視を戻せば取り込みも戻る。
     /// `config` は共有参照で、フィルタ・デバウンス等の変更は次のキャプチャから反映される。
     pub fn spawn(
         config: Arc<RwLock<Config>>,
         on_entry: impl Fn(Entry) + Send + 'static,
+        on_panic: impl Fn(WinResult<()>) + Send + 'static,
     ) -> Result<Self> {
-        Self::spawn_inner(config, on_entry, |_| {})
+        Self::spawn_inner(config, on_entry, on_panic, |_| {})
     }
 
     /// テスト用: `spawn` に、取り込みの1回ごとの判定の観測（`on_outcome`）を足したもの。
@@ -750,14 +801,16 @@ impl ClipboardWatcher {
     pub(crate) fn spawn_observed(
         config: Arc<RwLock<Config>>,
         on_entry: impl Fn(Entry) + Send + 'static,
+        on_panic: impl Fn(WinResult<()>) + Send + 'static,
         on_outcome: impl Fn(Outcome) + Send + 'static,
     ) -> Result<Self> {
-        Self::spawn_inner(config, on_entry, on_outcome)
+        Self::spawn_inner(config, on_entry, on_panic, on_outcome)
     }
 
     fn spawn_inner(
         config: Arc<RwLock<Config>>,
         on_entry: impl Fn(Entry) + Send + 'static,
+        on_panic: impl Fn(WinResult<()>) + Send + 'static,
         on_outcome: impl Fn(Outcome) + Send + 'static,
     ) -> Result<Self> {
         let (changed_tx, changed_rx) = mpsc::channel::<()>();
@@ -779,7 +832,7 @@ impl ClipboardWatcher {
             .map_err(|_| ClipboardError::Win32(WinError::from_hresult(windows::Win32::Foundation::E_FAIL)))??
             .0;
 
-        let watch = config.read().unwrap().general.clipboard_watch;
+        let watch = config.read().unwrap_or_else(|p| p.into_inner()).general.clipboard_watch;
         if watch {
             if let Err(e) = unsafe { AddClipboardFormatListener(hwnd) } {
                 // 失敗時はここまでに作った窓・スレッドを片付けてから返す（残すとリークする）
@@ -790,10 +843,10 @@ impl ClipboardWatcher {
 
         let port = Arc::new(ClipboardPort::new(hwnd));
         let worker_port = Arc::clone(&port);
-        let listening = Arc::new(AtomicBool::new(watch));
-        let worker_listening = Arc::clone(&listening);
+        let switch = Arc::new(WatchSwitch { hwnd, lock: Mutex::new(()), listening: Arc::new(AtomicBool::new(watch)) });
+        let worker_switch = Arc::clone(&switch);
         let worker_thread = thread::spawn(move || {
-            worker_loop(changed_rx, config, worker_port, worker_listening, on_entry, on_outcome)
+            worker_loop(changed_rx, config, worker_port, worker_switch, on_entry, on_panic, on_outcome)
         });
 
         Ok(Self {
@@ -802,7 +855,7 @@ impl ClipboardWatcher {
             changed_tx: Some(changed_tx),
             window_thread: Some(window_thread),
             worker_thread: Some(worker_thread),
-            listening,
+            switch,
         })
     }
 
@@ -826,36 +879,24 @@ impl ClipboardWatcher {
     /// 同じなら何もせず `Ok`。違えば登録・解除し、成功したときだけ状態を変える（失敗は `Err` で、状態は
     /// そのまま）。
     pub fn set_watch(&self, enabled: bool) -> WinResult<()> {
-        if self.listening.load(Ordering::SeqCst) == enabled {
-            return Ok(());
-        }
-        unsafe {
-            if enabled {
-                AddClipboardFormatListener(self.hwnd)?;
-            } else {
-                RemoveClipboardFormatListener(self.hwnd)?;
-            }
-        }
-        self.listening.store(enabled, Ordering::SeqCst);
-        Ok(())
+        self.switch.set(enabled)
     }
 
-    /// 今クリップボードの変更の通知に登録しているか（実際の状態）。
+    /// 今クリップボードの変更の通知に登録しているか（実際の状態。取り込みのパニックでワーカーが止めることもある）。
     pub fn listening(&self) -> bool {
-        self.listening.load(Ordering::SeqCst)
+        self.switch.listening()
     }
 
     /// 実際の状態の共有（トレイがアイコン・メニューのチェックに使う）。
     pub fn watch_state(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.listening)
+        Arc::clone(&self.switch.listening)
     }
 }
 
 impl Drop for ClipboardWatcher {
     fn drop(&mut self) {
-        unsafe {
-            let _ = RemoveClipboardFormatListener(self.hwnd);
-        }
+        // 解除はワーカー（取り込みのパニック）と同じ切り替えを通す（同時に解除しても、登録と状態が食い違わない）
+        let _ = self.switch.set(false);
         if let Some(t) = self.window_thread.take() {
             shutdown_window_thread(self.hwnd, t);
         }
@@ -892,7 +933,7 @@ pub(crate) mod test_support {
     pub(crate) fn test_watcher() -> ClipboardWatcher {
         let mut config = Config::default();
         config.general.clipboard_watch = false;
-        ClipboardWatcher::spawn(Arc::new(RwLock::new(config)), |_| {}).unwrap()
+        ClipboardWatcher::spawn(Arc::new(RwLock::new(config)), |_| {}, |_| {}).unwrap()
     }
 
     /// `CLIPBOARD_TEST_LOCK`を取る。直前のテストがロックを持ったままパニックしても
@@ -948,7 +989,7 @@ mod tests {
         let _clipboard = lock_clipboard_tests();
         let _gui = crate::tray::lock_gui_resource_tests();
         let config = Arc::new(RwLock::new(Config::default()));
-        let watcher = ClipboardWatcher::spawn(config, |_| {}).unwrap();
+        let watcher = ClipboardWatcher::spawn(config, |_| {}, |_| {}).unwrap();
         let watcher = SendWatcher(watcher);
 
         let (done_tx, done_rx) = mpsc::channel();
@@ -972,7 +1013,7 @@ mod tests {
         let _gui = crate::tray::lock_gui_resource_tests();
         let mut config = Config::default();
         config.general.clipboard_watch = false;
-        let watcher = ClipboardWatcher::spawn(Arc::new(RwLock::new(config)), |_| {}).unwrap();
+        let watcher = ClipboardWatcher::spawn(Arc::new(RwLock::new(config)), |_| {}, |_| {}).unwrap();
         let shared = watcher.watch_state();
         assert!(!watcher.listening());
         watcher.set_watch(false).expect("同じ状態への切り替えが失敗した");
@@ -1366,11 +1407,18 @@ mod tests {
         watcher: ClipboardWatcher,
         entries: mpsc::Receiver<Entry>,
         outcomes: mpsc::Receiver<Outcome>,
+        /// `on_panic` に渡された、監視を止めた結果
+        panics: mpsc::Receiver<WinResult<()>>,
         _gui: MutexGuard<'static, ()>,
         _clipboard: MutexGuard<'static, ()>,
     }
 
     fn observed(interval_ms: u64, watch: bool) -> Observed {
+        observed_with(interval_ms, watch, |_| false)
+    }
+
+    /// `panic_on` が真を返す項目では、取り込み（`on_entry`）がパニックする。
+    fn observed_with(interval_ms: u64, watch: bool, panic_on: impl Fn(&Entry) -> bool + Send + 'static) -> Observed {
         let clipboard = lock_clipboard_tests();
         let gui = crate::tray::lock_gui_resource_tests();
         settle_clipboard();
@@ -1379,17 +1427,24 @@ mod tests {
         config.history.add_interval_ms = interval_ms;
         let (entry_tx, entries) = mpsc::channel();
         let (outcome_tx, outcomes) = mpsc::channel();
+        let (panic_tx, panics) = mpsc::channel();
         let watcher = ClipboardWatcher::spawn_observed(
             Arc::new(RwLock::new(config)),
             move |entry| {
+                if panic_on(&entry) {
+                    panic!("テスト用の取り込みのパニック");
+                }
                 let _ = entry_tx.send(entry);
+            },
+            move |stopped| {
+                let _ = panic_tx.send(stopped);
             },
             move |outcome| {
                 let _ = outcome_tx.send(outcome);
             },
         )
         .unwrap();
-        Observed { watcher, entries, outcomes, _gui: gui, _clipboard: clipboard }
+        Observed { watcher, entries, outcomes, panics, _gui: gui, _clipboard: clipboard }
     }
 
     impl Observed {
@@ -1489,6 +1544,33 @@ mod tests {
         o.watcher.set_watch(false).unwrap();
         assert_eq!(o.next_outcome(), Outcome::WatchOff);
         assert!(o.entries.try_recv().is_err(), "監視を切った後に取り込んだ");
+    }
+
+    /// 取り込みがパニックしても、ワーカーは続く。監視を止めて（トレイと共有する状態も）知らせ、止めている間の
+    /// コピーは取り込まない。監視を戻せば、次のコピーを取り込む。
+    #[test]
+    fn panic_in_capture_stops_watch_and_worker_keeps_running() {
+        let o = observed_with(50, true, |entry| entry_text(entry) == "パニックする");
+        let port = o.watcher.port();
+        let shared = o.watcher.watch_state();
+
+        set_clipboard(&port, &[text("パニックする")]).unwrap();
+        assert_eq!(o.next_outcome(), Outcome::Panicked);
+        assert!(o.panics.try_recv().expect("パニックを知らせていない").is_ok(), "監視を止められなかった");
+        assert!(o.panics.try_recv().is_err(), "1回のパニックで2回知らせた");
+        assert!(!o.watcher.listening() && !shared.load(Ordering::SeqCst), "監視が止まっていない");
+        assert!(o.entries.try_recv().is_err());
+
+        // 止めている間のコピーは取り込まない（通知の登録も外れているので、判定も来ない）
+        set_clipboard(&port, &[text("止めている間")]).unwrap();
+        assert!(o.outcomes.recv_timeout(Duration::from_millis(300)).is_err(), "止めた後に判定した");
+
+        o.watcher.set_watch(true).unwrap();
+        set_clipboard(&port, &[text("戻した後")]).unwrap();
+        let copied = seq();
+        assert_eq!(o.next_outcome(), Outcome::Captured { seq: copied });
+        assert_eq!(entry_text(&o.entries.try_recv().unwrap()), "戻した後");
+        assert!(o.panics.try_recv().is_err());
     }
 
     /// 回帰: サイズ0は上限設定に関わらず常に不採用（空データのFormatを履歴に積まない）。

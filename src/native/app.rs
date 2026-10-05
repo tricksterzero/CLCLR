@@ -382,7 +382,8 @@ impl App {
 
     /// 操作スレッドから届いた失敗を受け取る。設定で知らせないとき・終了の要求の後はログだけ。ただし
     /// 設定の反映の失敗（`ActionKind::ApplySettings`）と、履歴のファイルを書けなかったこと
-    /// （`ActionKind::SaveHistory`）は、設定に関係なく知らせる（`ActionKind::always_notified`）。
+    /// （`ActionKind::SaveHistory`）、監視からの取り込みの失敗（`ActionKind::Capture`・`CapturePanic`。監視の
+    /// ワーカーが同じ通知先へ積む）は、設定に関係なく知らせる（`ActionKind::always_notified`）。
     /// データのチェックの結果は、終了の要求の後でなければいつも出す。
     fn collect_failures(&self) {
         let notices = self.actions.borrow().as_ref().map(|link| link.failures.drain()).unwrap_or_default();
@@ -391,6 +392,15 @@ impl App {
         }
         let notify_actions = self.config.read().unwrap().general.notify_action_errors;
         for notice in notices {
+            // 取り込みのパニックで、ワーカーが監視を止めた（止められなかった）。トレイのアイコンを実際の状態に合わせる
+            // （設定ファイルは変えない。トレイを後から作るときは、実際の状態から作る）
+            if matches!(&notice, Notice::Failure(f) if f.kind == ActionKind::CapturePanic) && !self.exiting.get() {
+                if let Some(parts) = self.parts.borrow().as_ref() {
+                    if let Some(tray) = &parts.tray {
+                        tray.set_watch_icon(parts.watcher.listening());
+                    }
+                }
+            }
             let notify = !self.exiting.get()
                 && match &notice {
                     Notice::Failure(failure) => notify_actions || failure.kind.always_notified(),
@@ -501,10 +511,15 @@ impl App {
         }
     }
 
-    /// 保存先のフォルダの権限の警告がまだ出ていないのにビューアを隠していれば（非表示で起動したなど）、ビューアを出す
-    /// （警告は表示したときにしか出ないため。安全と確かめられなかったときだけで、終了の要求の後は出さない）。
-    fn reveal_for_folder_report(&self, hwnd: HWND) {
-        let waiting = self.notifier.borrow().pending.iter().any(|n| matches!(n, Notice::FolderReport(_)));
+    /// 保存先のフォルダの権限の警告か、監視からの取り込みの失敗の知らせがまだ出ていないのにビューアを隠していれば
+    /// （非表示で起動した・トレイへ隠したなど）、ビューアを出す（知らせは表示したときにしか出ず、隠したままだと
+    /// 気づけないため。終了の要求の後は出さない）。
+    fn reveal_for_warnings(&self, hwnd: HWND) {
+        let waiting = self.notifier.borrow().pending.iter().any(|n| match n {
+            Notice::FolderReport(_) => true,
+            Notice::Failure(f) => f.kind.is_capture(),
+            Notice::CheckReport(_) | Notice::CleanResult(_) => false,
+        });
         if waiting && self.viewer_hidden.get() && !self.exiting.get() {
             // 借用を放してから出す（表示で `on_shown` が呼ばれる）
             let reveal = Rc::clone(&self.reveal_viewer.borrow());
@@ -1098,7 +1113,7 @@ impl ViewerHandler for App {
         // 操作の失敗は最後に知らせる（メッセージボックスのモーダルループの中で再入が起きても、
         // この起床の処理は終わっている）
         self.collect_failures();
-        self.reveal_for_folder_report(hwnd);
+        self.reveal_for_warnings(hwnd);
         self.show_pending_failures(hwnd);
     }
 
@@ -2072,6 +2087,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 監視からの取り込みの失敗: 操作の失敗を知らせない設定でも知らせ、ビューアを隠していれば出す。ほかの操作の
+    /// 失敗では、隠したビューアを出さない（表示したときに出す）。
+    #[test]
+    fn capture_failures_are_notified_and_reveal_hidden_viewer() {
+        let mut config = memory_only_config();
+        config.general.notify_action_errors = true;
+        let (dir, core) = temp_service(config.clone());
+        let (_tray, tray_rx) = mpsc::channel();
+        let (_hotkey, hotkey_rx) = mpsc::channel();
+        let app = Rc::new(App::new(Arc::new(RwLock::new(config)), core, tray_rx, hotkey_rx));
+        let sink = FailureSink::new(|| {});
+        let (requests, _received) = mpsc::channel();
+        app.attach_actions(requests, sink.clone());
+        let log: Rc<RefCell<Vec<String>>> = Rc::default();
+        {
+            let (log_f, log_r, weak) = (Rc::clone(&log), Rc::clone(&log), Rc::downgrade(&app));
+            app.set_failure_display(move |_hwnd, text| log_f.borrow_mut().push(format!("F:{text}")));
+            app.set_folder_display(
+                |_hwnd, _report| viewer::FolderChoice::Continue,
+                move |hwnd| {
+                    log_r.borrow_mut().push("reveal".to_string());
+                    weak.upgrade().unwrap().on_shown(hwnd);
+                },
+            );
+        }
+
+        // ほかの操作の失敗は、隠している間は出さず、ビューアも出さない
+        app.mark_viewer_hidden();
+        sink.report(failure("送る"));
+        app.on_wake(HWND::default());
+        assert!(log.borrow().is_empty(), "{:?}", log.borrow());
+
+        // 取り込みの失敗が届くと、ビューアを出して、待っていた分と一緒に出す
+        sink.report(ActionFailure { kind: ActionKind::Capture, message: "取り込み".into() });
+        app.on_wake(HWND::default());
+        assert_eq!(
+            log.borrow().as_slice(),
+            ["reveal", "F:クリップボードへ送れませんでした: 送る\nクリップボードの内容を履歴に取り込めませんでした: 取り込み"]
+        );
+
+        // 操作の失敗を知らせない設定でも、パニックの知らせは出す（parts が無い = トレイのアイコンは直さない）
+        app.config.write().unwrap().general.notify_action_errors = false;
+        app.mark_viewer_hidden();
+        sink.report(ActionFailure { kind: ActionKind::CapturePanic, message: "止めた".into() });
+        app.on_wake(HWND::default());
+        assert_eq!(log.borrow().len(), 4, "{:?}", log.borrow());
+        assert_eq!(log.borrow()[2..], ["reveal", "F:クリップボードの取り込み中に予期しない誤りが起きました: 止めた"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// 保存先のフォルダの権限の警告: 非表示で起動していれば、ビューアを出してから出す。出せなかった（ほかの表示中）
     /// ときは残して次の起床で出す。「今後は確かめない」は設定ファイルに書けてから共有の設定に反映する。終了の要求の
     /// 後に届いたものは出さず、ビューアも出さない。
@@ -2580,7 +2645,7 @@ mod tests {
         let handler: Rc<dyn ViewerHandler> = app.clone();
         let window = viewer::ViewerWindow::create("CLCLR apply test", (400, 300), handler).unwrap();
         let hwnd = window.hwnd();
-        let watcher = ClipboardWatcher::spawn(Arc::clone(&app.config), |_| {}).unwrap();
+        let watcher = ClipboardWatcher::spawn(Arc::clone(&app.config), |_| {}, |_| {}).unwrap();
         app.set_parts(Parts { watcher, tray: None, hotkeys: None });
 
         let mut draft = base.clone();
@@ -2634,7 +2699,7 @@ mod tests {
             let handler: Rc<dyn ViewerHandler> = app.clone();
             let window = viewer::ViewerWindow::create("CLCLR apply exit test", (400, 300), handler).unwrap();
             let hwnd = window.hwnd();
-            let watcher = ClipboardWatcher::spawn(Arc::clone(&app.config), |_| {}).unwrap();
+            let watcher = ClipboardWatcher::spawn(Arc::clone(&app.config), |_| {}, |_| {}).unwrap();
             let (tray_tx, _tray_rx) = mpsc::channel();
             app.attach_tray_source(tray_tx.clone(), window.waker());
             let tray = base.general.show_trayicon.then(|| Tray::spawn(watcher.watch_state(), tray_tx, || {}).unwrap());
@@ -2766,7 +2831,7 @@ mod tests {
             let handler: Rc<dyn ViewerHandler> = app.clone();
             let window = viewer::ViewerWindow::create("CLCLR settings reentry test", (400, 300), handler).unwrap();
             let hwnd = window.hwnd();
-            let watcher = ClipboardWatcher::spawn(Arc::clone(&app.config), |_| {}).unwrap();
+            let watcher = ClipboardWatcher::spawn(Arc::clone(&app.config), |_| {}, |_| {}).unwrap();
             let (tray_tx, _tray_rx) = mpsc::channel();
             let tray = Tray::spawn(watcher.watch_state(), tray_tx, || {}).unwrap();
             app.set_parts(Parts { watcher, tray: Some(tray), hotkeys: None });

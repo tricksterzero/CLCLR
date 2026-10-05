@@ -22,6 +22,7 @@
 use std::fmt;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -111,12 +112,25 @@ pub enum ActionKind {
     /// データのチェック・その削除（利用者が自分で頼んだ操作なので、失敗は設定に関係なく知らせる）
     CheckData,
     CleanData,
+    /// 監視からの取り込みの失敗（`CaptureReporter`）。利用者の操作ではなく、知らせないと誰も気づけないので、
+    /// 設定に関係なく知らせ、ビューアを隠していれば出す
+    Capture,
+    /// 監視からの取り込みのパニック（監視は止めてある。`CaptureReporter`）。`Capture` と同じく知らせる
+    CapturePanic,
 }
 
 impl ActionKind {
     /// 操作の失敗の設定（`notify_action_errors`）に関係なく知らせるか。
     pub fn always_notified(self) -> bool {
-        matches!(self, Self::ApplySettings | Self::SaveHistory | Self::CheckData | Self::CleanData)
+        matches!(
+            self,
+            Self::ApplySettings | Self::SaveHistory | Self::CheckData | Self::CleanData | Self::Capture | Self::CapturePanic
+        )
+    }
+
+    /// 監視からの取り込みの知らせか（ビューアを隠していれば出す。`App::reveal_for_warnings`）。
+    pub fn is_capture(self) -> bool {
+        matches!(self, Self::Capture | Self::CapturePanic)
     }
 
     /// 失敗の知らせの見出し（「{見出し}: {理由}」の前半。「{操作の名前}に失敗しました」の形にしないのは、
@@ -139,6 +153,8 @@ impl ActionKind {
             Self::SaveHistory => "履歴のファイルを保存できませんでした",
             Self::CheckData => "データをチェックできませんでした",
             Self::CleanData => "データを削除できませんでした",
+            Self::Capture => "クリップボードの内容を履歴に取り込めませんでした",
+            Self::CapturePanic => "クリップボードの取り込み中に予期しない誤りが起きました",
         }
     }
 }
@@ -274,6 +290,55 @@ impl FailureSink {
         state.open = false;
         std::mem::take(&mut state.queue)
     }
+}
+
+/// 監視からの取り込みの失敗を知らせる（監視のワーカーのスレッドから呼ぶ。`main` が監視へ渡す）。release の
+/// ビルドには標準エラーの出力先が無いので、ログに書くだけでは誰も気づけない。
+///
+/// - パニック（`panicked`）: 毎回知らせる。監視はワーカーが止めてあるので、利用者が戻すまで繰り返さない
+/// - `Core::capture` の失敗（`failed`）: 種類（`OpError::Poisoned` とそれ以外）ごとに、1回の起動で最初の1回だけ
+///   知らせ、2回目からはログに書くだけ（ディスクが満杯などでコピーのたびに失敗しても、知らせを積み続けない）。
+///   終了処理の後の締め切り（`OpError::Closing`）は失敗ではないので知らせない
+pub struct CaptureReporter {
+    sink: FailureSink,
+    poisoned_sent: AtomicBool,
+    failed_sent: AtomicBool,
+}
+
+impl CaptureReporter {
+    pub fn new(sink: FailureSink) -> Self {
+        Self { sink, poisoned_sent: AtomicBool::new(false), failed_sent: AtomicBool::new(false) }
+    }
+
+    /// 取り込みがパニックし、監視を止めた（`stopped` は止めた結果）。
+    pub fn panicked(&self, stopped: &windows::core::Result<()>) {
+        let log = crate::storage::base_dir().join("panic.log");
+        self.sink.report(ActionFailure { kind: ActionKind::CapturePanic, message: capture_panic_message(stopped, &log) });
+    }
+
+    pub fn failed(&self, error: &OpError) {
+        let sent = match error {
+            OpError::Closing => return,
+            OpError::Poisoned => &self.poisoned_sent,
+            _ => &self.failed_sent,
+        };
+        let failure = ActionFailure { kind: ActionKind::Capture, message: error.to_string() };
+        if sent.swap(true, Ordering::SeqCst) {
+            eprintln!("{failure}");
+        } else {
+            self.sink.report(failure);
+        }
+    }
+}
+
+/// 取り込みのパニックの知らせの本文（見出しの後ろ）。
+fn capture_panic_message(stopped: &windows::core::Result<()>, log: &Path) -> String {
+    let watch = match stopped {
+        Ok(()) => "クリップボードの監視を止めました。トレイのメニューか設定画面の「OK」でオンに戻せます（次の起動では設定どおりに監視します）。"
+            .to_string(),
+        Err(e) => format!("クリップボードの監視を止められませんでした（{e}）。"),
+    };
+    format!("{watch}\n詳しい記録: {}", log.display())
 }
 
 /// 同時に起動中の「関連付けで開く」の数。
@@ -784,6 +849,41 @@ mod tests {
             let _ = self.entered.send(());
             let _ = self.release.lock().unwrap().recv_timeout(Duration::from_secs(10));
         }
+    }
+
+    /// 監視からの取り込みの失敗: 締め切りは知らせず、`Poisoned` とそれ以外は種類ごとに最初の1回だけ知らせる。
+    /// パニックは毎回知らせ、監視を止めた結果と記録の場所を書く。
+    #[test]
+    fn capture_reporter_notifies_each_kind_once_and_every_panic() {
+        let sink = FailureSink::new(|| {});
+        let reporter = CaptureReporter::new(sink.clone());
+        reporter.failed(&OpError::Closing);
+        reporter.failed(&OpError::Poisoned);
+        reporter.failed(&OpError::NotFound);
+        reporter.failed(&OpError::Poisoned);
+        reporter.failed(&OpError::Empty);
+        reporter.panicked(&Ok(()));
+        reporter.panicked(&Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_ACCESSDENIED)));
+        let failures: Vec<ActionFailure> = sink
+            .drain()
+            .into_iter()
+            .map(|n| match n {
+                Notice::Failure(f) => f,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let kinds: Vec<ActionKind> = failures.iter().map(|f| f.kind).collect();
+        assert_eq!(
+            kinds,
+            [ActionKind::Capture, ActionKind::Capture, ActionKind::CapturePanic, ActionKind::CapturePanic],
+            "{failures:?}"
+        );
+        assert_eq!(failures[0].message, OpError::Poisoned.to_string());
+        assert_eq!(failures[1].message, OpError::NotFound.to_string());
+        let log = crate::storage::base_dir().join("panic.log").display().to_string();
+        assert!(failures[2].message.contains("監視を止めました") && failures[2].message.contains(&log), "{}", failures[2].message);
+        assert!(failures[3].message.contains("監視を止められませんでした") && failures[3].message.contains(&log), "{}", failures[3].message);
+        assert!([ActionKind::Capture, ActionKind::CapturePanic].iter().all(|k| k.always_notified() && k.is_capture()));
     }
 
     #[derive(Debug, PartialEq, Eq)]
