@@ -493,7 +493,8 @@ impl Storage {
     /// WebP の blob（サムネイルを含む）を、先に見出しと長さを確かめてから読む。CLCLR が書く形でないもの
     /// （`dib::webp_header_dimensions`）・寸法に見合わない長さのもの（`dib::webp_file_len_limit`）・読めないものは
     /// None。画素を RGBA に換算した大きさが `max_rgba` を超えるものは、全体を読まずに `TooLarge`。見出しと全体は
-    /// 同じ開いたファイルから読み、読めた長さが確かめた長さと違えば（読む間に書き換えられた）None。
+    /// 同じ開いたファイルから読み、読めた長さか、読んだデータの見出しの寸法が確かめたものと違えば（読む間に書き換え
+    /// られた）None。
     pub(crate) fn load_webp(&self, name: &str, max_rgba: u64) -> Option<LoadedWebp> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = fs::File::open(self.blob_path(name)).ok()?;
@@ -510,7 +511,13 @@ impl Storage {
         file.seek(SeekFrom::Start(0)).ok()?;
         let mut data = Vec::with_capacity(len as usize);
         file.take(len + 1).read_to_end(&mut data).ok()?;
-        (data.len() as u64 == len).then_some(LoadedWebp::Data(data))
+        if data.len() as u64 != len {
+            return None;
+        }
+        // 見出しを確かめてから読み直すまでの間に、同じ長さのまま中身を書き換えられても、確かめた寸法（上限の判定に
+        // 使ったもの）と違う画像は返さない
+        let reread = dib::webp_header_dimensions(&data, len).ok()?;
+        (reread == (width, height)).then_some(LoadedWebp::Data(data))
     }
 
     /// 生のまま（.bin）の blob を、長さが `size` のときだけ読む（長さが違えば、全体を読まずに `Err`）。

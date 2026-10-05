@@ -117,6 +117,9 @@ pub enum ActionKind {
     Capture,
     /// 監視からの取り込みのパニック（監視は止めてある。`CaptureReporter`）。`Capture` と同じく知らせる
     CapturePanic,
+    /// 監視から取り込んだ項目は履歴に入ったが、履歴のファイル（history.toml）を書けなかった（`CaptureReporter`。
+    /// `OpError::CapturedIndexNotSaved`）。`Capture` と同じく知らせる
+    CaptureIndex,
 }
 
 impl ActionKind {
@@ -124,13 +127,19 @@ impl ActionKind {
     pub fn always_notified(self) -> bool {
         matches!(
             self,
-            Self::ApplySettings | Self::SaveHistory | Self::CheckData | Self::CleanData | Self::Capture | Self::CapturePanic
+            Self::ApplySettings
+                | Self::SaveHistory
+                | Self::CheckData
+                | Self::CleanData
+                | Self::Capture
+                | Self::CapturePanic
+                | Self::CaptureIndex
         )
     }
 
     /// 監視からの取り込みの知らせか（ビューアを隠していれば出す。`App::reveal_for_warnings`）。
     pub fn is_capture(self) -> bool {
-        matches!(self, Self::Capture | Self::CapturePanic)
+        matches!(self, Self::Capture | Self::CapturePanic | Self::CaptureIndex)
     }
 
     /// 失敗の知らせの見出し（「{見出し}: {理由}」の前半。「{操作の名前}に失敗しました」の形にしないのは、
@@ -155,6 +164,7 @@ impl ActionKind {
             Self::CleanData => "データを削除できませんでした",
             Self::Capture => "クリップボードの内容を履歴に取り込めませんでした",
             Self::CapturePanic => "クリップボードの取り込み中に予期しない誤りが起きました",
+            Self::CaptureIndex => "取り込んだ項目を履歴のファイルへ書けませんでした",
         }
     }
 }
@@ -298,18 +308,25 @@ impl FailureSink {
 /// - パニック（`panicked`）: 毎回知らせる。監視はワーカーが止めてあるので、利用者が戻すまで繰り返さない
 /// - 合計の上限を超えたコピー（`too_large`）: 毎回知らせる（利用者がコピーした直後のことで、そのたびに取り込まれ
 ///   なかったと分かる必要がある）
-/// - `Core::capture` の失敗（`failed`）: 種類（`OpError::Poisoned` とそれ以外）ごとに、1回の起動で最初の1回だけ
-///   知らせ、2回目からはログに書くだけ（ディスクが満杯などでコピーのたびに失敗しても、知らせを積み続けない）。
-///   終了処理の後の締め切り（`OpError::Closing`）は失敗ではないので知らせない
+/// - `Core::capture` の失敗（`failed`）: 種類（`OpError::Poisoned`、取り込んだが履歴のファイルを書けなかった
+///   `OpError::CapturedIndexNotSaved`、それ以外）ごとに、1回の起動で最初の1回だけ知らせ、2回目からはログに書くだけ
+///   （ディスクが満杯などでコピーのたびに失敗しても、知らせを積み続けない）。終了処理の後の締め切り
+///   （`OpError::Closing`）は失敗ではないので知らせない
 pub struct CaptureReporter {
     sink: FailureSink,
     poisoned_sent: AtomicBool,
+    index_sent: AtomicBool,
     failed_sent: AtomicBool,
 }
 
 impl CaptureReporter {
     pub fn new(sink: FailureSink) -> Self {
-        Self { sink, poisoned_sent: AtomicBool::new(false), failed_sent: AtomicBool::new(false) }
+        Self {
+            sink,
+            poisoned_sent: AtomicBool::new(false),
+            index_sent: AtomicBool::new(false),
+            failed_sent: AtomicBool::new(false),
+        }
     }
 
     /// 取り込みがパニックし、監視を止めた（`stopped` は止めた結果）。
@@ -324,12 +341,18 @@ impl CaptureReporter {
     }
 
     pub fn failed(&self, error: &OpError) {
-        let sent = match error {
+        let (sent, failure) = match error {
             OpError::Closing => return,
-            OpError::Poisoned => &self.poisoned_sent,
-            _ => &self.failed_sent,
+            OpError::Poisoned => (&self.poisoned_sent, ActionFailure { kind: ActionKind::Capture, message: error.to_string() }),
+            OpError::CapturedIndexNotSaved(e) => (
+                &self.index_sent,
+                ActionFailure {
+                    kind: ActionKind::CaptureIndex,
+                    message: format!("項目は履歴に入っています。あとで書き直します（{e}）"),
+                },
+            ),
+            _ => (&self.failed_sent, ActionFailure { kind: ActionKind::Capture, message: error.to_string() }),
         };
-        let failure = ActionFailure { kind: ActionKind::Capture, message: error.to_string() };
         if sent.swap(true, Ordering::SeqCst) {
             eprintln!("{failure}");
         } else {
@@ -886,6 +909,9 @@ mod tests {
         let too_large = TooLarge { total: 400 * 1024 * 1024, limit: 320 * 1024 * 1024 };
         reporter.too_large(too_large);
         reporter.too_large(too_large);
+        let index = || OpError::CapturedIndexNotSaved(crate::storage::StorageError::Io(std::io::Error::other("書けない")));
+        reporter.failed(&index());
+        reporter.failed(&index());
         let failures: Vec<ActionFailure> = sink
             .drain()
             .into_iter()
@@ -903,10 +929,13 @@ mod tests {
                 ActionKind::CapturePanic,
                 ActionKind::CapturePanic,
                 ActionKind::Capture,
-                ActionKind::Capture
+                ActionKind::Capture,
+                ActionKind::CaptureIndex
             ],
             "{failures:?}"
         );
+        assert!(failures[6].message.contains("項目は履歴に入っています") && failures[6].message.contains("書けない"), "{}", failures[6].message);
+        assert!(ActionKind::CaptureIndex.always_notified() && ActionKind::CaptureIndex.is_capture());
         assert_eq!(failures[4], failures[5], "上限を超えたコピーは毎回知らせる");
         let message = &failures[4].message;
         assert!(

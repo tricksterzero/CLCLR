@@ -57,6 +57,10 @@ pub enum OpError {
     /// 項目はメモリから除いたが、履歴のインデックス（history.toml）を書き直せなかった。あとの操作と最後の保存で
     /// 書き直す（それまでに異常終了すると、次の起動で除いた項目が戻る）。利用者に知らせるために返す
     IndexNotSaved(StorageError),
+    /// 取り込んだ項目は履歴に足したが、履歴のインデックス（history.toml）を書き直せなかった（変更の都度の保存か、
+    /// 押し出した項目の後始末）。あとの操作と最後の保存で書き直す（それまでに異常終了すると、次の起動で項目が
+    /// 欠けうる）。監視からの取り込みの失敗として利用者に知らせるために返す
+    CapturedIndexNotSaved(StorageError),
     /// データのチェックの削除で、ディスクの history.toml・pinned.toml に、メモリに無い項目があった（実行中に
     /// 外から書き戻されたなど）。何も消さない
     DataChanged,
@@ -79,6 +83,9 @@ impl fmt::Display for OpError {
             Self::ForeignTicket => write!(f, "別の受け付けの登録が渡されました"),
             Self::IndexNotSaved(e) => {
                 write!(f, "履歴のファイルへ書けませんでした（項目は消しました。あとで書き直します）: {e}")
+            }
+            Self::CapturedIndexNotSaved(e) => {
+                write!(f, "履歴のファイルへ書けませんでした（項目は履歴に入っています。あとで書き直します）: {e}")
             }
             Self::DataChanged => write!(
                 f,
@@ -277,7 +284,8 @@ impl Core {
 
     // --- 書く操作 ---
 
-    /// クリップボードから取り込んだ項目を履歴に足す（監視スレッドから呼ぶ）。
+    /// クリップボードから取り込んだ項目を履歴に足す（監視スレッドから呼ぶ）。項目を足した後でインデックスを
+    /// 書けなかったときは `CapturedIndexNotSaved`（項目は履歴に入っている）。
     pub fn capture(&self, entry: Entry) -> Result<(), OpError> {
         let mut scope = self.begin()?;
         let cfg = self.cfg();
@@ -297,11 +305,12 @@ impl Core {
         }
         if !evicted.is_empty() {
             let retire = snapshot.map_or(Retire::Targeted, Retire::Full);
-            // 監視からの取り込みには知らせる先が無い（ログは `retire_items` が書く。消し直す対象に残る）
-            let _ = retire_items(&self.inner.storage, &mut scope.ops, evicted, retire);
+            // 書けなかった項目は消し直す対象に残る（ログは `retire_items` が書く）
+            retire_items(&self.inner.storage, &mut scope.ops, evicted, retire).map_err(OpError::CapturedIndexNotSaved)?;
         } else if let Some(metas) = snapshot {
             if let Err(e) = self.inner.storage.save_history_index(&metas) {
                 eprintln!("履歴インデックスの保存に失敗: {e}");
+                return Err(OpError::CapturedIndexNotSaved(e));
             }
         }
         Ok(())
@@ -2024,6 +2033,27 @@ pub(crate) mod tests {
         core.capture(text_entry("次の操作")).unwrap();
         assert!(!blob_path(&dir, &meta).exists(), "書けるようになっても消し直していない");
         assert!(!index_text(&dir).contains("孤児化テスト"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 取り込みで、項目を足した後にインデックスを書けなければ `CapturedIndexNotSaved` を返す（項目は履歴に入っている）。
+    /// 変更の都度の保存と、押し出した項目の後始末のどちらでも。書けるようになれば、次の取り込みで書き直す。
+    #[test]
+    fn capture_reports_index_not_saved_but_keeps_item() {
+        let mut config = Config::default();
+        config.history.save_on_change = true;
+        config.history.max = 1;
+        let (dir, core) = temp_core(config);
+        block_write(&dir, "history.toml");
+        // 変更の都度の保存が書けない
+        assert!(matches!(core.capture(text_entry("一件目")), Err(OpError::CapturedIndexNotSaved(_))));
+        assert_eq!(core.read(|s| s.history.len()).unwrap(), 1, "項目を足していない");
+        // 押し出した項目の後始末が書けない
+        assert!(matches!(core.capture(text_entry("二件目")), Err(OpError::CapturedIndexNotSaved(_))));
+        assert!(core.read(|s| s.history.front().is_some_and(|i| i.meta.preview.as_deref() == Some("二件目"))).unwrap());
+        unblock_write(&dir, "history.toml");
+        core.capture(text_entry("三件目")).unwrap();
+        assert!(index_text(&dir).contains("三件目"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

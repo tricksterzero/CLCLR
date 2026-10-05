@@ -651,11 +651,7 @@ unsafe fn break_long_words(hdc: windows::Win32::Graphics::Gdi::HDC, text: &[u16]
                     &mut size,
                 );
             }
-            let mut n = (fit.max(1) as usize).min(word.len());
-            // 高位サロゲートで切らない（1文字が2コードユニット）
-            if n < word.len() && (0xD800..0xDC00).contains(&word[n - 1]) && n > 1 {
-                n -= 1;
-            }
+            let n = split_point(word, fit);
             out.extend_from_slice(&word[..n]);
             word = &word[n..];
             if !word.is_empty() {
@@ -664,6 +660,19 @@ unsafe fn break_long_words(hdc: windows::Win32::Graphics::Gdi::HDC, text: &[u16]
         }
     }
     out
+}
+
+/// 単語 `word` を折り返す位置（先頭から何コードユニットを1行に置くか）。`fit` は幅に収まる単位数。少なくとも
+/// 1文字は置き、サロゲートペア（1文字が2コードユニット）の途中では切らない: 収まる範囲の最後が高位サロゲート
+/// なら1つ手前で切り、先頭の1文字がペアなら、幅を超えても2単位をまとめて置く。
+fn split_point(word: &[u16], fit: i32) -> usize {
+    let is_high = |u: u16| (0xD800..0xDC00).contains(&u);
+    let n = (fit.max(1) as usize).min(word.len());
+    if n < word.len() && is_high(word[n - 1]) {
+        if n > 1 { n - 1 } else { 2 }
+    } else {
+        n
+    }
 }
 
 /// `anchor`があるモニタの作業領域（取れなければ`anchor`を含む大きな領域）。
@@ -937,6 +946,22 @@ mod tests {
             resident_hdrop: None,
             resident_dib: None,
         }
+    }
+
+    /// 折り返す位置は、少なくとも1文字を置き、サロゲートペアの途中で切らない（先頭の1文字がペアなら、幅を
+    /// 超えても2単位をまとめて置く）。
+    #[test]
+    fn split_point_never_splits_surrogate_pairs() {
+        let emoji: Vec<u16> = "😀😀a".encode_utf16().collect(); // [高, 低, 高, 低, 'a']
+        assert_eq!(split_point(&emoji, 0), 2, "先頭のペアを分けた");
+        assert_eq!(split_point(&emoji, 1), 2, "先頭のペアを分けた");
+        assert_eq!(split_point(&emoji, 2), 2);
+        assert_eq!(split_point(&emoji, 3), 2, "2つ目のペアを分けた");
+        assert_eq!(split_point(&emoji, 4), 4);
+        assert_eq!(split_point(&emoji, 99), 5);
+        let ascii: Vec<u16> = "abc".encode_utf16().collect();
+        assert_eq!(split_point(&ascii, 0), 1);
+        assert_eq!(split_point(&ascii, 2), 2);
     }
 
     #[test]

@@ -160,12 +160,18 @@ fn load_limited(storage: &Storage, request: &ImageRequest, limit: u64) -> Option
         ImageSource::Thumb(name) => loaded_webp(storage.load_thumbnail(name, limit)?, request, limit)?,
         ImageSource::Blob(name) if name.ends_with(".webp") => loaded_webp(storage.load_webp(name, limit)?, request, limit)?,
         ImageSource::Blob(name) => {
-            // WebP にできなかった元の DIB（`.bin`）。先頭のヘッダーで大きさを判定してから全体を読む
+            // WebP にできなかった元の DIB（`.bin`）。先頭のヘッダーで大きさを判定してから全体を読む。寸法に見合わない
+            // 長さのファイル（小さな寸法の後ろに大きなデータが付いたもの）は、全体を読まない
             let (w, h) = crate::dib::dib_header_dimensions(&storage.load_blob_prefix(name, 64).ok()?).ok()?;
             if exceeds(w, h, limit) {
                 ImageContent::TooLarge { width: w, height: h }
             } else {
-                fitted_dib(&storage.load_blob(name).ok()?, request, limit)?
+                let cap = dib_file_len_limit(w, h);
+                let dib = storage.load_blob_prefix(name, cap + 1).ok()?;
+                if dib.len() > cap {
+                    return None;
+                }
+                fitted_dib(&dib, request, limit)?
             }
         }
         ImageSource::Resident(formats) => {
@@ -179,6 +185,12 @@ fn load_limited(storage: &Storage, request: &ImageRequest, limit: u64) -> Option
         preview_ticket: request.preview_ticket,
         content,
     })
+}
+
+/// DIB のファイルの長さの見込みの上限（バイト）: 画素を RGBA で並べた大きさ（24bpp・32bpp の行は、4 バイトに
+/// そろえてもこれを超えない）に、ヘッダー・マスク・色の表の分として 1MiB を足したもの。
+fn dib_file_len_limit(width: u32, height: u32) -> usize {
+    usize::try_from(u64::from(width) * u64::from(height) * 4 + 1024 * 1024).unwrap_or(usize::MAX)
 }
 
 /// 元の大きさ（RGBA 換算）が上限を超えるか。
@@ -363,6 +375,24 @@ mod tests {
             let within = load_limited(&storage, &request(source, 100), exact).unwrap();
             assert_eq!(pixels(&within), (100, 50, 400, 200));
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// DIB のまま保存した画像は、寸法に見合わない長さのファイル（小さな寸法の後ろに大きなデータが付いたもの）を
+    /// 全体を読まずに断る。見合う長さなら読む。
+    #[test]
+    fn raw_dib_with_oversized_file_is_not_read() {
+        let dir = std::env::temp_dir().join(format!("clclr-test-{}", Uuid::new_v4()));
+        let storage = Storage::open(dir.clone()).unwrap();
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        let dib = dib_32bpp(4, 2);
+        std::fs::write(dir.join("blobs").join("small.bin"), &dib).unwrap();
+        let mut padded = dib.clone();
+        padded.resize(dib_file_len_limit(4, 2) + 1, 0);
+        std::fs::write(dir.join("blobs").join("padded.bin"), &padded).unwrap();
+        let ok = load_limited(&storage, &request(ImageSource::Blob("small.bin".into()), 100), MAX_IMAGE_BYTES).unwrap();
+        assert_eq!(pixels(&ok), (4, 2, 4, 2));
+        assert!(load_limited(&storage, &request(ImageSource::Blob("padded.bin".into()), 100), MAX_IMAGE_BYTES).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

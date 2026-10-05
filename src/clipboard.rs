@@ -666,8 +666,9 @@ fn worker_loop(
         let config = config.read().unwrap_or_else(|p| p.into_inner()).clone();
         let interval = Duration::from_millis(config.history.add_interval_ms.max(1));
 
-        // ウィンドウフィルタは、変更の通知を受けた瞬間の前面の窓（コピー元）でも判定する。まとめ待ちの後の前面の
-        // 窓だけだと、コピーしてすぐ別の窓へ切り替えたときに当たらない。知らせを受け取ったらすぐに読む（ワーカーは
+        // ウィンドウフィルタは、変更の通知を受けた瞬間の前面の窓（ほとんどはコピー元。通知を受ける前に切り替えられると
+        // 別の窓になり、その場合は漏れうる）でも判定する。まとめ待ちの後の前面の窓だけだと、コピーしてすぐ別の窓へ
+        // 切り替えたときに当たらない。知らせを受け取ったらすぐに読む（ワーカーは
         // 知らせを待って止まっているので、通知の直後）。まとめた知らせのどれかで当たれば、まとめた1回を取り込まない
         let mut ignored_at_change = first.source_ignored(&config);
 
