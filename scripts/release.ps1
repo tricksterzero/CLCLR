@@ -8,10 +8,11 @@ CLCLR の配布用の zip と、リリースのページの文面を作る（Git
 1. 作業ツリーに未コミットの変更が無く、main の最新（origin/main と同じ）であることを確かめる
 2. Cargo.toml の版を読み、CHANGELOG.md にその版の節（「## 版（公開日）」）があることと、タグ v<版> が
    origin にまだ無いことを確かめる
-3. cargo test（debug）と cargo build --release。どちらも C ランタイムを静的にリンクする（-C target-feature=+crt-static）。
-   exe はこのビルドで cargo が知らせたものを使い、版と x64 であることと、C ランタイムの DLL を import していない
-   ことを確かめる。release のビルドでは Cargo のホームのパスを「cargo」に置き換え（--remap-path-prefix）、
-   exe にユーザーのフォルダと Cargo のホームのパスが残っていないことを確かめる（探すのはこの2つのパスだけ）
+3. cargo test（debug）と cargo build --release。どちらも C ランタイムを静的にリンクし（-C target-feature=+crt-static）、
+   Control Flow Guard を付ける（-C control-flow-guard）。exe はこのビルドで cargo が知らせたものを使い、版と x64 で
+   あることと、C ランタイムの DLL を import していないことと、CFG の印があることを確かめる。release のビルドでは
+   Cargo のホームのパスを「cargo」に置き換え（--remap-path-prefix）、exe にユーザーのフォルダと Cargo のホームの
+   パスが残っていないことを確かめる（探すのはこの2つのパスだけ）
 4. <出力先>\dist\CLCLR-<版>-x64.zip を作る（CLCLR.exe・README.md・LICENSE・THIRD-PARTY-NOTICES.md の4つ）。
    作った zip の項目がちょうどその4つで、中身が元のファイルと同じであることと、テスト・ビルドの間に作業ツリーと
    コミットが変わっていないことを確かめる
@@ -107,6 +108,17 @@ function Test-X64Exe([string]$path) {
     $signature = [System.BitConverter]::ToUInt32($bytes, $peOffset)
     $machine = [System.BitConverter]::ToUInt16($bytes, $peOffset + 4)
     return ($signature -eq 0x00004550 -and $machine -eq 0x8664)
+}
+
+# exe（x64 の PE。PE32+）に Control Flow Guard の印があるか（オプションヘッダーの DllCharacteristics の
+# IMAGE_DLLCHARACTERISTICS_GUARD_CF = 0x4000。PE32+ ではオプションヘッダーの先頭から 70 バイト目）
+function Test-GuardCf([string]$path) {
+    $bytes = [System.IO.File]::ReadAllBytes($path)
+    $optional = [System.BitConverter]::ToInt32($bytes, 0x3C) + 24
+    if ([System.BitConverter]::ToUInt16($bytes, $optional) -ne 0x20B) {
+        throw "$path が PE32+ の実行ファイルではありません"
+    }
+    return (([System.BitConverter]::ToUInt16($bytes, $optional + 70) -band 0x4000) -ne 0)
 }
 
 # exe（x64 の PE。PE32+）が静的に import している DLL の名前（import のディレクトリから読む）
@@ -297,12 +309,15 @@ try {
             throw "環境変数 $variable が設定されています。消してから実行してください"
         }
     }
-    # C ランタイム（CRT）を exe に静的にリンクする。Visual C++ の実行環境（VCRUNTIME140.dll）が入っていない PC でも
-    # 動き、exe の隣に置かれた同じ名前の DLL も関係しなくなる。テストも同じ指定で通す
-    $crtStatic = '-Ctarget-feature=+crt-static'
+    # 配布のビルドの指定（テストも同じ指定で通す。CARGO_ENCODED_RUSTFLAGS は、指定を 0x1F の文字で区切って並べる）
+    # - C ランタイム（CRT）を exe に静的にリンクする。Visual C++ の実行環境（VCRUNTIME140.dll）が入っていない PC でも
+    #   動き、exe の隣に置かれた同じ名前の DLL も関係しなくなる
+    # - Control Flow Guard（CFG）を付ける。間接呼び出しの呼び先を Windows が確かめ、正しい呼び先でなければプロセスを
+    #   終える（メモリが壊されたときに、呼び先を書き換えて処理を乗っ取られないようにする）
+    $hardening = '-Ctarget-feature=+crt-static' + [char]0x1F + '-Ccontrol-flow-guard'
 
-    Write-Step 'テスト（cargo test。配布のビルドと同じく CRT を静的にリンクする）'
-    $env:CARGO_ENCODED_RUSTFLAGS = $crtStatic
+    Write-Step 'テスト（cargo test。配布のビルドと同じく CRT の静的リンクと CFG の指定で）'
+    $env:CARGO_ENCODED_RUSTFLAGS = $hardening
     try {
         Invoke-Checked 'cargo test' { cargo test }
     } finally {
@@ -319,8 +334,7 @@ try {
     }
     $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $userProfile '.cargo' }
     $cargoHome = [System.IO.Path]::GetFullPath($cargoHome).TrimEnd('\')
-    # CARGO_ENCODED_RUSTFLAGS は、指定を 0x1F の文字で区切って並べる
-    $env:CARGO_ENCODED_RUSTFLAGS = "--remap-path-prefix=$cargoHome=cargo" + [char]0x1F + $crtStatic
+    $env:CARGO_ENCODED_RUSTFLAGS = "--remap-path-prefix=$cargoHome=cargo" + [char]0x1F + $hardening
     try {
         # exe の場所は CARGO_TARGET_DIR・CARGO_BUILD_TARGET などで変わるので、決め打ちにせず、このビルドで cargo が
         # 知らせた成果物（compiler-artifact の executable）を使う。診断は人が読む形で stderr に出る
@@ -365,6 +379,9 @@ try {
     $runtimeImports = @(Get-ImportedDll $exe | Where-Object { $_ -match '^(vcruntime|msvcp|ucrtbase|api-ms-win-crt-)' })
     if ($runtimeImports.Count -gt 0) {
         throw "CLCLR.exe が C ランタイムの DLL を import しています（$($runtimeImports -join '、')）。CRT の静的リンクが効いていません"
+    }
+    if (-not (Test-GuardCf $exe)) {
+        throw "CLCLR.exe に Control Flow Guard（CFG）の印がありません。CFG の指定が効いていません"
     }
     $leaks = @(Find-LocalPath $exe @($userProfile, $cargoHome, (Get-ShortFolderPath $userProfile), (Get-ShortFolderPath $cargoHome)))
     if ($leaks.Count -gt 0) {
