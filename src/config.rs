@@ -589,6 +589,16 @@ impl Config {
                 message: "ホットキーのキー欄には半角英数字1文字を入力してください（現在の値では登録されません）".to_string(),
             });
         }
+        // 再生するときもネットワークの場所は開かずにシステム音にする（`ops::play_add_sound`）。音を鳴らす設定が
+        // 無効な間は欄が灰色で直せないので、ホットキーのキーと同じく有効なときだけ確かめる
+        if h.sound_on_add && !h.sound_file.is_empty() && !crate::ops::is_local_path(&h.sound_file) {
+            issues.push(ConfigIssue {
+                field: "history.sound_file",
+                row: None,
+                message: "WAVファイルには、この PC のドライブにあるファイルを指定してください（ネットワークの場所は使えません）"
+                    .to_string(),
+            });
+        }
         // TOML の整数は符号付き64ビット（形式ごとの上限と同じ）
         if i64::try_from(self.capture_total_limit).is_err() {
             issues.push(ConfigIssue {
@@ -1145,6 +1155,21 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].field, "hotkey.popup_menu.key");
         c.hotkey.popup_menu.enabled = false;
+        assert!(c.validate().is_empty());
+    }
+
+    /// 追加音のファイルは、音を鳴らす設定が有効なときだけ、ネットワークの場所でないかを確かめる。
+    #[test]
+    fn validate_rejects_network_sound_file_only_when_enabled() {
+        let mut c = Config::default();
+        c.history.sound_file = r"\\server\share\a.wav".to_string();
+        assert!(c.validate().is_empty());
+        c.history.sound_on_add = true;
+        let issues = c.validate();
+        assert_eq!(issues.iter().map(|i| i.field).collect::<Vec<_>>(), ["history.sound_file"]);
+        c.history.sound_file = r"C:\Windows\Media\chimes.wav".to_string();
+        assert!(c.validate().is_empty());
+        c.history.sound_file.clear();
         assert!(c.validate().is_empty());
     }
 

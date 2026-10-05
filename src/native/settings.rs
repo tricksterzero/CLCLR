@@ -136,7 +136,7 @@ struct FieldPlace {
     enabler: Option<(i32, &'static str)>,
 }
 
-const PLACES: [FieldPlace; 15] = [
+const PLACES: [FieldPlace; 16] = [
     // フィルタの行の誤り（`ConfigIssue::row` の行を選んでから、その欄へ）
     FieldPlace { field: "format_filters.format_name", page: PAGE_FORMAT, ctl: IDC_FMT_NAME, enabler: None },
     FieldPlace { field: "format_filters.limit_size", page: PAGE_FORMAT, ctl: IDC_FMT_LIMIT, enabler: None },
@@ -147,6 +147,7 @@ const PLACES: [FieldPlace; 15] = [
     FieldPlace { field: "history.grouping.folders", page: PAGE_HISTORY, ctl: IDC_HIS_FOLDERS, enabler: Some((IDC_HIS_GROUP, "古い履歴をフォルダにまとめる")) },
     FieldPlace { field: "history.grouping.items_per_folder", page: PAGE_HISTORY, ctl: IDC_HIS_PER_FOLDER, enabler: Some((IDC_HIS_GROUP, "古い履歴をフォルダにまとめる")) },
     FieldPlace { field: "history.add_interval_ms", page: PAGE_HISTORY, ctl: IDC_HIS_INTERVAL, enabler: None },
+    FieldPlace { field: "history.sound_file", page: PAGE_HISTORY, ctl: IDC_HIS_SOUND_FILE, enabler: Some((IDC_HIS_SOUND, "履歴に追加された時に音を鳴らす")) },
     FieldPlace { field: "hotkey.menu_max_items", page: PAGE_HOTKEY, ctl: IDC_HK_MENU_ITEMS, enabler: None },
     FieldPlace { field: "hotkey.tooltip.delay_ms", page: PAGE_HOTKEY, ctl: IDC_HK_TIP_DELAY, enabler: Some((IDC_HK_TOOLTIP, "メニュー項目にツールチップを表示する")) },
     FieldPlace { field: "hotkey.tooltip.max_chars", page: PAGE_HOTKEY, ctl: IDC_HK_TIP_CHARS, enabler: Some((IDC_HK_TOOLTIP, "メニュー項目にツールチップを表示する")) },
@@ -1829,8 +1830,10 @@ mod tests {
         bad.hotkey.popup_menu.key = String::new();
         bad.format_filters = vec![format("", FilterAction::Add, true, 0)];
         bad.window_filters = vec![window("", "", true)];
+        bad.history.sound_on_add = true;
+        bad.history.sound_file = r"\\server\share\a.wav".to_string();
         let issues = bad.validate();
-        assert_eq!(issues.len(), 13, "前提: すべての項目が誤り");
+        assert_eq!(issues.len(), 14, "前提: すべての項目が誤り");
         let limit = ["format_filters.limit_size"]; // 上限は画面の読み取りの誤り（read_draft）
         for field in issues.iter().map(|i| i.field).chain(NUMS.iter().map(|n| n.field)).chain(limit) {
             assert!(PLACES.iter().any(|p| p.field == field), "{field} の場所が無い");
