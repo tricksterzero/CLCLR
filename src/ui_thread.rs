@@ -37,8 +37,17 @@ pub(crate) fn stop_ui_thread(hwnd: HWND, shutdown_msg: u32, thread: JoinHandle<(
         let _ = PostMessageW(Some(hwnd), shutdown_msg, WPARAM(0), LPARAM(0));
     };
     post();
+    join_answering_sent_messages(thread, repost_interval, post);
+}
+
+/// `thread` が終わるまで、このスレッドの窓へ送られたメッセージに応じながら待って join する（上限なし）。
+/// `interval` ごとに `on_interval` を呼ぶ。窓を持たないスレッド（監視のワーカー）の終わりを待つときも使う: 待たれる
+/// スレッドが、待つ側の窓（ビューア）のタイトルを `GetWindowText` で読むと、自分のプロセスの窓なので `WM_GETTEXT` が
+/// 送られる（Microsoft Learn の GetWindowTextW）。ただ join で待つと互いに待って止まる。応じ方と縮退は
+/// `stop_ui_thread` と同じ。
+pub(crate) fn join_answering_sent_messages(thread: JoinHandle<()>, interval: Duration, mut on_interval: impl FnMut()) {
     let handle = HANDLE(thread.as_raw_handle());
-    let wait_ms = u32::try_from(repost_interval.as_millis()).unwrap_or(u32::MAX);
+    let wait_ms = u32::try_from(interval.as_millis()).unwrap_or(u32::MAX);
     loop {
         let result = unsafe { MsgWaitForMultipleObjects(Some(&[handle]), false, wait_ms, QS_SENDMESSAGE) };
         if result == WAIT_OBJECT_0 {
@@ -51,7 +60,7 @@ pub(crate) fn stop_ui_thread(hwnd: HWND, shutdown_msg: u32, thread: JoinHandle<(
                 let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
             }
         } else if result == WAIT_TIMEOUT {
-            post();
+            on_interval();
         } else {
             let error = unsafe { GetLastError() };
             eprintln!(

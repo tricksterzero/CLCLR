@@ -972,7 +972,9 @@ impl Drop for ClipboardWatcher {
         // 既にWM_DESTROY処理によりdrop済みなので、残る送信側はこれだけ）
         self.changed_tx = None;
         if let Some(t) = self.worker_thread.take() {
-            let _ = t.join();
+            // ワーカーは前面の窓・持ち主の窓のタイトルを読む。それがこのスレッドの窓（ビューア）だと `WM_GETTEXT` が
+            // 送られてくるので、応じながら待つ（ただ join すると互いに待って止まる）
+            crate::ui_thread::join_answering_sent_messages(t, crate::ui_thread::REPOST_INTERVAL, || {});
         }
     }
 }
@@ -1252,6 +1254,57 @@ mod tests {
         assert_eq!(entry_text(&entries.try_recv().unwrap()), "除外したい窓のコピー");
         drop(changed_tx);
         worker.join().unwrap();
+    }
+
+    /// 監視のワーカーの終わりを待つ側（`ClipboardWatcher` の `Drop`）は、ワーカーが待つ側のスレッドの窓（ビューアの
+    /// 代わり）のタイトルを読む間も、送られてくる `WM_GETTEXT` に応じながら待つ（ただ join すると互いに待って止まる）。
+    /// 止まったときは、見張りのスレッドが知らせる（テストは戻らない）。
+    #[test]
+    fn waiting_for_worker_answers_its_window_text_request() {
+        use std::sync::atomic::AtomicUsize;
+        use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, RegisterClassW, WM_GETTEXT, WNDCLASSW};
+        static GETTEXT: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn count_gettext(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+            if msg == WM_GETTEXT {
+                GETTEXT.fetch_add(1, Ordering::SeqCst);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        let _gui = crate::tray::lock_gui_resource_tests();
+        GETTEXT.store(0, Ordering::SeqCst);
+        let hwnd = unsafe {
+            let class_name = w!("CLCLR_TestWaiterWindow");
+            RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(count_gettext),
+                hInstance: GetModuleHandleW(None).unwrap().into(),
+                lpszClassName: class_name,
+                ..Default::default()
+            });
+            CreateWindowExW(Default::default(), class_name, w!("CLCLR 除外テスト窓（待つ側）"), WS_OVERLAPPED, 0, 0, 10, 10, None, None, None, None)
+                .unwrap()
+        };
+        let mut config = Config::default();
+        config.window_filters.push(title_filter("除外テスト"));
+        // 監視は切ってある扱い（クリップボードは開かない）
+        let switch = Arc::new(WatchSwitch { hwnd: HWND::default(), lock: Mutex::new(()), listening: Arc::new(AtomicBool::new(false)) });
+        let (changed_tx, changed_rx) = mpsc::channel();
+        let worker = {
+            let (config, port) = (Arc::new(RwLock::new(config)), Arc::new(ClipboardPort::unopenable()));
+            thread::spawn(move || worker_loop(changed_rx, config, port, switch, |_| {}, |_| {}, |_| {}))
+        };
+        changed_tx.send(Changed { foreground: hwnd.0 as isize }).unwrap();
+        drop(changed_tx);
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let watchdog = thread::spawn(move || done_rx.recv_timeout(Duration::from_secs(10)).is_ok());
+        crate::ui_thread::join_answering_sent_messages(worker, Duration::from_millis(100), || {});
+        let _ = done_tx.send(());
+        assert!(watchdog.join().unwrap(), "ワーカーの終わりを待つ側が WM_GETTEXT に応じず、互いに待った");
+        assert!(GETTEXT.load(Ordering::SeqCst) >= 1, "前提: ワーカーが待つ側の窓のタイトルを読んでいない");
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
     }
 
     /// 実際のウィンドウでタイトル/クラス名フィルタが機能すること
