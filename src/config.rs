@@ -27,6 +27,10 @@ pub struct Config {
     /// `Ignore`にすることでホワイトリスト方式（明示的に許可した形式のみ捕捉）になる。
     pub format_filter_default: FilterAction,
     pub format_filters: Vec<FormatFilter>,
+    /// 1回のコピーで取り込む形式（形式フィルタで取り込む対象になり、形式ごとの上限も通ったもの）の大きさの
+    /// 合計の上限（バイト）。超えたコピーは何も取り込まず、知らせる。0は無制限。以前の版の設定ファイルには
+    /// 無いので、既定（`DEFAULT_CAPTURE_TOTAL_LIMIT`）が効く
+    pub capture_total_limit: u64,
     pub window_filters: Vec<WindowFilter>,
 }
 
@@ -379,6 +383,9 @@ pub enum FilterAction {
 pub const DEFAULT_TEXT_LIMIT: u64 = 32 * 1024 * 1024;
 pub const DEFAULT_IMAGE_LIMIT: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_FILE_LIST_LIMIT: u64 = 1024 * 1024;
+/// 既定の1回のコピーの合計の上限（バイト）。既定の形式ごとの上限の和（約 289MiB）より大きくし、既定のまま
+/// 使う間は当たらないようにする（形式を足したときと、形式ごとの上限が 0 の設定の歯止め）
+pub const DEFAULT_CAPTURE_TOTAL_LIMIT: u64 = 320 * 1024 * 1024;
 
 impl Default for Config {
     fn default() -> Self {
@@ -410,6 +417,7 @@ impl Default for Config {
                     limit_size: DEFAULT_FILE_LIST_LIMIT,
                 },
             ],
+            capture_total_limit: DEFAULT_CAPTURE_TOTAL_LIMIT,
             window_filters: Vec::new(),
         }
     }
@@ -579,6 +587,14 @@ impl Config {
                 field: "hotkey.popup_menu.key",
                 row: None,
                 message: "ホットキーのキー欄には半角英数字1文字を入力してください（現在の値では登録されません）".to_string(),
+            });
+        }
+        // TOML の整数は符号付き64ビット（形式ごとの上限と同じ）
+        if i64::try_from(self.capture_total_limit).is_err() {
+            issues.push(ConfigIssue {
+                field: "capture_total_limit",
+                row: None,
+                message: format!("「コピーの合計の上限」は {} 以下で入力してください", i64::MAX),
             });
         }
         // フィルタの効かない行は誤りにする（黙って保存しない）。形式名の比べ方は
@@ -761,6 +777,39 @@ mod tests {
         let text = "[[format_filters]]\nformat_name = \"CF_UNICODETEXT\"\naction = \"add\"\nsave = true\nlimit_size = 0\n";
         let saved: Config = toml::from_str(text).unwrap();
         assert_eq!(saved.size_limit("CF_UNICODETEXT"), 0);
+    }
+
+    /// 1回のコピーの合計の上限: 既定は 320MiB で、既定の形式ごとの上限の和より大きい（既定のまま使う間は当たらない）。
+    /// 項目の無い以前の設定ファイル（形式ごとの上限が 0 のものを含む）にも既定が効き、書いた値（0 = 無制限を含む）は
+    /// そのまま使い、保存して読み戻しても変わらない。
+    #[test]
+    fn capture_total_limit_defaults_and_round_trips() {
+        let c = Config::default();
+        assert_eq!(c.capture_total_limit, 320 * 1024 * 1024);
+        let sum: u64 = c.format_filters.iter().map(|f| f.limit_size).sum();
+        assert!(sum < c.capture_total_limit, "{sum}");
+
+        let older = "format_filter_default = \"ignore\"\n[[format_filters]]\nformat_name = \"CF_DIB\"\naction = \"add\"\nsave = true\nlimit_size = 0\n";
+        let older: Config = toml::from_str(older).unwrap();
+        assert_eq!(older.capture_total_limit, DEFAULT_CAPTURE_TOTAL_LIMIT);
+
+        for limit in [0, 1234] {
+            let written: Config = toml::from_str(&format!("capture_total_limit = {limit}\n")).unwrap();
+            assert_eq!(written.capture_total_limit, limit);
+            let again: Config = toml::from_str(&toml::to_string(&written).unwrap()).unwrap();
+            assert_eq!(again.capture_total_limit, limit);
+        }
+    }
+
+    /// 合計の上限も、TOML に書ける範囲（符号付き64ビット）を超えたら誤りにする。
+    #[test]
+    fn capture_total_limit_over_i64_is_an_issue() {
+        let mut c = Config::default();
+        c.capture_total_limit = i64::MAX as u64;
+        assert!(c.validate().is_empty());
+        c.capture_total_limit = i64::MAX as u64 + 1;
+        let got: Vec<(&str, Option<usize>)> = c.validate().iter().map(|i| (i.field, i.row)).collect();
+        assert_eq!(got, [("capture_total_limit", None)]);
     }
 
     /// 項目の無い以前の設定ファイルでも、保存先のフォルダの権限は確かめる（既定値 true）。

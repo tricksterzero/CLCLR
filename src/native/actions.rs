@@ -36,7 +36,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-use crate::clipboard::ClipboardPort;
+use crate::clipboard::{ClipboardPort, TooLarge};
 use crate::config::Config;
 use crate::data::{utf16_bytes, utf16_text, Format};
 use crate::datacheck::{CleanResult, DataReport};
@@ -296,6 +296,8 @@ impl FailureSink {
 /// ビルドには標準エラーの出力先が無いので、ログに書くだけでは誰も気づけない。
 ///
 /// - パニック（`panicked`）: 毎回知らせる。監視はワーカーが止めてあるので、利用者が戻すまで繰り返さない
+/// - 合計の上限を超えたコピー（`too_large`）: 毎回知らせる（利用者がコピーした直後のことで、そのたびに取り込まれ
+///   なかったと分かる必要がある）
 /// - `Core::capture` の失敗（`failed`）: 種類（`OpError::Poisoned` とそれ以外）ごとに、1回の起動で最初の1回だけ
 ///   知らせ、2回目からはログに書くだけ（ディスクが満杯などでコピーのたびに失敗しても、知らせを積み続けない）。
 ///   終了処理の後の締め切り（`OpError::Closing`）は失敗ではないので知らせない
@@ -316,6 +318,11 @@ impl CaptureReporter {
         self.sink.report(ActionFailure { kind: ActionKind::CapturePanic, message: capture_panic_message(stopped, &log) });
     }
 
+    /// 取り込む形式の大きさの合計が上限を超えたので、何も取り込まなかった。
+    pub fn too_large(&self, too_large: TooLarge) {
+        self.sink.report(ActionFailure { kind: ActionKind::Capture, message: too_large_message(too_large) });
+    }
+
     pub fn failed(&self, error: &OpError) {
         let sent = match error {
             OpError::Closing => return,
@@ -329,6 +336,17 @@ impl CaptureReporter {
             self.sink.report(failure);
         }
     }
+}
+
+/// 合計の上限を超えたコピーの知らせの本文（見出しの後ろ）。
+fn too_large_message(TooLarge { total, limit }: TooLarge) -> String {
+    use crate::native::settings::readable_bytes;
+    format!(
+        "コピーした内容の大きさの合計（{}、{total} バイト）が上限（{}）を超えたため、取り込みませんでした。\n\
+         上限は、設定画面の「形式フィルタ」の「コピーの合計の上限」で変えられます。",
+        readable_bytes(total),
+        readable_bytes(limit)
+    )
 }
 
 /// 取り込みのパニックの知らせの本文（見出しの後ろ）。
@@ -852,7 +870,8 @@ mod tests {
     }
 
     /// 監視からの取り込みの失敗: 締め切りは知らせず、`Poisoned` とそれ以外は種類ごとに最初の1回だけ知らせる。
-    /// パニックは毎回知らせ、監視を止めた結果と記録の場所を書く。
+    /// パニックは毎回知らせ、監視を止めた結果と記録の場所を書く。合計の上限を超えたコピーは毎回知らせ、大きさと
+    /// 上限と変える場所を書く。
     #[test]
     fn capture_reporter_notifies_each_kind_once_and_every_panic() {
         let sink = FailureSink::new(|| {});
@@ -864,6 +883,9 @@ mod tests {
         reporter.failed(&OpError::Empty);
         reporter.panicked(&Ok(()));
         reporter.panicked(&Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_ACCESSDENIED)));
+        let too_large = TooLarge { total: 400 * 1024 * 1024, limit: 320 * 1024 * 1024 };
+        reporter.too_large(too_large);
+        reporter.too_large(too_large);
         let failures: Vec<ActionFailure> = sink
             .drain()
             .into_iter()
@@ -875,8 +897,21 @@ mod tests {
         let kinds: Vec<ActionKind> = failures.iter().map(|f| f.kind).collect();
         assert_eq!(
             kinds,
-            [ActionKind::Capture, ActionKind::Capture, ActionKind::CapturePanic, ActionKind::CapturePanic],
+            [
+                ActionKind::Capture,
+                ActionKind::Capture,
+                ActionKind::CapturePanic,
+                ActionKind::CapturePanic,
+                ActionKind::Capture,
+                ActionKind::Capture
+            ],
             "{failures:?}"
+        );
+        assert_eq!(failures[4], failures[5], "上限を超えたコピーは毎回知らせる");
+        let message = &failures[4].message;
+        assert!(
+            message.contains("400.0 MB、419430400 バイト") && message.contains("上限（320.0 MB）") && message.contains("「コピーの合計の上限」"),
+            "{message}"
         );
         assert_eq!(failures[0].message, OpError::Poisoned.to_string());
         assert_eq!(failures[1].message, OpError::NotFound.to_string());

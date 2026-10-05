@@ -108,9 +108,21 @@ pub fn dib_to_bmp_file(dib: &[u8]) -> Result<Vec<u8>> {
     Ok(bmp)
 }
 
-/// CF_DIB のバイト列を WebP ロスレスに変換する。
+/// WebP にする画像の幅・高さの上限（各辺）。WebP の仕様の上限は 16384 で、`image-webp` 0.2.4 のエンコーダも
+/// 16384 まで書くが、そのデコーダはロスレスの見出しの幅・高さを `(1 + header) & 0x3FFF` で読む
+/// （`decoder.rs` の VP8L の見出し）ため、ちょうど 16384 の辺は 0 になり、書いた画像を読み戻せない。読み戻せる
+/// 16383 までにする
+const WEBP_MAX_EDGE: u32 = 16383;
+
+/// CF_DIB のバイト列を WebP ロスレスに変換する。`WEBP_MAX_EDGE` を超える画像は、ヘッダーを確かめた後、画素を
+/// 並べ直す前に断る（エンコーダは並べ直した後で断るので、使わない大きな確保が起きる）。断った画像は、呼び出し側が
+/// DIB のまま保存する。
 pub fn dib_to_webp(dib: &[u8]) -> Result<Vec<u8>> {
-    let parsed = parse_dib(dib)?;
+    let layout = parse_layout(dib)?;
+    if layout.width > WEBP_MAX_EDGE || layout.height > WEBP_MAX_EDGE {
+        return Err(DibError::Unsupported("読み戻せる WebP の幅・高さの上限（16383）を超える"));
+    }
+    let parsed = parse_pixels(dib, &layout);
     let mut out = Vec::new();
     let encoder = WebPEncoder::new(&mut out);
     match &parsed.pixels {
@@ -410,6 +422,11 @@ impl DibLayout {
 
 fn parse_dib(dib: &[u8]) -> Result<ParsedDib> {
     let layout = parse_layout(dib)?;
+    Ok(parse_pixels(dib, &layout))
+}
+
+/// 確かめた配置（`parse_layout`）から、画素を RGB か RGBA に並べ直す。
+fn parse_pixels(dib: &[u8], layout: &DibLayout) -> ParsedDib {
     let (w, h) = (layout.width as usize, layout.height as usize);
     let pixels = if layout.has_meaningful_alpha(dib) {
         let mut data = Vec::with_capacity(w * h * 4);
@@ -431,7 +448,7 @@ fn parse_dib(dib: &[u8]) -> Result<ParsedDib> {
         }
         Pixels::Rgb(data)
     };
-    Ok(ParsedDib { width: layout.width, height: layout.height, pixels })
+    ParsedDib { width: layout.width, height: layout.height, pixels }
 }
 
 /// ヘッダーを検査して配置を求める（対応する形式・データの長さも確かめる）。
@@ -796,5 +813,31 @@ mod tests {
         assert!(dib_to_webp(&[]).is_err());
         assert!(dib_to_webp(&[0xFF; 39]).is_err());
         assert!(webp_to_dib(&[0xFF; 64]).is_err());
+    }
+
+    /// 読み戻せる WebP の幅・高さの上限（16383）を超える画像は、変換を試みずに断る（呼び出し側が DIB のまま保存する）。
+    /// 上限ちょうどは変換して読み戻せる。
+    #[test]
+    fn dib_over_webp_edge_limit_is_rejected_before_conversion() {
+        for (w, h) in [(WEBP_MAX_EDGE + 1, 1), (1, WEBP_MAX_EDGE + 1)] {
+            let dib = build_dib_32bpp(w, h, &vec![7u8; (w * h * 3) as usize], false);
+            match dib_to_webp(&dib) {
+                Err(DibError::Unsupported(reason)) => assert!(reason.contains("16383"), "{reason}"),
+                other => panic!("{w}x{h}: {other:?}"),
+            }
+        }
+        for (w, h) in [(WEBP_MAX_EDGE, 1), (1, WEBP_MAX_EDGE)] {
+            let dib = build_dib_32bpp(w, h, &vec![7u8; (w * h * 3) as usize], false);
+            assert_eq!(webp_to_dib(&dib_to_webp(&dib).unwrap()).unwrap(), dib, "{w}x{h}");
+        }
+    }
+
+    /// `WEBP_MAX_EDGE` を 16383 にしている理由: `image-webp` 0.2.4 は、辺がちょうど 16384 の画像を書けるが読み戻せない。
+    /// 依存を更新してこれが通らなくなったら（読み戻せるようになったら）、上限を 16384 に戻せる。
+    #[test]
+    fn image_webp_cannot_read_back_16384_edge() {
+        let mut out = Vec::new();
+        WebPEncoder::new(&mut out).encode(&vec![7u8; 16384 * 3], 16384, 1, ColorType::Rgb8).unwrap();
+        assert!(webp_to_dib(&out).is_err());
     }
 }

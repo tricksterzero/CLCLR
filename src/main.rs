@@ -334,7 +334,7 @@ fn main() {
     let watcher = {
         let core = core.clone();
         let reporter = Arc::new(native::actions::CaptureReporter::new(failures.clone()));
-        let panic_reporter = Arc::clone(&reporter);
+        let problem_reporter = Arc::clone(&reporter);
         match ClipboardWatcher::spawn(
             Arc::clone(&config),
             move |entry| {
@@ -344,7 +344,10 @@ fn main() {
                 }
                 waker.wake();
             },
-            move |stopped| panic_reporter.panicked(&stopped),
+            move |problem| match problem {
+                clipboard::WatchProblem::Panicked(stopped) => problem_reporter.panicked(&stopped),
+                clipboard::WatchProblem::TooLarge(too_large) => problem_reporter.too_large(too_large),
+            },
         ) {
             Ok(w) => w,
             Err(e) => {

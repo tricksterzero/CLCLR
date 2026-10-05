@@ -297,6 +297,24 @@ enum Capture {
     Suppressed(u32),
     /// 読んだ（形式が無ければ `None`）
     Read(u32, Option<Entry>),
+    /// 取り込む形式の大きさの合計が上限を超えた。中身は写していない
+    TooLarge(u32, TooLarge),
+}
+
+/// 取り込む形式の大きさの合計（`total`）が、`Config::capture_total_limit`（`limit`）を超えた。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooLarge {
+    pub total: u64,
+    pub limit: u64,
+}
+
+/// 監視のワーカーから知らせること（`ClipboardWatcher::spawn` の `on_problem`）。
+#[derive(Debug)]
+pub enum WatchProblem {
+    /// 読み取りか `on_entry` がパニックし、監視を止めた（止めた結果。失敗したら監視は登録されたまま）
+    Panicked(WinResult<()>),
+    /// 取り込む形式の大きさの合計が上限を超えたので、何も取り込まなかった
+    TooLarge(TooLarge),
 }
 
 /// 監視の取り込み: 開いてから変更番号を読み、抑止する番号と同じなら中身を読まない。開いている
@@ -308,12 +326,23 @@ fn capture_clipboard(config: &Config, port: &ClipboardPort) -> Result<Capture> {
     if port.is_suppressed(seq) {
         return Ok(Capture::Suppressed(seq));
     }
-    Ok(Capture::Read(seq, read_entry(&guard, config)))
+    Ok(match read_entry(&guard, config) {
+        Ok(entry) => Capture::Read(seq, entry),
+        Err(too_large) => Capture::TooLarge(seq, too_large),
+    })
 }
 
-/// 開いているクリップボード（`guard`）の中身を読む（`capture_clipboard` の本体）。
-fn read_entry(_guard: &ClipboardGuard, config: &Config) -> Option<Entry> {
-    let mut formats = Vec::new();
+/// 合計の上限（0は無制限）を超えるか。
+fn exceeds_total(total: u64, limit: u64) -> bool {
+    limit != 0 && total > limit
+}
+
+/// 開いているクリップボード（`guard`）の中身を読む（`capture_clipboard` の本体）。先に取り込む形式と大きさを
+/// 集め、合計が上限を超えたら中身を写さずに `Err` を返す（大きな確保そのものをしない）。ハンドルは
+/// クリップボードを開いている間は有効で、ほかのプロセスは書き換えられない。
+fn read_entry(_guard: &ClipboardGuard, config: &Config) -> std::result::Result<Option<Entry>, TooLarge> {
+    let mut picked = Vec::new();
+    let mut total = 0u64;
     let mut id = 0u32;
     loop {
         id = unsafe { EnumClipboardFormats(id) };
@@ -337,18 +366,22 @@ fn read_entry(_guard: &ClipboardGuard, config: &Config) -> Option<Entry> {
         if !should_capture_size(size, config.size_limit(&name)) {
             continue;
         }
-
-        let Some(guard) = GlobalLockGuard::lock(hglobal) else {
-            continue;
-        };
-        formats.push(Format {
-            format_name: name,
-            format_id: id,
-            data: guard.as_slice(size).to_vec(),
-        });
+        total = total.saturating_add(size as u64);
+        picked.push((id, name, hglobal, size));
     }
 
-    (!formats.is_empty()).then(|| Entry::new(formats))
+    let limit = config.capture_total_limit;
+    if exceeds_total(total, limit) {
+        return Err(TooLarge { total, limit });
+    }
+    let formats: Vec<Format> = picked
+        .into_iter()
+        .filter_map(|(id, name, hglobal, size)| {
+            let guard = GlobalLockGuard::lock(hglobal)?;
+            Some(Format { format_name: name, format_id: id, data: guard.as_slice(size).to_vec() })
+        })
+        .collect();
+    Ok((!formats.is_empty()).then(|| Entry::new(formats)))
 }
 
 // --- Write to clipboard ---
@@ -560,8 +593,10 @@ pub(crate) enum Outcome {
     Failed,
     /// まとめ待ちの間に監視が切られた（開いていない）
     WatchOff,
-    /// 読み取りか取り込み（`on_entry`）がパニックした（監視を止め、`on_panic` を呼んだ後）
+    /// 読み取りか取り込み（`on_entry`）がパニックした（監視を止め、`on_problem` を呼んだ後）
     Panicked,
+    /// 取り込む形式の大きさの合計が上限を超えた（中身は写さず、`on_problem` を呼んだ後）
+    TooLarge { seq: u32 },
 }
 
 /// 監視の登録（`AddClipboardFormatListener`）の切り替え。ビューア（`set_watch`）と、取り込みがパニックした
@@ -606,7 +641,7 @@ fn worker_loop(
     port: Arc<ClipboardPort>,
     switch: Arc<WatchSwitch>,
     on_entry: impl Fn(Entry),
-    on_panic: impl Fn(WinResult<()>),
+    on_problem: impl Fn(WatchProblem),
     on_outcome: impl Fn(Outcome),
 ) {
     while rx.recv().is_ok() {
@@ -649,10 +684,14 @@ fn worker_loop(
                 Outcome::Captured { seq }
             }
             Ok(Capture::Read(seq, None)) => Outcome::Empty { seq },
+            Ok(Capture::TooLarge(seq, too_large)) => {
+                on_problem(WatchProblem::TooLarge(too_large));
+                Outcome::TooLarge { seq }
+            }
             Err(_) => Outcome::Failed,
         }));
         let outcome = captured.unwrap_or_else(|_| {
-            on_panic(switch.set(false));
+            on_problem(WatchProblem::Panicked(switch.set(false)));
             Outcome::Panicked
         });
         on_outcome(outcome);
@@ -785,15 +824,15 @@ pub struct ClipboardWatcher {
 impl ClipboardWatcher {
     /// 監視を開始する。`on_entry` はキャプチャされた `Entry` ごとに呼ばれる
     /// （ワーカースレッド上で実行されるため、呼び出し先はスレッドセーフである必要がある）。
-    /// `on_panic` は、読み取りか `on_entry` がパニックし、監視を止めた後に呼ばれる（引数は止めた結果。
-    /// 失敗したら監視は登録されたまま）。ワーカーは続くので、監視を戻せば取り込みも戻る。
+    /// `on_problem` は、取り込めなかったことを知らせる（`WatchProblem`。パニックしたときは監視を止めた後で、
+    /// ワーカーは続くので、監視を戻せば取り込みも戻る）。
     /// `config` は共有参照で、フィルタ・デバウンス等の変更は次のキャプチャから反映される。
     pub fn spawn(
         config: Arc<RwLock<Config>>,
         on_entry: impl Fn(Entry) + Send + 'static,
-        on_panic: impl Fn(WinResult<()>) + Send + 'static,
+        on_problem: impl Fn(WatchProblem) + Send + 'static,
     ) -> Result<Self> {
-        Self::spawn_inner(config, on_entry, on_panic, |_| {})
+        Self::spawn_inner(config, on_entry, on_problem, |_| {})
     }
 
     /// テスト用: `spawn` に、取り込みの1回ごとの判定の観測（`on_outcome`）を足したもの。
@@ -801,16 +840,16 @@ impl ClipboardWatcher {
     pub(crate) fn spawn_observed(
         config: Arc<RwLock<Config>>,
         on_entry: impl Fn(Entry) + Send + 'static,
-        on_panic: impl Fn(WinResult<()>) + Send + 'static,
+        on_problem: impl Fn(WatchProblem) + Send + 'static,
         on_outcome: impl Fn(Outcome) + Send + 'static,
     ) -> Result<Self> {
-        Self::spawn_inner(config, on_entry, on_panic, on_outcome)
+        Self::spawn_inner(config, on_entry, on_problem, on_outcome)
     }
 
     fn spawn_inner(
         config: Arc<RwLock<Config>>,
         on_entry: impl Fn(Entry) + Send + 'static,
-        on_panic: impl Fn(WinResult<()>) + Send + 'static,
+        on_problem: impl Fn(WatchProblem) + Send + 'static,
         on_outcome: impl Fn(Outcome) + Send + 'static,
     ) -> Result<Self> {
         let (changed_tx, changed_rx) = mpsc::channel::<()>();
@@ -846,7 +885,7 @@ impl ClipboardWatcher {
         let switch = Arc::new(WatchSwitch { hwnd, lock: Mutex::new(()), listening: Arc::new(AtomicBool::new(watch)) });
         let worker_switch = Arc::clone(&switch);
         let worker_thread = thread::spawn(move || {
-            worker_loop(changed_rx, config, worker_port, worker_switch, on_entry, on_panic, on_outcome)
+            worker_loop(changed_rx, config, worker_port, worker_switch, on_entry, on_problem, on_outcome)
         });
 
         Ok(Self {
@@ -1174,7 +1213,7 @@ mod tests {
     /// 今のクリップボードのテキスト（読むだけなので変更番号は変わらない）。
     fn current_text(port: &ClipboardPort) -> String {
         let guard = port.open().unwrap();
-        entry_text(&read_entry(&guard, &Config::default()).unwrap())
+        entry_text(&read_entry(&guard, &Config::default()).unwrap().unwrap())
     }
 
     /// 別のスレッドで自分の窓（ほかのアプリの代わり）を作り、`f` に渡す。窓は `f` の後に壊す。
@@ -1407,27 +1446,31 @@ mod tests {
         watcher: ClipboardWatcher,
         entries: mpsc::Receiver<Entry>,
         outcomes: mpsc::Receiver<Outcome>,
-        /// `on_panic` に渡された、監視を止めた結果
-        panics: mpsc::Receiver<WinResult<()>>,
+        /// `on_problem` に渡された知らせ
+        problems: mpsc::Receiver<WatchProblem>,
         _gui: MutexGuard<'static, ()>,
         _clipboard: MutexGuard<'static, ()>,
     }
 
     fn observed(interval_ms: u64, watch: bool) -> Observed {
-        observed_with(interval_ms, watch, |_| false)
+        observed_with(observed_config(interval_ms, watch), |_| false)
     }
 
-    /// `panic_on` が真を返す項目では、取り込み（`on_entry`）がパニックする。
-    fn observed_with(interval_ms: u64, watch: bool, panic_on: impl Fn(&Entry) -> bool + Send + 'static) -> Observed {
-        let clipboard = lock_clipboard_tests();
-        let gui = crate::tray::lock_gui_resource_tests();
-        settle_clipboard();
+    fn observed_config(interval_ms: u64, watch: bool) -> Config {
         let mut config = Config::default();
         config.general.clipboard_watch = watch;
         config.history.add_interval_ms = interval_ms;
+        config
+    }
+
+    /// `panic_on` が真を返す項目では、取り込み（`on_entry`）がパニックする。
+    fn observed_with(config: Config, panic_on: impl Fn(&Entry) -> bool + Send + 'static) -> Observed {
+        let clipboard = lock_clipboard_tests();
+        let gui = crate::tray::lock_gui_resource_tests();
+        settle_clipboard();
         let (entry_tx, entries) = mpsc::channel();
         let (outcome_tx, outcomes) = mpsc::channel();
-        let (panic_tx, panics) = mpsc::channel();
+        let (problem_tx, problems) = mpsc::channel();
         let watcher = ClipboardWatcher::spawn_observed(
             Arc::new(RwLock::new(config)),
             move |entry| {
@@ -1436,15 +1479,15 @@ mod tests {
                 }
                 let _ = entry_tx.send(entry);
             },
-            move |stopped| {
-                let _ = panic_tx.send(stopped);
+            move |problem| {
+                let _ = problem_tx.send(problem);
             },
             move |outcome| {
                 let _ = outcome_tx.send(outcome);
             },
         )
         .unwrap();
-        Observed { watcher, entries, outcomes, panics, _gui: gui, _clipboard: clipboard }
+        Observed { watcher, entries, outcomes, problems, _gui: gui, _clipboard: clipboard }
     }
 
     impl Observed {
@@ -1550,14 +1593,15 @@ mod tests {
     /// コピーは取り込まない。監視を戻せば、次のコピーを取り込む。
     #[test]
     fn panic_in_capture_stops_watch_and_worker_keeps_running() {
-        let o = observed_with(50, true, |entry| entry_text(entry) == "パニックする");
+        let o = observed_with(observed_config(50, true), |entry| entry_text(entry) == "パニックする");
         let port = o.watcher.port();
         let shared = o.watcher.watch_state();
 
         set_clipboard(&port, &[text("パニックする")]).unwrap();
         assert_eq!(o.next_outcome(), Outcome::Panicked);
-        assert!(o.panics.try_recv().expect("パニックを知らせていない").is_ok(), "監視を止められなかった");
-        assert!(o.panics.try_recv().is_err(), "1回のパニックで2回知らせた");
+        let problem = o.problems.try_recv().expect("パニックを知らせていない");
+        assert!(matches!(problem, WatchProblem::Panicked(Ok(()))), "監視を止められなかった: {problem:?}");
+        assert!(o.problems.try_recv().is_err(), "1回のパニックで2回知らせた");
         assert!(!o.watcher.listening() && !shared.load(Ordering::SeqCst), "監視が止まっていない");
         assert!(o.entries.try_recv().is_err());
 
@@ -1570,7 +1614,42 @@ mod tests {
         let copied = seq();
         assert_eq!(o.next_outcome(), Outcome::Captured { seq: copied });
         assert_eq!(entry_text(&o.entries.try_recv().unwrap()), "戻した後");
-        assert!(o.panics.try_recv().is_err());
+        assert!(o.problems.try_recv().is_err());
+    }
+
+    /// 取り込む形式の大きさの合計が上限を超えたコピーは、何も取り込まずに知らせる。上限以下なら取り込み、
+    /// 0 は無制限。合計は、形式フィルタで取り込まない形式を数えない。
+    #[test]
+    fn copy_over_total_limit_is_not_captured_and_is_reported() {
+        let mut config = observed_config(50, true);
+        // 「テキスト」は UTF-16 と終端で 10 バイト（`GlobalSize` は確保の単位で丸められうるので、余裕を見る）
+        config.capture_total_limit = 64;
+        let o = observed_with(config.clone(), |_| false);
+        let port = o.watcher.port();
+
+        let big = "あ".repeat(100);
+        set_clipboard(&port, &[text(&big)]).unwrap();
+        let copied = seq();
+        assert_eq!(o.next_outcome(), Outcome::TooLarge { seq: copied });
+        let problem = o.problems.try_recv().expect("上限を超えたことを知らせていない");
+        let WatchProblem::TooLarge(TooLarge { total, limit }) = problem else { panic!("{problem:?}") };
+        assert!(total > 64 && limit == 64, "{total} {limit}");
+        assert!(o.entries.try_recv().is_err(), "上限を超えたコピーを取り込んだ");
+
+        // 取り込まない形式（CF_TEXT など、既定で無視する形式）は合計に数えない
+        set_clipboard(&port, &[text("テキスト"), Format { format_name: "CF_TEXT".to_string(), format_id: 1, data: vec![b'x'; 200] }])
+            .unwrap();
+        let copied = seq();
+        assert_eq!(o.next_outcome(), Outcome::Captured { seq: copied });
+        assert_eq!(entry_text(&o.entries.try_recv().unwrap()), "テキスト");
+        assert!(o.problems.try_recv().is_err());
+    }
+
+    #[test]
+    fn total_limit_zero_is_unlimited() {
+        assert!(!exceeds_total(u64::MAX, 0));
+        assert!(!exceeds_total(64, 64));
+        assert!(exceeds_total(65, 64));
     }
 
     /// 回帰: サイズ0は上限設定に関わらず常に不採用（空データのFormatを履歴に積まない）。

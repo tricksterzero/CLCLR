@@ -136,10 +136,11 @@ struct FieldPlace {
     enabler: Option<(i32, &'static str)>,
 }
 
-const PLACES: [FieldPlace; 14] = [
+const PLACES: [FieldPlace; 15] = [
     // フィルタの行の誤り（`ConfigIssue::row` の行を選んでから、その欄へ）
     FieldPlace { field: "format_filters.format_name", page: PAGE_FORMAT, ctl: IDC_FMT_NAME, enabler: None },
     FieldPlace { field: "format_filters.limit_size", page: PAGE_FORMAT, ctl: IDC_FMT_LIMIT, enabler: None },
+    FieldPlace { field: "capture_total_limit", page: PAGE_FORMAT, ctl: IDC_FMT_TOTAL, enabler: None },
     FieldPlace { field: "window_filters.title", page: PAGE_WINDOW, ctl: IDC_WIN_TITLE, enabler: None },
     FieldPlace { field: "history.max", page: PAGE_HISTORY, ctl: IDC_HIS_MAX, enabler: None },
     FieldPlace { field: "history.grouping.visible_items", page: PAGE_HISTORY, ctl: IDC_HIS_VISIBLE, enabler: Some((IDC_HIS_GROUP, "古い履歴をフォルダにまとめる")) },
@@ -229,21 +230,26 @@ fn parse_limit(text: &str) -> Option<u64> {
 
 /// 上限の欄の横に出す読みやすい大きさ。読めない入力は空。
 fn readable_size(text: &str) -> String {
-    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
     match parse_limit(text) {
         None => String::new(),
         Some(0) => "（無制限）".to_string(),
-        Some(n) if n < 1024 => format!("= {n} バイト"),
-        Some(n) => {
-            let mut v = n as f64 / 1024.0;
-            let mut unit = 0;
-            while v >= 1024.0 && unit < UNITS.len() - 1 {
-                v /= 1024.0;
-                unit += 1;
-            }
-            format!("= {v:.1} {}", UNITS[unit])
-        }
+        Some(n) => format!("= {}", readable_bytes(n)),
     }
+}
+
+/// バイト数の読みやすい表し方（1024 未満は「n バイト」、ほかは 1024 単位で小数1桁の KB・MB・GB・TB）。
+pub(crate) fn readable_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if n < 1024 {
+        return format!("{n} バイト");
+    }
+    let mut v = n as f64 / 1024.0;
+    let mut unit = 0;
+    while v >= 1024.0 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    format!("{v:.1} {}", UNITS[unit])
 }
 
 /// 行を編集する一覧（形式フィルタ・ウィンドウフィルタのページ）。
@@ -655,6 +661,8 @@ fn load(ctx: &Ctx) {
     let default = ACTIONS.iter().position(|(a, _)| *a == c.format_filter_default).unwrap_or(0);
     fill_combo(pages[PAGE_FORMAT], IDC_FMT_DEFAULT, &ACTIONS.map(|(_, l)| l), default);
     fill_combo(pages[PAGE_FORMAT], IDC_FMT_ACTION, &ACTIONS.map(|(_, l)| l), 0);
+    // 読みやすい大きさは、下の `sync_page` が出す
+    set_text(pages[PAGE_FORMAT], IDC_FMT_TOTAL, &c.capture_total_limit.to_string());
     for rl in &ROW_LISTS {
         let Some(list) = item(pages[rl.page], rl.list) else {
             continue;
@@ -1023,6 +1031,14 @@ fn read_draft(pages: &[HWND], base: &Config, formats: &[FormatRow], windows: &[W
     c.tools.text.time_format = get_text(text, IDC_TX_TIME_FMT);
 
     c.format_filter_default = ACTIONS[combo_index(pages[PAGE_FORMAT], IDC_FMT_DEFAULT).min(ACTIONS.len() - 1)].0;
+    c.capture_total_limit = parse_limit(&get_text(pages[PAGE_FORMAT], IDC_FMT_TOTAL)).unwrap_or_else(|| {
+        issues.push(ConfigIssue {
+            field: "capture_total_limit",
+            row: None,
+            message: "「コピーの合計の上限」に数値を入力してください".to_string(),
+        });
+        0
+    });
     c.format_filters = formats
         .iter()
         .enumerate()
@@ -1045,8 +1061,11 @@ fn read_draft(pages: &[HWND], base: &Config, formats: &[FormatRow], windows: &[W
     if issues.is_empty() { Ok(c) } else { Err(issues) }
 }
 
-/// ページの「入力できる・できない」と、階層表示の保持総数の表示を合わせる。
+/// ページの「入力できる・できない」と、階層表示の保持総数・コピーの合計の上限の読みやすい大きさの表示を合わせる。
 fn sync_page(page: HWND, index: usize) {
+    if index == PAGE_FORMAT {
+        set_text(page, IDC_FMT_TOTAL_SIZE, &readable_size(&get_text(page, IDC_FMT_TOTAL)));
+    }
     for (p, enabler, targets) in ENABLERS {
         if p != index {
             continue;
@@ -2400,6 +2419,40 @@ mod tests {
         assert_eq!(selected_row(h.list(PAGE_FORMAT)), Some(1));
         assert_eq!(unsafe { GetFocus() }, item(pages[PAGE_FORMAT], IDC_FMT_LIMIT).unwrap());
         assert!(get_text(h.dialog, IDC_SET_ERROR).contains("形式フィルタの 2 行目: 「上限」に数値を入力してください"));
+    }
+
+    /// コピーの合計の上限: 開いたときの値と読みやすい大きさを出し、入力に合わせて表示を直す。読めない入力は OK で
+    /// その欄の誤りにし（反映は呼ばない）、直せば編集した値で反映する。
+    #[test]
+    fn capture_total_limit_field_shows_size_and_is_read_on_ok() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let mut base = Config::default();
+        base.capture_total_limit = 1024 * 1024;
+        let h = Harness::open(base, || Ok(()));
+        unsafe {
+            let _ = SetForegroundWindow(h.dialog);
+        }
+        let page = h.pages()[PAGE_FORMAT];
+        assert_eq!(get_text(page, IDC_FMT_TOTAL), "1048576");
+        assert_eq!(get_text(page, IDC_FMT_TOTAL_SIZE), "= 1.0 MB");
+        set_text(page, IDC_FMT_TOTAL, "0");
+        assert_eq!(get_text(page, IDC_FMT_TOTAL_SIZE), "（無制限）");
+
+        set_text(page, IDC_FMT_TOTAL, "");
+        assert_eq!(get_text(page, IDC_FMT_TOTAL_SIZE), "");
+        select_page(h.dialog, PAGE_GENERAL);
+        h.command(IDOK.0);
+        assert!(h.calls.borrow().is_empty(), "読めない上限なのに反映を呼んだ");
+        assert_eq!(unsafe { GetFocus() }, item(page, IDC_FMT_TOTAL).unwrap());
+        assert!(get_text(h.dialog, IDC_SET_ERROR).contains("「コピーの合計の上限」に数値を入力してください"));
+
+        set_text(page, IDC_FMT_TOTAL, "2048");
+        h.command(IDOK.0);
+        let calls = h.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        let draft: Config = toml::from_str(&calls[0].1).unwrap();
+        assert_eq!(draft.capture_total_limit, 2048);
     }
 
     /// 行の入力欄にフォーカスがあるときの Enter は OK。アクセスキーで一覧・入力欄へ移る（メッセージループと同じ

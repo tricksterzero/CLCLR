@@ -86,6 +86,8 @@
 #define IDC_FMT_SAVE        1506
 #define IDC_FMT_LIMIT       1507
 #define IDC_FMT_LIMIT_SIZE  1508
+#define IDC_FMT_TOTAL       1509
+#define IDC_FMT_TOTAL_SIZE  1510
 
 // ウィンドウフィルタ
 #define IDC_WIN_LIST        1600
