@@ -219,21 +219,42 @@ fn notify_nc_activate(hwnd: HWND) {
     }
 }
 
+/// 貼り付けを送らなかった・送りきれなかった理由（`send_paste`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasteSkipped {
+    /// 修飾キーが離されないまま待ちが時間切れになった（送ると Ctrl+Alt+V などになる）
+    ModifiersHeld,
+    /// 待っている間に前面の窓が、戻した窓から変わった（別の窓へ貼り付けない）
+    ForegroundChanged,
+    /// `SendInput` が送れたのは入力の一部だけ（送れた数）。送り直さない（二重に貼り付けうる）
+    Partial(u32),
+}
+
 /// Ctrl+V をアクティブウィンドウへ送出する（C版 sendkey_paste 相当）。
 ///
 /// 先に修飾キーの解放を待つ（C版 key_wait）: Alt+C 直後は Alt が押されたまま
-/// なので、待たずに送ると Ctrl+Alt+V になってしまう。
-pub fn send_paste() {
-    wait_modifiers_released();
+/// なので、待たずに送ると Ctrl+Alt+V になってしまう。待ちが時間切れなら送らない。
+/// 待った後、送る直前に前面の窓が `fi` で戻した窓のままかを確かめ、変わっていれば送らない（待っている間に利用者や
+/// ほかのアプリが前面を変えると、別の窓へ貼り付けてしまうため）。確かめるのは前面の窓までで、同じ窓の中で入力欄が
+/// 変わったことは見分けない。確かめてから送るまでの間に変わることも防げない。
+pub fn send_paste(fi: &FocusInfo) -> Result<(), PasteSkipped> {
     let inputs = [
         key_input(VK_CONTROL, false),
         key_input(VK_V, false),
         key_input(VK_V, true),
         key_input(VK_CONTROL, true),
     ];
-    unsafe {
-        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    if !wait_modifiers_released() {
+        return Err(PasteSkipped::ModifiersHeld);
     }
+    if unsafe { GetForegroundWindow() }.0 as isize != fi.active_wnd {
+        return Err(PasteSkipped::ForegroundChanged);
+    }
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent as usize != inputs.len() {
+        return Err(PasteSkipped::Partial(sent));
+    }
+    Ok(())
 }
 
 /// 現在のマウスカーソル位置（スクリーン座標）。キャレット位置が取れない時の
@@ -251,17 +272,18 @@ pub fn shift_held() -> bool {
     unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000 != 0 }
 }
 
-/// Ctrl/Shift/Alt が全て離されるまで待つ（最大2秒でタイムアウト）。
-fn wait_modifiers_released() {
+/// Ctrl/Shift/Alt が全て離されるまで待つ（最大2秒でタイムアウト）。離されたら true、時間切れなら false。
+fn wait_modifiers_released() -> bool {
     for _ in 0..100 {
         let held = [VK_MENU, VK_CONTROL, VK_SHIFT]
             .iter()
             .any(|vk| unsafe { GetAsyncKeyState(vk.0 as i32) } as u16 & 0x8000 != 0);
         if !held {
-            return;
+            return true;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    false
 }
 
 /// 自分が `SendInput` で送るキー入力の目印（`KEYBDINPUT::dwExtraInfo`）。二度押しのキーフックは、注入の印があって
@@ -295,8 +317,16 @@ mod tests {
     #[test]
     fn wait_modifiers_released_returns_promptly_when_no_modifier_is_held() {
         let start = std::time::Instant::now();
-        wait_modifiers_released();
+        assert!(wait_modifiers_released(), "修飾キーが押されていないのに時間切れになった");
         assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    /// 前面の窓が、戻した窓と違えば Ctrl+V を送らない（送れば別の窓へ貼り付けてしまう）。戻した窓に、前面に
+    /// なりえない値（存在しないハンドル）を使う。
+    #[test]
+    fn send_paste_skips_when_foreground_is_not_the_restored_window() {
+        let fi = FocusInfo { active_wnd: 0x7FFF_0000, focus_wnd: 0x7FFF_0000, caret_pos: None };
+        assert_eq!(send_paste(&fi), Err(PasteSkipped::ForegroundChanged));
     }
 
     /// キャレットを持たないスレッドに対しては`None`を返すこと。テスト実行スレッド

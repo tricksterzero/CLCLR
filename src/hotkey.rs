@@ -855,7 +855,10 @@ fn send_pick(hwnd: HWND, ctx: &HotkeyContext, id: Uuid, pinned: bool, focus: &Fo
         // send_pasteのSendInputはWH_KEYBOARD_LLにも乗るが、目印（`paste::PASTE_INPUT_MARK`）を付けてあり、
         // フックが二度押し判定へ転送しない（`should_forward`。Ctrl down→V down/up(リセット)→Ctrl up(新規1回
         // 押下として記録)という経路になり、直後の実操作と合算して誤発火しうるため）
-        crate::paste::send_paste();
+        if let Err(skipped) = crate::paste::send_paste(focus) {
+            // 送らなかった（送りきれなかった）ことはログだけ。クリップボードには書いてあるので、利用者は手で貼り付けられる
+            eprintln!("自動の貼り付けをしませんでした: {skipped:?}");
+        }
         // 外している一瞬に他のアプリが同じキーを取った場合だけ失敗する。画面には出さない
         // （メニューから送出した直後のため。起動時の失敗は `Hotkeys::startup_problems` で伝える）
         if let Some(problem) = register_from_config(hwnd, &ctx.config) {

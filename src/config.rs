@@ -375,6 +375,11 @@ pub enum FilterAction {
 
 // --- Defaults ---
 
+/// 既定の形式フィルタの大きさの上限（バイト）。テキストは UTF-16 のバイト数、ファイルは中身ではなくパスの一覧の大きさ。
+pub const DEFAULT_TEXT_LIMIT: u64 = 32 * 1024 * 1024;
+pub const DEFAULT_IMAGE_LIMIT: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_FILE_LIST_LIMIT: u64 = 1024 * 1024;
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -383,24 +388,26 @@ impl Default for Config {
             hotkey: HotkeyConfig::default(),
             tools: ToolsConfig::default(),
             format_filter_default: FilterAction::Ignore,
+            // 大きさの上限（バイト）: 極端に大きなコピーで、取り込み・保存のメモリとディスクを使い切らないため。
+            // 新しく作る設定だけの既定（設定ファイルにある値は変えない）
             format_filters: vec![
                 FormatFilter {
                     format_name: "CF_UNICODETEXT".to_string(),
                     action: FilterAction::Add,
                     save: true,
-                    limit_size: 0,
+                    limit_size: DEFAULT_TEXT_LIMIT,
                 },
                 FormatFilter {
                     format_name: "CF_DIB".to_string(),
                     action: FilterAction::Add,
                     save: true,
-                    limit_size: 0,
+                    limit_size: DEFAULT_IMAGE_LIMIT,
                 },
                 FormatFilter {
                     format_name: "CF_HDROP".to_string(),
                     action: FilterAction::Add,
                     save: true,
-                    limit_size: 0,
+                    limit_size: DEFAULT_FILE_LIST_LIMIT,
                 },
             ],
             window_filters: Vec::new(),
@@ -741,6 +748,19 @@ mod tests {
         let config: Config = toml::from_str("[general]\nclipboard_watch = false\n").unwrap();
         assert!(config.general.notify_action_errors);
         assert!(!config.general.clipboard_watch);
+    }
+
+    /// 新しく作る設定の既定の形式フィルタには、大きさの上限がある（テキスト 32MiB・画像 256MiB・ファイルの一覧 1MiB）。
+    /// 設定ファイルにある値（0 = 無制限を含む）は、そのまま使う。
+    #[test]
+    fn default_format_filters_have_size_limits() {
+        let c = Config::default();
+        assert_eq!(c.size_limit("CF_UNICODETEXT"), 32 * 1024 * 1024);
+        assert_eq!(c.size_limit("CF_DIB"), 256 * 1024 * 1024);
+        assert_eq!(c.size_limit("CF_HDROP"), 1024 * 1024);
+        let text = "[[format_filters]]\nformat_name = \"CF_UNICODETEXT\"\naction = \"add\"\nsave = true\nlimit_size = 0\n";
+        let saved: Config = toml::from_str(text).unwrap();
+        assert_eq!(saved.size_limit("CF_UNICODETEXT"), 0);
     }
 
     /// 項目の無い以前の設定ファイルでも、保存先のフォルダの権限は確かめる（既定値 true）。

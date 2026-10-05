@@ -1239,12 +1239,22 @@ fn press_ok(dialog: HWND) {
 
 /// 閉じる要求の処理: `on_closed` を呼ぶ（`App` が `SettingsWindow` を捨て、この窓は破棄される）。その後は
 /// コンテキストに触らない。
+///
+/// OK の処理中は破棄しない: `press_ok` はコンテキストの `ok_running` を借りたまま `on_ok` を呼び、`on_ok` の中では
+/// 送られたメッセージが処理されうる（トレイの停止を待つ間など）。ほかのプロセスがこのメッセージを送ってくると、ここで
+/// 窓を破棄すると、戻った `press_ok` が解放したコンテキストに書く。OK の処理中に届いたら閉じる要求を記録だけし
+/// （`request_close` と同じ）、投稿済みの印を下ろす（OK が戻った後の `post_close` が投稿し直せるように）。
 fn handle_close(dialog: HWND) {
     let on_closed = {
         let Some(ctx) = (unsafe { ctx_ref(dialog) }) else {
             return;
         };
         if ctx.ended.get() {
+            return;
+        }
+        if ctx.ok_running.get() {
+            ctx.close_pending.set(true);
+            ctx.closing.set(false);
             return;
         }
         Rc::clone(&ctx.on_closed)
@@ -1951,6 +1961,34 @@ mod tests {
         pump(100);
         assert_eq!(h.closed.get(), 1);
         assert!(!h.is_open());
+    }
+
+    /// OK の処理中に、閉じる要求のメッセージ（`WM_APP_SETTINGS_CLOSE`）を直接送られても（ほかのプロセスからの送信）、
+    /// 窓とコンテキストを破棄しない。OK が戻ってから（成功でも失敗でも）1回だけ閉じる。
+    #[test]
+    fn close_message_sent_during_ok_does_not_destroy_window() {
+        let _gui = crate::tray::lock_gui_resource_tests();
+        for succeed in [true, false] {
+            let dialog_cell: Rc<Cell<isize>> = Rc::default();
+            let inner = Rc::clone(&dialog_cell);
+            let h = Harness::open(Config::default(), move || {
+                let dialog = HWND(inner.get() as *mut _);
+                unsafe {
+                    SendMessageW(dialog, WM_APP_SETTINGS_CLOSE, None, None);
+                    SendMessageW(dialog, WM_APP_SETTINGS_CLOSE, None, None);
+                    assert!(IsWindow(Some(dialog)).as_bool(), "OK の処理中に窓を破棄した");
+                    let ctx = ctx_ref(dialog).expect("OK の処理中にコンテキストを解放した");
+                    assert!(ctx.close_pending.get() && !ctx.closing.get());
+                }
+                if succeed { Ok(()) } else { Err(ApplyError::Busy) }
+            });
+            dialog_cell.set(h.dialog.0 as isize);
+            h.command(IDOK.0);
+            assert!(h.is_open(), "OK が戻った時点で閉じた（閉じるのは投稿の後）");
+            pump(100);
+            assert_eq!(h.closed.get(), 1, "succeed={succeed}");
+            assert!(!h.is_open());
+        }
     }
 
     /// 閉じる要求の投稿に失敗したら印を戻し、もう一度閉じられる。
