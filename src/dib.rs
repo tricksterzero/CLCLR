@@ -225,7 +225,7 @@ pub(crate) fn scale_rgba(w: u32, h: u32, rgba: Vec<u8>, max_edge: u32) -> (u32, 
 }
 
 /// `webp_to_rgba_scaled` が展開してよい原寸の大きさ（RGBA に換算したバイト数。2048 × 2048 相当）。
-const SCALED_WEBP_MAX_BYTES: u64 = 2048 * 2048 * 4;
+pub const SCALED_WEBP_MAX_BYTES: u64 = 2048 * 2048 * 4;
 
 /// WebP を長辺 `max_edge` px 以下へ縮小した RGBA8（トップダウン）にデコードする。
 /// 元画像が既にそれ以下なら縮小しない（ポップアップメニューのサムネイル用。
@@ -243,7 +243,7 @@ pub fn webp_to_rgba_scaled(webp: &[u8], max_edge: u32) -> Result<(u32, u32, Vec<
 
 /// WebP を RGBA8（トップダウン）にデコードする（原寸を作る。大きさの上限は呼び出し側が先に確かめる）。
 pub fn webp_to_rgba(webp: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
-    let mut decoder = WebPDecoder::new(Cursor::new(webp))?;
+    let mut decoder = open_webp(webp)?;
     let (w, h) = decoder.dimensions();
     let size = decoder
         .output_buffer_size()
@@ -323,16 +323,70 @@ pub(crate) fn scale_rgba_to(w: u32, h: u32, rgba: &[u8], tw: u32, th: u32) -> Ve
     if tw == w && th == h { rgba.to_vec() } else { downscale_box(rgba, w, h, 4, tw, th) }
 }
 
-/// WebP のヘッダーから幅・高さを読む（画素は展開しない）。
+/// CLCLR が書く形の WebP の見出しの長さ（`webp_header_dimensions` が読む先頭のバイト数）。
+pub const WEBP_HEADER_LEN: usize = 25;
+
+/// CLCLR が書く形の WebP（`dib_to_webp`・`dib_to_thumbnail_webp`。メタデータを付けないので、エンコーダは `RIFF`・
+/// `WEBP` の後に可逆圧縮の `VP8L` のチャンクを1つだけ書く）かを、先頭（`WEBP_HEADER_LEN` バイト以上）と
+/// ファイル全体の長さ `len` で確かめ、幅・高さを返す。ほかの形（`VP8X`・非可逆の `VP8` を含むもの、後ろにほかの
+/// チャンクがあるもの）は読まない: `image-webp` 0.2.4 は、外側の見出しの寸法と中の画像の寸法が食い違うファイルで、
+/// 中の寸法の領域を確保してから断るため、外側の寸法を確かめても確保を抑えられない。読み戻せない辺
+/// （`WEBP_MAX_EDGE` 超え）も断る。
+pub fn webp_header_dimensions(head: &[u8], len: u64) -> Result<(u32, u32)> {
+    if head.len() < WEBP_HEADER_LEN {
+        return Err(DibError::Invalid("WebP の見出しに満たない長さ"));
+    }
+    if &head[0..4] != b"RIFF" || &head[8..12] != b"WEBP" {
+        return Err(DibError::Invalid("WebP の見出しが無い"));
+    }
+    if &head[12..16] != b"VP8L" {
+        return Err(DibError::Unsupported("可逆圧縮だけの単純な形の WebP ではない"));
+    }
+    let (riff, chunk) = (u64::from(u32_le(head, 4)), u64::from(u32_le(head, 16)));
+    if riff + 8 != len || 20 + chunk + (chunk & 1) != len {
+        return Err(DibError::Unsupported("VP8L のほかにチャンクがあるか、長さが合わない"));
+    }
+    if head[20] != 0x2F {
+        return Err(DibError::Invalid("VP8L の見出しの印が無い"));
+    }
+    let bits = u32_le(head, 21);
+    if bits >> 29 != 0 {
+        return Err(DibError::Unsupported("VP8L の版が 0 ではない"));
+    }
+    let (width, height) = ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1);
+    if width > WEBP_MAX_EDGE || height > WEBP_MAX_EDGE {
+        return Err(DibError::Unsupported("読み戻せる WebP の幅・高さの上限（16383）を超える"));
+    }
+    Ok((width, height))
+}
+
+/// CLCLR が書く WebP のファイルの長さの見込みの上限（幅・高さから）。可逆圧縮の結果は、画素を RGBA で並べた大きさに、
+/// 見出しと符号の表の分を足した程度に収まる（ほとんどはずっと小さい）。これより長いファイルは、寸法に見合わないので
+/// 全体を読まない。
+pub fn webp_file_len_limit(width: u32, height: u32) -> u64 {
+    u64::from(width) * u64::from(height) * 4 + 1024 * 1024
+}
+
+/// WebP のヘッダーから幅・高さを読む（画素は展開しない）。CLCLR が書く形でなければ `Err`（`webp_header_dimensions`）。
 pub fn webp_dimensions(webp: &[u8]) -> Result<(u32, u32)> {
-    Ok(WebPDecoder::new(Cursor::new(webp))?.dimensions())
+    webp_header_dimensions(webp, webp.len() as u64)
+}
+
+/// CLCLR が書く形の WebP だけを開く（`webp_header_dimensions` で確かめてから、デコーダの寸法が同じかも確かめる）。
+fn open_webp(webp: &[u8]) -> Result<WebPDecoder<Cursor<&[u8]>>> {
+    let dims = webp_dimensions(webp)?;
+    let decoder = WebPDecoder::new(Cursor::new(webp))?;
+    if decoder.dimensions() != dims {
+        return Err(DibError::Invalid("WebP の見出しの寸法が食い違っている"));
+    }
+    Ok(decoder)
 }
 
 /// WebP を展開し、`tw` × `th`（元より大きくはしない）へ縮小した RGBA8（トップダウン）にする。
 /// 展開した画素（RGB または RGBA）から直接縮めるので、原寸の RGBA への写しは作らない。
 /// 結果は `webp_to_rgba` の後に同じ大きさへ `downscale_box` したものと同じ。
 pub fn webp_to_rgba_downscaled(webp: &[u8], tw: u32, th: u32) -> Result<(u32, u32, Vec<u8>)> {
-    let mut decoder = WebPDecoder::new(Cursor::new(webp))?;
+    let mut decoder = open_webp(webp)?;
     let (w, h) = decoder.dimensions();
     let size = decoder
         .output_buffer_size()
@@ -352,7 +406,7 @@ pub fn webp_to_rgba_downscaled(webp: &[u8], tw: u32, th: u32) -> Result<(u32, u3
 
 /// WebP を 32bpp BI_RGB ボトムアップの CF_DIB として再構築する。
 pub fn webp_to_dib(webp: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = WebPDecoder::new(Cursor::new(webp))?;
+    let mut decoder = open_webp(webp)?;
     let (width, height) = decoder.dimensions();
     let buf_size = decoder
         .output_buffer_size()
@@ -529,7 +583,7 @@ fn parse_layout(dib: &[u8]) -> Result<DibLayout> {
 /// RGB/RGBA（トップダウン）から32bpp BI_RGBボトムアップのDIBを組み立てる。
 /// アルファ無し入力の予約バイトは仕様どおり0にする（全アルファ0の32bpp DIBが
 /// 入力だった場合、ピクセル部はバイト同一で復元されることになる）。
-fn build_dib_32bpp(width: u32, height: u32, pixels: &[u8], has_alpha: bool) -> Vec<u8> {
+pub(crate) fn build_dib_32bpp(width: u32, height: u32, pixels: &[u8], has_alpha: bool) -> Vec<u8> {
     let w = width as usize;
     let h = height as usize;
     let stride = w * 4; // 32bppは常に4バイト境界
@@ -838,6 +892,44 @@ mod tests {
     fn image_webp_cannot_read_back_16384_edge() {
         let mut out = Vec::new();
         WebPEncoder::new(&mut out).encode(&vec![7u8; 16384 * 3], 16384, 1, ColorType::Rgb8).unwrap();
-        assert!(webp_to_dib(&out).is_err());
+        let read_back = WebPDecoder::new(Cursor::new(&out[..])).and_then(|mut d| {
+            let mut buf = vec![0u8; d.output_buffer_size().unwrap_or(0)];
+            d.read_image(&mut buf).map(|_| d.dimensions())
+        });
+        assert!(read_back.is_err(), "{read_back:?}");
+        // CLCLR の見出しの確かめは、16384 を正しく読んだうえで断る
+        assert!(matches!(webp_dimensions(&out), Err(DibError::Unsupported(r)) if r.contains("16383")));
+    }
+
+    /// CLCLR が書く形の WebP だけを読む: 本体・サムネイルとも、単純な形の VP8L で、見出しの長さがファイルと合う。
+    /// ほかの形（VP8X・VP8 を含むもの、後ろにチャンクがあるもの、長さの合わないもの、短いもの）は、展開の前に断る。
+    #[test]
+    fn only_clclr_webp_form_is_read() {
+        let dib = build_dib_32bpp(300, 200, &vec![9u8; 300 * 200 * 3], false);
+        let webp = dib_to_webp(&dib).unwrap();
+        let thumb = dib_to_thumbnail_webp(&dib).unwrap().unwrap();
+        assert_eq!(webp_dimensions(&webp).unwrap(), (300, 200));
+        assert_eq!(webp_header_dimensions(&thumb, thumb.len() as u64).unwrap(), (128, 85));
+        assert!(webp.len() as u64 <= webp_file_len_limit(300, 200));
+
+        // 外側を VP8X（1×1）、中を非可逆の VP8 にした形は、デコーダに渡す前に断る
+        let mut vp8x = b"RIFF".to_vec();
+        vp8x.extend(30u32.to_le_bytes());
+        vp8x.extend(b"WEBPVP8X");
+        vp8x.extend(10u32.to_le_bytes());
+        vp8x.extend([0u8; 10]);
+        vp8x.extend(b"VP8 ");
+        vp8x.extend(0u32.to_le_bytes());
+        assert!(matches!(webp_dimensions(&vp8x), Err(DibError::Unsupported(_))));
+        assert!(webp_to_dib(&vp8x).is_err() && webp_to_rgba(&vp8x).is_err() && webp_to_rgba_downscaled(&vp8x, 8, 8).is_err());
+
+        // 後ろにチャンクを足したもの・長さの合わないもの・短いもの
+        let mut trailing = webp.clone();
+        trailing.extend(b"EXIF");
+        trailing.extend(0u32.to_le_bytes());
+        assert!(webp_dimensions(&trailing).is_err());
+        assert!(webp_header_dimensions(&webp, webp.len() as u64 + 1).is_err());
+        assert!(webp_dimensions(&webp[..WEBP_HEADER_LEN - 1]).is_err());
+        assert!(webp_to_dib(&webp[..webp.len() - 2]).is_err());
     }
 }

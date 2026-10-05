@@ -260,7 +260,8 @@ fn load_image(snap: &Snapshot) -> Option<TooltipImage> {
         .formats
         .iter()
         .find_map(|f| f.thumb.as_deref())
-        .and_then(|name| snap.storage.load_thumbnail(name))
+        .and_then(|name| snap.storage.load_thumbnail(name, crate::dib::SCALED_WEBP_MAX_BYTES))
+        .and_then(|w| w.into_data())
     {
         crate::dib::webp_to_rgba_scaled(&webp, edge)
     } else if let Some(dib) = &snap.resident_dib {
@@ -270,10 +271,18 @@ fn load_image(snap: &Snapshot) -> Option<TooltipImage> {
         if fm.size > MAX_FALLBACK_DIB_BYTES as u64 {
             return None;
         }
-        let raw = snap.storage.load_blob(&fm.blob).ok()?;
+        // `size` は history.toml の値なので、ファイルの長さでも上限を確かめてから全体を読む
         if fm.blob.ends_with(".webp") {
-            crate::dib::webp_to_rgba_scaled(&raw, edge)
+            let webp = snap.storage.load_webp(&fm.blob, crate::dib::SCALED_WEBP_MAX_BYTES)?.into_data()?;
+            if webp.len() > MAX_FALLBACK_DIB_BYTES {
+                return None;
+            }
+            crate::dib::webp_to_rgba_scaled(&webp, edge)
         } else {
+            let raw = snap.storage.load_blob_prefix(&fm.blob, MAX_FALLBACK_DIB_BYTES + 1).ok()?;
+            if raw.len() > MAX_FALLBACK_DIB_BYTES {
+                return None;
+            }
             crate::dib::dib_to_rgba_scaled(&raw, edge)
         }
     };

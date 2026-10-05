@@ -493,7 +493,8 @@ fn thumb_name(meta: &EntryMeta) -> Option<String> {
 fn load_menu_thumbnails(layout: &mut MenuLayout, storage: &crate::storage::Storage) {
     for row in &mut layout.rows {
         if let Some(name) = &row.thumb_name {
-            row.thumbnail = storage.load_thumbnail(name);
+            // 縮小して使う（`dib::webp_to_rgba_scaled`）ので、その上限を超えるものは読まない
+            row.thumbnail = storage.load_thumbnail(name, crate::dib::SCALED_WEBP_MAX_BYTES).and_then(|w| w.into_data());
         }
     }
 }

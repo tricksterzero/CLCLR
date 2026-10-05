@@ -23,7 +23,7 @@ use std::thread::{self, JoinHandle};
 use uuid::Uuid;
 
 use crate::data::Format;
-use crate::storage::Storage;
+use crate::storage::{LoadedWebp, Storage};
 
 /// 展開・縮小してよい画像の大きさの上限（RGBA に換算したバイト数。約 6,700 万画素）。超える画像は展開せず、
 /// プレビューに省略を書き添える（`ImageContent::TooLarge`）。
@@ -156,8 +156,9 @@ fn load(storage: &Storage, request: &ImageRequest) -> Option<LoadedImage> {
 /// 超えるなら展開しない。展開するときも原寸の RGBA は作らない（`dib::*_downscaled`）。
 fn load_limited(storage: &Storage, request: &ImageRequest, limit: u64) -> Option<LoadedImage> {
     let content = match &request.source {
-        ImageSource::Thumb(name) => fitted_webp(&storage.load_thumbnail(name)?, request, limit)?,
-        ImageSource::Blob(name) if name.ends_with(".webp") => fitted_webp(&storage.load_blob(name).ok()?, request, limit)?,
+        // WebP は見出しと長さを確かめてから読む（上限を超えるものは全体を読まない。`Storage::load_webp`）
+        ImageSource::Thumb(name) => loaded_webp(storage.load_thumbnail(name, limit)?, request, limit)?,
+        ImageSource::Blob(name) if name.ends_with(".webp") => loaded_webp(storage.load_webp(name, limit)?, request, limit)?,
         ImageSource::Blob(name) => {
             // WebP にできなかった元の DIB（`.bin`）。先頭のヘッダーで大きさを判定してから全体を読む
             let (w, h) = crate::dib::dib_header_dimensions(&storage.load_blob_prefix(name, 64).ok()?).ok()?;
@@ -183,6 +184,13 @@ fn load_limited(storage: &Storage, request: &ImageRequest, limit: u64) -> Option
 /// 元の大きさ（RGBA 換算）が上限を超えるか。
 fn exceeds(width: u32, height: u32, limit: u64) -> bool {
     u64::from(width) * u64::from(height) * 4 > limit
+}
+
+fn loaded_webp(loaded: LoadedWebp, request: &ImageRequest, limit: u64) -> Option<ImageContent> {
+    match loaded {
+        LoadedWebp::Data(webp) => fitted_webp(&webp, request, limit),
+        LoadedWebp::TooLarge { width, height } => Some(ImageContent::TooLarge { width, height }),
+    }
 }
 
 fn fitted_webp(webp: &[u8], request: &ImageRequest, limit: u64) -> Option<ImageContent> {

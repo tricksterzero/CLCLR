@@ -141,7 +141,7 @@ impl EntrySource {
     }
 
     /// 画像（CF_DIB）をファイルへ書き出すために読む。WebP の blob で保存されていれば、その中身を
-    /// 変換せずにそのまま返す（WebP のヘッダーから大きさを読めることだけを確かめる。画素の復号まではしないので、
+    /// 変換せずにそのまま返す（CLCLR が書く形の WebP で、長さが寸法に見合うことだけを確かめる。画素の復号まではしないので、
     /// 中身の壊れは開いたアプリが扱う）。それ以外（元の DIB のままの blob、メモリだけに
     /// 持つ画像）は `load_strict` と同じく読んで DIB を返す。画像が無ければ `None`。
     pub fn load_image(self) -> Result<Option<ImageData>, StorageError> {
@@ -154,10 +154,8 @@ impl EntrySource {
         if let Some(name) = webp {
             // 欠けている・壊れているときは、厳密な読み込みと同じエラーにする
             let missing = || StorageError::MissingFormat { format_name: "CF_DIB".to_string() };
-            let data = self.storage.load_blob(&name).map_err(|_| missing())?;
-            if crate::dib::webp_dimensions(&data).is_err() {
-                return Err(missing());
-            }
+            // CLCLR が書く形で、長さが寸法に見合うものだけ（`Storage::load_webp`。書き出すだけなので大きさの上限は無い）
+            let data = self.storage.load_webp(&name, u64::MAX).and_then(|w| w.into_data()).ok_or_else(missing)?;
             return Ok(Some(ImageData::Webp(data)));
         }
         Ok(self

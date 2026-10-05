@@ -42,6 +42,33 @@ pub enum StorageError {
     /// 厳密な読み込み（`load_entry_data_strict`）で、メタデータにある形式の blob が読めない
     /// （欠けている・壊れている）
     MissingFormat { format_name: String },
+    /// 保存してある画像（WebP）が、元に戻すときの上限（`MAX_RESTORE_RGBA`）を超える
+    ImageTooLarge { width: u32, height: u32 },
+}
+
+/// 保存してある画像（WebP）を DIB に戻すとき（送る・起動時の復元・ピン留めの複製など）の大きさの上限（画素を RGBA に
+/// 換算したバイト数）。書き換えられたファイルで大きな確保をしないため。1回のコピーの合計の上限が既定（320MiB）なら、
+/// 取り込める画像は必ずこの中に収まる（24bit の DIB 320MiB でも RGBA で約 427MiB）。合計の上限を上げて取り込んだ、
+/// これを超える画像は戻さない
+pub const MAX_RESTORE_RGBA: u64 = 512 * 1024 * 1024;
+
+/// WebP の blob を読んだ結果（`Storage::load_webp`）。
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoadedWebp {
+    /// ファイル全体（CLCLR が書く形で、長さが寸法に見合うことを確かめてある）
+    Data(Vec<u8>),
+    /// 画素を RGBA に換算した大きさが上限を超えるので、全体を読まなかった
+    TooLarge { width: u32, height: u32 },
+}
+
+impl LoadedWebp {
+    /// 読めたファイル全体（上限を超えたものは None）。
+    pub fn into_data(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Data(data) => Some(data),
+            Self::TooLarge { .. } => None,
+        }
+    }
 }
 
 impl fmt::Display for StorageError {
@@ -63,6 +90,11 @@ impl fmt::Display for StorageError {
             Self::MissingFormat { format_name } => {
                 write!(f, "項目のデータ（{format_name}）が見つからないか、壊れています")
             }
+            Self::ImageTooLarge { width, height } => write!(
+                f,
+                "画像が大きすぎるため、元に戻せません（{width} × {height}。戻せるのは、画素を RGBA に換算して {} MiB まで）",
+                MAX_RESTORE_RGBA / (1024 * 1024)
+            ),
         }
     }
 }
@@ -76,7 +108,7 @@ impl std::error::Error for StorageError {
             Self::InvalidTimestamp => None,
             Self::PinnedTreeCorrupt => None,
             Self::UnsupportedSchema { .. } => None,
-            Self::MissingFormat { .. } => None,
+            Self::MissingFormat { .. } | Self::ImageTooLarge { .. } => None,
         }
     }
 }
@@ -290,7 +322,7 @@ impl Storage {
     /// （エラーで弾くと次回保存時にツリーから静かに消えてしまうため）。
     #[allow(dead_code, reason = "送る・ピン留めは厳密な読み込み（load_entry_data_strict）に移し、今は使う所がない（テストが使う）")]
     pub fn load_entry_data(&self, meta: &EntryMeta) -> Result<Entry> {
-        let formats = meta.formats.iter().filter_map(|fm| self.load_format(fm)).collect();
+        let formats = meta.formats.iter().filter_map(|fm| self.load_format(fm).ok()).collect();
         Ok(Entry {
             id: meta.id,
             title: meta.title.clone(),
@@ -303,14 +335,7 @@ impl Storage {
     /// （送る・ピン留めの複製で、一部の形式だけが欠けたものを正常として扱わないため）。
     /// プレビュー・ツールチップは、読めた分だけを出す `load_entry_data` を使う。
     pub fn load_entry_data_strict(&self, meta: &EntryMeta) -> Result<Entry> {
-        let formats = meta
-            .formats
-            .iter()
-            .map(|fm| {
-                self.load_format(fm)
-                    .ok_or_else(|| StorageError::MissingFormat { format_name: fm.format_name.clone() })
-            })
-            .collect::<Result<Vec<Format>>>()?;
+        let formats = meta.formats.iter().map(|fm| self.load_format(fm)).collect::<Result<Vec<Format>>>()?;
         Ok(Entry {
             id: meta.id,
             title: meta.title.clone(),
@@ -319,20 +344,23 @@ impl Storage {
         })
     }
 
-    /// 1形式分の blob を読んで復元する。読めない・壊れているなら None。
-    fn load_format(&self, fm: &FormatMeta) -> Option<Format> {
-        let raw = self.load_blob(&fm.blob).ok()?;
-        // .webpはCF_DIBの変換保存（save_entry_filtered参照）。復元に失敗した
-        // 破損WebPは、blob欠損と同じ扱いにする。生のまま（.bin）の blob は、保存したときの大きさ（`size`）と
-        // 違えば壊れている（保存の後に短くなった・書き換えられた）ので、欠損と同じ扱いにする
+    /// 1形式分の blob を読んで復元する。読めない・壊れているなら `MissingFormat`、戻すには大きすぎる画像なら
+    /// `ImageTooLarge`。
+    fn load_format(&self, fm: &FormatMeta) -> Result<Format> {
+        let missing = || StorageError::MissingFormat { format_name: fm.format_name.clone() };
+        // .webpはCF_DIBの変換保存（save_entry_filtered参照）。CLCLR が書く形でない・寸法に見合わない長さの
+        // WebP は全体を読まず、復元に失敗した破損WebPと同じく、blob欠損と同じ扱いにする。`MAX_RESTORE_RGBA` を
+        // 超える画像は全体を読まない。生のまま（.bin）の blob は、保存したときの大きさ（`size`）と違えば壊れている
+        // （保存の後に短くなった・書き換えられた）ので、全体を読まずに欠損と同じ扱いにする
         let data = if fm.blob.ends_with(".webp") {
-            dib::webp_to_dib(&raw).ok()?
-        } else if raw.len() as u64 != fm.size {
-            return None;
+            match self.load_webp(&fm.blob, MAX_RESTORE_RGBA).ok_or_else(missing)? {
+                LoadedWebp::Data(raw) => dib::webp_to_dib(&raw).map_err(|_| missing())?,
+                LoadedWebp::TooLarge { width, height } => return Err(StorageError::ImageTooLarge { width, height }),
+            }
         } else {
-            raw
+            self.load_blob_exact(&fm.blob, fm.size).map_err(|_| missing())?
         };
-        Some(Format {
+        Ok(Format {
             format_name: fm.format_name.clone(),
             format_id: fm.format_id,
             data,
@@ -455,11 +483,50 @@ impl Storage {
 
     /// サムネイルWebPをファイル名で読む（無ければNone）。一覧描画用。
     /// FormatMeta.thumbの値だけを受け付ける（.thumb.webp以外は読まない）。
-    pub fn load_thumbnail(&self, name: &str) -> Option<Vec<u8>> {
+    pub fn load_thumbnail(&self, name: &str, max_rgba: u64) -> Option<LoadedWebp> {
         if !name.ends_with(".thumb.webp") {
             return None;
         }
-        self.load_blob(name).ok()
+        self.load_webp(name, max_rgba)
+    }
+
+    /// WebP の blob（サムネイルを含む）を、先に見出しと長さを確かめてから読む。CLCLR が書く形でないもの
+    /// （`dib::webp_header_dimensions`）・寸法に見合わない長さのもの（`dib::webp_file_len_limit`）・読めないものは
+    /// None。画素を RGBA に換算した大きさが `max_rgba` を超えるものは、全体を読まずに `TooLarge`。見出しと全体は
+    /// 同じ開いたファイルから読み、読めた長さが確かめた長さと違えば（読む間に書き換えられた）None。
+    pub(crate) fn load_webp(&self, name: &str, max_rgba: u64) -> Option<LoadedWebp> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = fs::File::open(self.blob_path(name)).ok()?;
+        let len = file.metadata().ok()?.len();
+        let mut head = Vec::with_capacity(dib::WEBP_HEADER_LEN);
+        (&mut file).take(dib::WEBP_HEADER_LEN as u64).read_to_end(&mut head).ok()?;
+        let (width, height) = dib::webp_header_dimensions(&head, len).ok()?;
+        if u64::from(width) * u64::from(height) * 4 > max_rgba {
+            return Some(LoadedWebp::TooLarge { width, height });
+        }
+        if len > dib::webp_file_len_limit(width, height) {
+            return None;
+        }
+        file.seek(SeekFrom::Start(0)).ok()?;
+        let mut data = Vec::with_capacity(len as usize);
+        file.take(len + 1).read_to_end(&mut data).ok()?;
+        (data.len() as u64 == len).then_some(LoadedWebp::Data(data))
+    }
+
+    /// 生のまま（.bin）の blob を、長さが `size` のときだけ読む（長さが違えば、全体を読まずに `Err`）。
+    fn load_blob_exact(&self, name: &str, size: u64) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let file = fs::File::open(self.blob_path(name))?;
+        let invalid = || StorageError::Io(io::Error::new(io::ErrorKind::InvalidData, "保存したときの大きさと違います"));
+        if file.metadata()?.len() != size {
+            return Err(invalid());
+        }
+        let mut data = Vec::with_capacity(size as usize);
+        file.take(size + 1).read_to_end(&mut data)?;
+        if data.len() as u64 != size {
+            return Err(invalid());
+        }
+        Ok(data)
     }
 
     // --- Pinned ---
@@ -1232,6 +1299,42 @@ size = 4
         (dir, storage)
     }
 
+    /// WebP の blob は見出しと長さを確かめてから読む: 上限を超えるものは全体を読まずに大きさだけ、寸法に見合わない
+    /// 長さ・CLCLR が書く形でないもの・無いものは None。生のままの blob は、長さが保存したときの大きさと同じときだけ読む。
+    #[test]
+    fn webp_and_bin_blobs_are_checked_before_reading_whole() {
+        let (dir, storage) = temp_storage();
+        let blobs = dir.join("blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        let rgb = vec![5u8; 64 * 32 * 3];
+        let webp = dib::dib_to_webp(&dib::build_dib_32bpp(64, 32, &rgb, false)).unwrap();
+        fs::write(blobs.join("a_0.webp"), &webp).unwrap();
+        assert_eq!(storage.load_webp("a_0.webp", u64::MAX), Some(LoadedWebp::Data(webp.clone())));
+        assert_eq!(storage.load_webp("a_0.webp", 64 * 32 * 4 - 1), Some(LoadedWebp::TooLarge { width: 64, height: 32 }));
+        assert_eq!(storage.load_webp("missing.webp", u64::MAX), None);
+
+        // 見出しの寸法に見合わない長さ（見出しの長さもそろえた、中身の長いファイル）は読まない
+        let pad = dib::webp_file_len_limit(64, 32) as usize;
+        let mut long = webp.clone();
+        long.resize(webp.len() + pad + (pad & 1), 0);
+        let (chunk, riff) = ((long.len() - 20) as u32, (long.len() - 8) as u32);
+        long[4..8].copy_from_slice(&riff.to_le_bytes());
+        long[16..20].copy_from_slice(&chunk.to_le_bytes());
+        assert!(dib::webp_header_dimensions(&long, long.len() as u64).is_ok(), "前提: 見出しの長さはそろっている");
+        fs::write(blobs.join("b_0.webp"), &long).unwrap();
+        assert_eq!(storage.load_webp("b_0.webp", u64::MAX), None);
+
+        // CLCLR が書く形でない WebP
+        fs::write(blobs.join("c_0.webp"), b"RIFF\x04\x00\x00\x00WEBP").unwrap();
+        assert_eq!(storage.load_webp("c_0.webp", u64::MAX), None);
+
+        fs::write(blobs.join("d_0.bin"), [1u8, 2, 3]).unwrap();
+        assert_eq!(storage.load_blob_exact("d_0.bin", 3).unwrap(), [1, 2, 3]);
+        assert!(storage.load_blob_exact("d_0.bin", 2).is_err());
+        assert!(storage.load_blob_exact("d_0.bin", 4).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn saved_index_files_record_current_schema_version() {
         let (dir, storage) = temp_storage();
@@ -1502,6 +1605,42 @@ size = 4
         assert_eq!(storage.load_entry_data_strict(&meta).unwrap().formats[0].data, b"abcdef");
         fs::write(dir.join("blobs").join(&meta.formats[0].blob), b"abc").unwrap();
         assert!(matches!(storage.load_entry_data_strict(&meta), Err(StorageError::MissingFormat { .. })));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 元に戻す画像（WebP）が `MAX_RESTORE_RGBA` を超えるなら、全体を読まずに「大きすぎる」で断る（欠けたものとは
+    /// 分ける）。上限までは戻す。
+    #[test]
+    fn strict_load_rejects_webp_over_restore_limit() {
+        let dir = temp_dir();
+        let storage = Storage::open(dir.clone()).unwrap();
+        let rgb = vec![3u8; 8 * 4 * 3];
+        let entry = Entry::new(vec![Format { format_name: "CF_DIB".into(), format_id: 8, data: dib::build_dib_32bpp(8, 4, &rgb, false) }]);
+        let meta = storage.save_entry(&entry).unwrap();
+        assert!(meta.formats[0].blob.ends_with(".webp"), "前提: WebP で保存した");
+        assert_eq!(storage.load_entry_data_strict(&meta).unwrap().formats[0].data, entry.formats[0].data);
+
+        // 見出しだけの VP8L（長さはそろえる）で、辺を上限を超える大きさにする
+        let side = 11586u32;
+        assert!(u64::from(side) * u64::from(side) * 4 > MAX_RESTORE_RGBA);
+        let bits = (side - 1) | ((side - 1) << 14);
+        let mut chunk = vec![0x2f];
+        chunk.extend(bits.to_le_bytes());
+        let mut webp = b"RIFF".to_vec();
+        webp.extend((4 + 8 + chunk.len() as u32 + 1).to_le_bytes());
+        webp.extend(b"WEBPVP8L");
+        webp.extend((chunk.len() as u32).to_le_bytes());
+        webp.extend(&chunk);
+        webp.push(0);
+        fs::write(dir.join("blobs").join(&meta.formats[0].blob), &webp).unwrap();
+        match storage.load_entry_data_strict(&meta) {
+            Err(e @ StorageError::ImageTooLarge { width, height }) => {
+                assert_eq!((width, height), (side, side));
+                assert!(e.to_string().contains("512 MiB"), "{e}");
+            }
+            Err(e) => panic!("{e:?}"),
+            Ok(_) => panic!("上限を超える画像を戻した"),
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
