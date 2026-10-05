@@ -635,8 +635,23 @@ impl WatchSwitch {
     }
 }
 
+/// 監視の窓からワーカーへの知らせ（クリップボードが変わった。`capture_now` の頼みも同じ形で送る）。
+#[derive(Clone, Copy, Debug)]
+struct Changed {
+    /// 変更の通知を受けた瞬間の前面の窓（ハンドルの値。ほとんどはコピー元）。0 は無い（`capture_now`）
+    foreground: isize,
+}
+
+impl Changed {
+    /// 通知を受けた瞬間の前面の窓がウィンドウフィルタに当たるか（ワーカーが受け取ってすぐに読む）。
+    fn source_ignored(self, config: &Config) -> bool {
+        !config.window_filters.is_empty()
+            && is_window_handle_ignored(HWND(self.foreground as *mut core::ffi::c_void), config)
+    }
+}
+
 fn worker_loop(
-    rx: Receiver<()>,
+    rx: Receiver<Changed>,
     config: Arc<RwLock<Config>>,
     port: Arc<ClipboardPort>,
     switch: Arc<WatchSwitch>,
@@ -644,17 +659,25 @@ fn worker_loop(
     on_problem: impl Fn(WatchProblem),
     on_outcome: impl Fn(Outcome),
 ) {
-    while rx.recv().is_ok() {
+    while let Ok(first) = rx.recv() {
         // 設定は変更イベントごとにスナップショットを取る（設定画面からの
         // 実行時変更を次のキャプチャから反映しつつ、Win32呼び出し中に
         // ロックを保持しないため）
         let config = config.read().unwrap_or_else(|p| p.into_inner()).clone();
         let interval = Duration::from_millis(config.history.add_interval_ms.max(1));
 
+        // ウィンドウフィルタは、変更の通知を受けた瞬間の前面の窓（コピー元）でも判定する。まとめ待ちの後の前面の
+        // 窓だけだと、コピーしてすぐ別の窓へ切り替えたときに当たらない。知らせを受け取ったらすぐに読む（ワーカーは
+        // 知らせを待って止まっているので、通知の直後）。まとめた知らせのどれかで当たれば、まとめた1回を取り込まない
+        let mut ignored_at_change = first.source_ignored(&config);
+
         // デバウンス: interval 内に届いた後続イベントは1回にまとめる
         loop {
             match rx.recv_timeout(interval) {
-                Ok(()) => continue,
+                Ok(changed) => {
+                    ignored_at_change |= changed.source_ignored(&config);
+                    continue;
+                }
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
             }
@@ -666,7 +689,7 @@ fn worker_loop(
             on_outcome(Outcome::WatchOff);
             continue;
         }
-        if is_clipboard_source_ignored(&config) {
+        if ignored_at_change || is_clipboard_source_ignored(&config) {
             on_outcome(Outcome::Ignored);
             continue;
         }
@@ -701,7 +724,7 @@ fn worker_loop(
 // --- Window procedure ---
 
 struct WindowContext {
-    changed_tx: Sender<()>,
+    changed_tx: Sender<Changed>,
 }
 
 const WM_APP_SHUTDOWN: u32 = WM_USER + 1;
@@ -720,7 +743,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_CLIPBOARDUPDATE => {
                 let ctx = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowContext;
                 if let Some(ctx) = ctx.as_ref() {
-                    let _ = ctx.changed_tx.send(());
+                    // 前面の窓のハンドルを取るだけ（タイトル・クラス名はワーカーが読む）
+                    let foreground = GetForegroundWindow().0 as isize;
+                    let _ = ctx.changed_tx.send(Changed { foreground });
                 }
                 LRESULT(0)
             }
@@ -742,7 +767,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
-fn create_message_window(changed_tx: Sender<()>) -> WinResult<HWND> {
+fn create_message_window(changed_tx: Sender<Changed>) -> WinResult<HWND> {
     unsafe {
         let hinstance = GetModuleHandleW(None)?.into();
 
@@ -813,7 +838,7 @@ pub struct ClipboardWatcher {
     /// 変更通知チャネルの送信側の複製（`capture_now`用。主経路は監視ウィンドウ）。
     /// `Option`にしているのは`Drop::drop`内で`worker_thread.join()`より前に
     /// 明示的に破棄するため（下記Drop実装のコメント参照）。
-    changed_tx: Option<mpsc::Sender<()>>,
+    changed_tx: Option<mpsc::Sender<Changed>>,
     window_thread: Option<JoinHandle<()>>,
     worker_thread: Option<JoinHandle<()>>,
     /// 監視の窓を今クリップボードの変更の通知に登録しているか（実際の状態）と、その切り替え。
@@ -852,7 +877,7 @@ impl ClipboardWatcher {
         on_problem: impl Fn(WatchProblem) + Send + 'static,
         on_outcome: impl Fn(Outcome) + Send + 'static,
     ) -> Result<Self> {
-        let (changed_tx, changed_rx) = mpsc::channel::<()>();
+        let (changed_tx, changed_rx) = mpsc::channel::<Changed>();
         let (hwnd_tx, hwnd_rx) = mpsc::channel::<WinResult<SendHwnd>>();
 
         let window_changed_tx = changed_tx.clone();
@@ -900,10 +925,11 @@ impl ClipboardWatcher {
 
     /// 現在のクリップボード内容を（変更を待たず）取り込む。起動時同期用。
     /// 変更通知と同じワーカー経路に乗せるため、フィルタ・重複チェック等の
-    /// ポリシーは通常のキャプチャと同一に適用される。
+    /// ポリシーは通常のキャプチャと同一に適用される（変更の瞬間の前面の窓は無いので、ウィンドウフィルタは
+    /// 判定の時点の前面の窓と持ち主の窓だけで見る）。
     pub fn capture_now(&self) {
         if let Some(tx) = &self.changed_tx {
-            let _ = tx.send(());
+            let _ = tx.send(Changed { foreground: 0 });
         }
     }
 
@@ -1072,7 +1098,7 @@ mod tests {
         // 監視の窓とスレッドを作るので、クリップボード用 → GUI 用の順にロックを取る
         let _clipboard = lock_clipboard_tests();
         let _gui = crate::tray::lock_gui_resource_tests();
-        let (changed_tx, _changed_rx) = mpsc::channel::<()>();
+        let (changed_tx, _changed_rx) = mpsc::channel::<Changed>();
         let (hwnd_tx, hwnd_rx) = mpsc::channel::<WinResult<SendHwnd>>();
         let window_thread = thread::spawn(move || match create_message_window(changed_tx) {
             Ok(hwnd) => {
@@ -1104,6 +1130,128 @@ mod tests {
     fn is_window_handle_ignored_returns_false_for_invalid_handle() {
         let config = Config::default();
         assert!(!is_window_handle_ignored(HWND::default(), &config));
+    }
+
+    /// メッセージを処理し続ける別のスレッドに作った、タイトル付きの窓（ほかのアプリの窓の代わり。ワーカーがタイトルを
+    /// 読むと、そのスレッドへ `WM_GETTEXT` が送られるので、処理し続ける）。破棄で窓を閉じ、スレッドを終える。
+    struct TitledWindow {
+        hwnd: isize,
+        thread_id: u32,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TitledWindow {
+        fn new(title: &'static str) -> Self {
+            use windows::Win32::System::Threading::GetCurrentThreadId;
+            let (tx, rx) = mpsc::channel();
+            let thread = thread::spawn(move || unsafe {
+                let hwnd = CreateWindowExW(
+                    Default::default(),
+                    w!("STATIC"),
+                    &windows::core::HSTRING::from(title),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    10,
+                    10,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+                tx.send((hwnd.0 as isize, GetCurrentThreadId())).unwrap();
+                run_message_loop();
+                let _ = DestroyWindow(hwnd);
+            });
+            let (hwnd, thread_id) = rx.recv().unwrap();
+            Self { hwnd, thread_id, thread: Some(thread) }
+        }
+    }
+
+    impl Drop for TitledWindow {
+        fn drop(&mut self) {
+            use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+            unsafe {
+                let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    fn title_filter(title: &str) -> crate::config::WindowFilter {
+        crate::config::WindowFilter { title: title.to_string(), class_name: String::new(), ignore: true }
+    }
+
+    /// 変更の知らせに付けた前面の窓（通知を受けた瞬間の窓）で、ウィンドウフィルタを判定する。前面の窓が無い知らせ
+    /// （`capture_now`）とフィルタが無いときは当たらない。
+    #[test]
+    fn change_notice_judges_window_filter_by_foreground_at_change() {
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let window = TitledWindow::new("CLCLR 除外テスト窓");
+        let changed = Changed { foreground: window.hwnd };
+        let mut config = Config::default();
+        assert!(!changed.source_ignored(&config), "フィルタが無いのに当たった");
+        config.window_filters.push(title_filter("除外テスト"));
+        assert!(changed.source_ignored(&config));
+        assert!(!Changed { foreground: 0 }.source_ignored(&config));
+        config.window_filters[0].title = "当たらない".to_string();
+        assert!(!changed.source_ignored(&config));
+    }
+
+    /// ワーカーは、まとめ待ちの後の前面の窓が当たらなくても、変更の知らせに付いた前面の窓（コピーした瞬間の窓）が
+    /// 当たれば取り込まない（コピーしてすぐ別の窓へ切り替えた場合）。当たらない知らせだけなら取り込む。
+    #[test]
+    fn worker_ignores_copy_when_window_at_change_matches_filter() {
+        let _clipboard = lock_clipboard_tests();
+        let _gui = crate::tray::lock_gui_resource_tests();
+        settle_clipboard();
+        let watcher = test_support::test_watcher();
+        let port = watcher.port();
+        let window = TitledWindow::new("CLCLR 除外テスト窓");
+        let mut config = Config::default();
+        config.history.add_interval_ms = 50;
+        config.window_filters.push(title_filter("除外テスト"));
+        let switch = Arc::new(WatchSwitch { hwnd: HWND::default(), lock: Mutex::new(()), listening: Arc::new(AtomicBool::new(true)) });
+        let (changed_tx, changed_rx) = mpsc::channel();
+        let (entry_tx, entries) = mpsc::channel();
+        let (outcome_tx, outcomes) = mpsc::channel();
+        let worker = {
+            let (config, port) = (Arc::new(RwLock::new(config)), Arc::clone(&port));
+            thread::spawn(move || {
+                worker_loop(
+                    changed_rx,
+                    config,
+                    port,
+                    switch,
+                    move |entry| {
+                        let _ = entry_tx.send(entry);
+                    },
+                    |_| {},
+                    move |outcome| {
+                        let _ = outcome_tx.send(outcome);
+                    },
+                )
+            })
+        };
+        set_clipboard(&port, &[text("除外したい窓のコピー")]).unwrap();
+        changed_tx.send(Changed { foreground: window.hwnd }).unwrap();
+        assert_eq!(outcomes.recv_timeout(Duration::from_secs(5)).unwrap(), Outcome::Ignored);
+        assert!(entries.try_recv().is_err(), "除外した窓のコピーを取り込んだ");
+
+        // まとめた知らせのどれかが当たれば、まとめた1回を取り込まない
+        changed_tx.send(Changed { foreground: 0 }).unwrap();
+        changed_tx.send(Changed { foreground: window.hwnd }).unwrap();
+        assert_eq!(outcomes.recv_timeout(Duration::from_secs(5)).unwrap(), Outcome::Ignored);
+
+        changed_tx.send(Changed { foreground: 0 }).unwrap();
+        let copied = seq();
+        assert_eq!(outcomes.recv_timeout(Duration::from_secs(5)).unwrap(), Outcome::Captured { seq: copied });
+        assert_eq!(entry_text(&entries.try_recv().unwrap()), "除外したい窓のコピー");
+        drop(changed_tx);
+        worker.join().unwrap();
     }
 
     /// 実際のウィンドウでタイトル/クラス名フィルタが機能すること
