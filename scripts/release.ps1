@@ -13,7 +13,8 @@ CLCLR の配布用の zip と、リリースのページの文面を作る（Git
    あることと、C ランタイムの DLL を import していないことと、CFG と CET シャドウスタック互換（build.rs が付ける）の
    印があることを確かめる。release のビルドでは
    Cargo のホームのパスを「cargo」に置き換え（--remap-path-prefix）、exe にユーザーのフォルダと Cargo のホームの
-   パスが残っていないことを確かめる（探すのはこの2つのパスだけ）
+   パスが残っていないことを確かめる（探すのはこの2つのパスだけ）。どちらも --locked を付け、Cargo.lock を書き換える
+   必要があれば（Cargo.toml と食い違うときなど）止まる
 4. <出力先>\dist\CLCLR-<版>-x64.zip を作る（CLCLR.exe・README.md・LICENSE・THIRD-PARTY-NOTICES.md の4つ）。
    作った zip の項目がちょうどその4つで、中身が元のファイルと同じであることと、テスト・ビルドの間に作業ツリーと
    コミットが変わっていないことを確かめる
@@ -355,11 +356,13 @@ try {
     # - Control Flow Guard（CFG）を付ける。間接呼び出しの呼び先を Windows が確かめ、正しい呼び先でなければプロセスを
     #   終える（メモリが壊されたときに、呼び先を書き換えて処理を乗っ取られないようにする）
     $hardening = '-Ctarget-feature=+crt-static' + [char]0x1F + '-Ccontrol-flow-guard'
+    # テストとビルドには --locked を付け、コミットした Cargo.lock の依存の版のままで行う（Cargo.lock を書き換える
+    # 必要があれば、コンパイルを始める前に止まる）
 
     Write-Step 'テスト（cargo test。配布のビルドと同じく CRT の静的リンクと CFG の指定で）'
     $env:CARGO_ENCODED_RUSTFLAGS = $hardening
     try {
-        Invoke-Checked 'cargo test' { cargo test }
+        Invoke-Checked 'cargo test' { cargo test --locked }
     } finally {
         Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue
     }
@@ -378,7 +381,7 @@ try {
     try {
         # exe の場所は CARGO_TARGET_DIR・CARGO_BUILD_TARGET などで変わるので、決め打ちにせず、このビルドで cargo が
         # 知らせた成果物（compiler-artifact の executable）を使う。診断は人が読む形で stderr に出る
-        $buildMessages = @(& cargo build --release --message-format=json-render-diagnostics)
+        $buildMessages = @(& cargo build --release --locked --message-format=json-render-diagnostics)
         if ($LASTEXITCODE -ne 0) {
             throw "cargo build --release が失敗しました（終了コード $LASTEXITCODE）"
         }
