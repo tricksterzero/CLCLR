@@ -16,6 +16,16 @@ fn main() {
         .unwrap();
     generate_resource_ids();
     limit_import_search_to_system32();
+    mark_cet_compatible();
+}
+
+/// exe に CET シャドウスタック互換の印を付ける（`/CETCOMPAT`）。対応した CPU と Windows（10 2004 以降）では、関数の
+/// 戻り先を CPU が別に記録して確かめ、書き換えられていればプロセスを終える（ROP 攻撃への備え）。既定の互換モードでは、
+/// 違反が致命的になるのは印のあるモジュールの中だけで、印の無い DLL（IME など）の中の違反では終えない。
+fn mark_cet_compatible() {
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/CETCOMPAT");
+    }
 }
 
 /// exe が静的に import する DLL（KnownDLLs に無い winmm.dll・msimg32.dll など）を、system32 だけから探させる

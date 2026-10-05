@@ -10,7 +10,8 @@ CLCLR の配布用の zip と、リリースのページの文面を作る（Git
    origin にまだ無いことを確かめる
 3. cargo test（debug）と cargo build --release。どちらも C ランタイムを静的にリンクし（-C target-feature=+crt-static）、
    Control Flow Guard を付ける（-C control-flow-guard）。exe はこのビルドで cargo が知らせたものを使い、版と x64 で
-   あることと、C ランタイムの DLL を import していないことと、CFG の印があることを確かめる。release のビルドでは
+   あることと、C ランタイムの DLL を import していないことと、CFG と CET シャドウスタック互換（build.rs が付ける）の
+   印があることを確かめる。release のビルドでは
    Cargo のホームのパスを「cargo」に置き換え（--remap-path-prefix）、exe にユーザーのフォルダと Cargo のホームの
    パスが残っていないことを確かめる（探すのはこの2つのパスだけ）
 4. <出力先>\dist\CLCLR-<版>-x64.zip を作る（CLCLR.exe・README.md・LICENSE・THIRD-PARTY-NOTICES.md の4つ）。
@@ -119,6 +120,45 @@ function Test-GuardCf([string]$path) {
         throw "$path が PE32+ の実行ファイルではありません"
     }
     return (([System.BitConverter]::ToUInt16($bytes, $optional + 70) -band 0x4000) -ne 0)
+}
+
+# exe（x64 の PE。PE32+）に CET シャドウスタック互換の印があるか（デバッグのディレクトリの、種類 20 =
+# IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS の項目が指す値の、ビット 0 = IMAGE_DLLCHARACTERISTICS_EX_CET_COMPAT）
+function Test-CetCompat([string]$path) {
+    $bytes = [System.IO.File]::ReadAllBytes($path)
+    $pe = [System.BitConverter]::ToInt32($bytes, 0x3C)
+    $sectionCount = [System.BitConverter]::ToUInt16($bytes, $pe + 6)
+    $optionalSize = [System.BitConverter]::ToUInt16($bytes, $pe + 20)
+    $optional = $pe + 24
+    if ([System.BitConverter]::ToUInt16($bytes, $optional) -ne 0x20B) {
+        throw "$path が PE32+ の実行ファイルではありません"
+    }
+    # データディレクトリの7つ目（デバッグ）。項目は 28 バイトずつ
+    $debugRva = [uint64][System.BitConverter]::ToUInt32($bytes, $optional + 112 + 8 * 6)
+    $debugSize = [System.BitConverter]::ToUInt32($bytes, $optional + 112 + 8 * 6 + 4)
+    if ($debugRva -eq 0) {
+        return $false
+    }
+    $directory = $null
+    for ($i = 0; $i -lt $sectionCount; $i++) {
+        $s = $optional + $optionalSize + $i * 40
+        $va = [uint64][System.BitConverter]::ToUInt32($bytes, $s + 12)
+        $size = [uint64][Math]::Max([System.BitConverter]::ToUInt32($bytes, $s + 8), [System.BitConverter]::ToUInt32($bytes, $s + 16))
+        if ($debugRva -ge $va -and $debugRva -lt $va + $size) {
+            $directory = [int]([System.BitConverter]::ToUInt32($bytes, $s + 20) + $debugRva - $va)
+        }
+    }
+    if ($null -eq $directory) {
+        throw "デバッグのディレクトリがどのセクションにもありません（$path）"
+    }
+    for ($entry = $directory; $entry -lt $directory + $debugSize; $entry += 28) {
+        if ([System.BitConverter]::ToUInt32($bytes, $entry + 12) -eq 20) {
+            # PointerToRawData（ファイルの中の位置）
+            $data = [int][System.BitConverter]::ToUInt32($bytes, $entry + 24)
+            return (([System.BitConverter]::ToUInt32($bytes, $data) -band 1) -ne 0)
+        }
+    }
+    return $false
 }
 
 # exe（x64 の PE。PE32+）が静的に import している DLL の名前（import のディレクトリから読む）
@@ -382,6 +422,10 @@ try {
     }
     if (-not (Test-GuardCf $exe)) {
         throw "CLCLR.exe に Control Flow Guard（CFG）の印がありません。CFG の指定が効いていません"
+    }
+    # CET シャドウスタック互換の印（build.rs がリンカへ /CETCOMPAT を渡す）
+    if (-not (Test-CetCompat $exe)) {
+        throw "CLCLR.exe に CET シャドウスタック互換の印がありません（build.rs の /CETCOMPAT が効いていません）"
     }
     $leaks = @(Find-LocalPath $exe @($userProfile, $cargoHome, (Get-ShortFolderPath $userProfile), (Get-ShortFolderPath $cargoHome)))
     if ($leaks.Count -gt 0) {
