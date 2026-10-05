@@ -15,6 +15,17 @@ fn main() {
         .manifest_required()
         .unwrap();
     generate_resource_ids();
+    limit_import_search_to_system32();
+}
+
+/// exe が静的に import する DLL（KnownDLLs に無い winmm.dll・msimg32.dll など）を、system32 だけから探させる
+/// （`/DEPENDENTLOADFLAG:0x800` = `LOAD_LIBRARY_SEARCH_SYSTEM32`。Windows 10 1607 以降で効く）。既定では exe と同じ
+/// フォルダが先に探されるので、そこに同じ名前の DLL が置かれていると、それが読まれる（例えば、ダウンロードのフォルダに
+/// 置かれていた DLL の隣へ zip を展開して起動した場合）。
+fn limit_import_search_to_system32() {
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
+    }
 }
 
 /// `OUT_DIR/version.h` に Cargo.toml の version を書く（`res/app.rc` の VERSIONINFO が読む。
