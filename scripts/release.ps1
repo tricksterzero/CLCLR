@@ -6,7 +6,7 @@ CLCLR の配布用の zip と、リリースのページの文面を作る（Git
 次の順に行い、どこかで失敗したら止まる。
 
 1. 作業ツリーに未コミットの変更が無く、main の最新（origin/main と同じ）であることを確かめる
-2. Cargo.toml の版を読み、CHANGELOG.md にその版の節（「## 版（公開日）」）があることと、タグ v<版> が
+2. Cargo.toml の版を読み、CHANGELOG.md にその版の節（「## v版（公開日）」）があることと、タグ v<版> が
    origin にまだ無いことを確かめる
 3. cargo test（debug）と cargo build --release。どちらも C ランタイムを静的にリンクし（-C target-feature=+crt-static）、
    Control Flow Guard を付ける（-C control-flow-guard）。exe はこのビルドで cargo が知らせたものを使い、版と x64 で
@@ -267,10 +267,10 @@ function Get-PackageVersion([string]$cargoToml) {
     throw 'Cargo.toml の [package] に version がありません'
 }
 
-# CHANGELOG.md の「## 版（公開日）」の節（公開日と本文）
+# CHANGELOG.md の「## v版（公開日）」の節（公開日と本文）
 function Get-ChangelogSection([string]$changelog, [string]$version) {
     $lines = @(Get-Content -LiteralPath $changelog -Encoding UTF8)
-    $pattern = '^## ' + [regex]::Escape($version) + '（(.+)）\s*$'
+    $pattern = '^## v' + [regex]::Escape($version) + '（(.+)）\s*$'
     $start = -1
     $date = $null
     for ($i = 0; $i -lt $lines.Count; $i++) {
@@ -281,7 +281,7 @@ function Get-ChangelogSection([string]$changelog, [string]$version) {
         }
     }
     if ($start -lt 0) {
-        throw "CHANGELOG.md に「## $version（公開日）」の節がありません"
+        throw "CHANGELOG.md に「## v$version（公開日）」の節がありません"
     }
     $end = $lines.Count
     for ($j = $start + 1; $j -lt $lines.Count; $j++) {
@@ -295,7 +295,7 @@ function Get-ChangelogSection([string]$changelog, [string]$version) {
         $body = ($lines[($start + 1)..($end - 1)] -join "`n").Trim()
     }
     if (-not $body) {
-        throw "CHANGELOG.md の「## $version」の節が空です"
+        throw "CHANGELOG.md の「## v$version」の節が空です"
     }
     return [pscustomobject]@{ Date = $date; Body = $body }
 }
@@ -506,7 +506,7 @@ try {
         $draftNote = "> 下書き（scripts\release.ps1 -Draft で作ったもの）。この zip は配らない。`n`n"
     }
     $notes = @"
-$draftNote## CLCLR $version（$($section.Date)）
+$draftNote## CLCLR $tag（$($section.Date)）
 
 $($section.Body)
 
@@ -542,7 +542,7 @@ $($section.Body)
         $ghArgs = @(
             'gh release create', (ConvertTo-PsLiteral $tag), (ConvertTo-PsLiteral $zip),
             '--repo', (ConvertTo-PsLiteral $repo),
-            '--title', (ConvertTo-PsLiteral "CLCLR $version"),
+            '--title', (ConvertTo-PsLiteral "CLCLR $tag"),
             '--notes-file', (ConvertTo-PsLiteral $notesPath),
             '--target', (ConvertTo-PsLiteral $head)
         )
