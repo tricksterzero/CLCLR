@@ -418,8 +418,9 @@ try {
     if (-not (Test-X64Exe $exe)) {
         throw "CLCLR.exe が x64 の実行ファイルではありません（$exe）"
     }
-    # CRT を静的にリンクしたので、Visual C++ の実行環境と UCRT の DLL は import していないはず
-    $runtimeImports = @(Get-ImportedDll $exe | Where-Object { $_ -match '^(vcruntime|msvcp|ucrtbase|api-ms-win-crt-)' })
+    # CRT を静的にリンクしたので、Visual C++ の実行環境と UCRT の DLL は import していないはず（古い C ランタイムの
+    # msvcrt.dll・msvcr<版>.dll も、混ざっていないことを確かめる）
+    $runtimeImports = @(Get-ImportedDll $exe | Where-Object { $_ -match '^(vcruntime|msvcp|msvcr|ucrtbase|api-ms-win-crt-)' })
     if ($runtimeImports.Count -gt 0) {
         throw "CLCLR.exe が C ランタイムの DLL を import しています（$($runtimeImports -join '、')）。CRT の静的リンクが効いていません"
     }
