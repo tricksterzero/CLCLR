@@ -328,8 +328,10 @@ fn main() {
         handle
     };
 
-    // 操作の失敗・知らせの通知先。監視からの取り込みの失敗もここへ積むので、監視より先に作る
+    // 操作の失敗・知らせの通知先。監視からの取り込みの失敗・権限の確認の結果もここへ積むので、監視より先に作り、
+    // 操作スレッドの成否と関係なくビューアとつなぐ（作れなくても、取り込みの失敗は知らせ、終了の要求で閉じる）
     let failures = native::actions::FailureSink::new(move || waker.wake());
+    app.attach_failures(failures.clone());
 
     let watcher = {
         let core = core.clone();
@@ -369,18 +371,16 @@ fn main() {
             failures.clone(),
             request_rx,
         ) {
-            Ok(_detached) => {
-                // 保存先のフォルダの権限を確かめる（作業スレッド。起動は待たない）。結果は失敗の通知先に届き、
-                // ビューアが警告する（非表示で起動していても、警告があればビューアを出す）
-                if config.read().unwrap().general.check_folder_permissions {
-                    native::actions::spawn_folder_check(failures.clone(), std::env::current_exe());
-                }
-                app.attach_actions(request_tx, failures)
-            }
+            Ok(_detached) => app.attach_actions(request_tx, failures.clone()),
             Err(e) => report_error(&format!(
                 "ビューアの操作（送る・変換・ピン留めなど）のスレッドを作れないため、これらの操作は使えません。\n\n{e}"
             )),
         }
+    }
+    // 保存先のフォルダの権限を確かめる（専用の作業スレッド。起動は待たない）。結果は失敗の通知先に届き、
+    // ビューアが警告する（非表示で起動していても、警告があればビューアを出す）
+    if config.read().unwrap().general.check_folder_permissions {
+        native::actions::spawn_folder_check(failures, std::env::current_exe());
     }
 
     sync_clipboard_on_start(&config, &core, &watcher);

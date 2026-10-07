@@ -592,7 +592,7 @@ impl Config {
         }
         // 再生するときもネットワークの場所は開かずにシステム音にする（`ops::play_add_sound`）。音を鳴らす設定が
         // 無効な間は欄が灰色で直せないので、ホットキーのキーと同じく有効なときだけ確かめる
-        if h.sound_on_add && !h.sound_file.is_empty() && !crate::ops::is_local_path(&h.sound_file) {
+        if h.sound_on_add && !h.sound_file.is_empty() && crate::ops::sound_file_path(&h.sound_file).is_none() {
             issues.push(ConfigIssue {
                 field: "history.sound_file",
                 row: None,

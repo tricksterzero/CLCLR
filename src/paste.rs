@@ -226,7 +226,8 @@ pub enum PasteSkipped {
     ModifiersHeld,
     /// 待っている間に前面の窓が、戻した窓から変わった（別の窓へ貼り付けない）
     ForegroundChanged,
-    /// `SendInput` が送れたのは入力の一部だけ（送れた数）。送り直さない（二重に貼り付けうる）
+    /// `SendInput` が送れたのは入力の一部だけ（送れた数）。送り直さない（二重に貼り付けうる）。押したままのキーを離す
+    /// 入力は送った（それも入らなかったときはログに書く）。貼り付けが起きたかは分からない
     Partial(u32),
 }
 
@@ -252,9 +253,27 @@ pub fn send_paste(fi: &FocusInfo) -> Result<(), PasteSkipped> {
     }
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent as usize != inputs.len() {
+        // 押す入力だけが入ったキーを押したままにしない（離す入力を送る。それも入らなければ、押したままになりうる）
+        let release: Vec<INPUT> = keys_left_down(sent).iter().map(|&vk| key_input(vk, true)).collect();
+        if !release.is_empty() {
+            let released = unsafe { SendInput(&release, std::mem::size_of::<INPUT>() as i32) };
+            if released as usize != release.len() {
+                eprintln!("自動の貼り付けで押したキーを離す入力を送りきれませんでした（{released}/{}）", release.len());
+            }
+        }
         return Err(PasteSkipped::Partial(sent));
     }
     Ok(())
+}
+
+/// `send_paste` の4つの入力（Ctrl を押す・V を押す・V を離す・Ctrl を離す）のうち、先頭の `sent` 個だけが入ったときに
+/// 押したままになっているキー（離す順）。
+fn keys_left_down(sent: u32) -> &'static [VIRTUAL_KEY] {
+    match sent {
+        1 | 3 => &[VK_CONTROL],
+        2 => &[VK_V, VK_CONTROL],
+        _ => &[],
+    }
 }
 
 /// 現在のマウスカーソル位置（スクリーン座標）。キャレット位置が取れない時の
@@ -319,6 +338,17 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(wait_modifiers_released(), "修飾キーが押されていないのに時間切れになった");
         assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    /// 入力の一部だけが入ったとき、押したままのキーを離す（Ctrl・V を押したまま残さない）。全部入った・何も入らない
+    /// ときは何もしない。
+    #[test]
+    fn keys_left_down_after_partial_send() {
+        assert_eq!(keys_left_down(0), &[] as &[VIRTUAL_KEY]);
+        assert_eq!(keys_left_down(1), &[VK_CONTROL]);
+        assert_eq!(keys_left_down(2), &[VK_V, VK_CONTROL]);
+        assert_eq!(keys_left_down(3), &[VK_CONTROL]);
+        assert_eq!(keys_left_down(4), &[] as &[VIRTUAL_KEY]);
     }
 
     /// 前面の窓が、戻した窓と違えば Ctrl+V を送らない（送れば別の窓へ貼り付けてしまう）。戻した窓に、前面に

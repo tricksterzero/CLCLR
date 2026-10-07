@@ -338,8 +338,13 @@ fn exceeds_total(total: u64, limit: u64) -> bool {
 }
 
 /// 開いているクリップボード（`guard`）の中身を読む（`capture_clipboard` の本体）。先に取り込む形式と大きさを
-/// 集め、合計が上限を超えたら中身を写さずに `Err` を返す（大きな確保そのものをしない）。ハンドルは
-/// クリップボードを開いている間は有効で、ほかのプロセスは書き換えられない。
+/// 数え、合計が上限を超えたら中身を写さずに `Err` を返す（大きな確保そのものをしない）。
+///
+/// 数えるときに取ったハンドルは、写すときには使わない。遅延描画では、後の形式を描くときに持ち主が前の形式を
+/// 設定し直すことがあり、そのとき前に取ったハンドルは使えない（GetClipboardData の文書は、取ったらすぐ写すことと、
+/// 同じ形式の SetClipboardData の後はハンドルを使わないことを求める）。写すときに形式ごとにハンドルを取り直し、
+/// 大きさを読み直して上限を確かめ直してから、すぐ写す（どの形式も数えるときに描き終えているので、取り直しでは
+/// 描き直さない）。
 fn read_entry(_guard: &ClipboardGuard, config: &Config) -> std::result::Result<Option<Entry>, TooLarge> {
     let mut picked = Vec::new();
     let mut total = 0u64;
@@ -358,6 +363,23 @@ fn read_entry(_guard: &ClipboardGuard, config: &Config) -> std::result::Result<O
             continue;
         }
 
+        let Some(size) = clipboard_data_size(id) else {
+            continue;
+        };
+        if !should_capture_size(size, config.size_limit(&name)) {
+            continue;
+        }
+        total = total.saturating_add(size as u64);
+        picked.push((id, name));
+    }
+
+    let limit = config.capture_total_limit;
+    if exceeds_total(total, limit) {
+        return Err(TooLarge { total, limit });
+    }
+    let mut copied = 0u64;
+    let mut formats = Vec::new();
+    for (id, name) in picked {
         let Ok(handle) = (unsafe { GetClipboardData(id) }) else {
             continue;
         };
@@ -366,22 +388,22 @@ fn read_entry(_guard: &ClipboardGuard, config: &Config) -> std::result::Result<O
         if !should_capture_size(size, config.size_limit(&name)) {
             continue;
         }
-        total = total.saturating_add(size as u64);
-        picked.push((id, name, hglobal, size));
+        copied = copied.saturating_add(size as u64);
+        if exceeds_total(copied, limit) {
+            return Err(TooLarge { total: copied, limit });
+        }
+        let Some(guard) = GlobalLockGuard::lock(hglobal) else {
+            continue;
+        };
+        formats.push(Format { format_name: name, format_id: id, data: guard.as_slice(size).to_vec() });
     }
-
-    let limit = config.capture_total_limit;
-    if exceeds_total(total, limit) {
-        return Err(TooLarge { total, limit });
-    }
-    let formats: Vec<Format> = picked
-        .into_iter()
-        .filter_map(|(id, name, hglobal, size)| {
-            let guard = GlobalLockGuard::lock(hglobal)?;
-            Some(Format { format_name: name, format_id: id, data: guard.as_slice(size).to_vec() })
-        })
-        .collect();
     Ok((!formats.is_empty()).then(|| Entry::new(formats)))
+}
+
+/// 形式 `id` のデータの大きさ（`GlobalSize`）。取れなければ None。ハンドルは返さない（`read_entry` の説明）。
+fn clipboard_data_size(id: u32) -> Option<usize> {
+    let handle = unsafe { GetClipboardData(id) }.ok()?;
+    Some(unsafe { GlobalSize(HGLOBAL(handle.0)) })
 }
 
 // --- Write to clipboard ---
@@ -1223,7 +1245,7 @@ mod tests {
         let (outcome_tx, outcomes) = mpsc::channel();
         let worker = {
             let (config, port) = (Arc::new(RwLock::new(config)), Arc::clone(&port));
-            thread::spawn(move || {
+            WorkerThread::spawn(changed_tx, move || {
                 worker_loop(
                     changed_rx,
                     config,
@@ -1240,21 +1262,52 @@ mod tests {
             })
         };
         set_clipboard(&port, &[text("除外したい窓のコピー")]).unwrap();
-        changed_tx.send(Changed { foreground: window.hwnd }).unwrap();
+        worker.send(Changed { foreground: window.hwnd });
         assert_eq!(outcomes.recv_timeout(Duration::from_secs(5)).unwrap(), Outcome::Ignored);
         assert!(entries.try_recv().is_err(), "除外した窓のコピーを取り込んだ");
 
         // まとめた知らせのどれかが当たれば、まとめた1回を取り込まない
-        changed_tx.send(Changed { foreground: 0 }).unwrap();
-        changed_tx.send(Changed { foreground: window.hwnd }).unwrap();
+        worker.send(Changed { foreground: 0 });
+        worker.send(Changed { foreground: window.hwnd });
         assert_eq!(outcomes.recv_timeout(Duration::from_secs(5)).unwrap(), Outcome::Ignored);
 
-        changed_tx.send(Changed { foreground: 0 }).unwrap();
+        worker.send(Changed { foreground: 0 });
         let copied = seq();
         assert_eq!(outcomes.recv_timeout(Duration::from_secs(5)).unwrap(), Outcome::Captured { seq: copied });
         assert_eq!(entry_text(&entries.try_recv().unwrap()), "除外したい窓のコピー");
-        drop(changed_tx);
-        worker.join().unwrap();
+        worker.finish();
+    }
+
+    /// テストで起こした監視のワーカーのスレッド。破棄で知らせの送り手を落とし、ワーカーが終わるまで待つ（テストが
+    /// 途中で失敗しても、ロックを放す前にワーカーを終える。ロックより後に作ること）。
+    struct WorkerThread {
+        tx: Option<Sender<Changed>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl WorkerThread {
+        fn spawn(tx: Sender<Changed>, f: impl FnOnce() + Send + 'static) -> Self {
+            Self { tx: Some(tx), handle: Some(thread::spawn(f)) }
+        }
+
+        fn send(&self, changed: Changed) {
+            self.tx.as_ref().unwrap().send(changed).unwrap();
+        }
+
+        /// 送り手を落として終わりを待ち、ワーカーのパニックをテストの失敗にする。
+        fn finish(mut self) {
+            self.tx = None;
+            self.handle.take().unwrap().join().unwrap();
+        }
+    }
+
+    impl Drop for WorkerThread {
+        fn drop(&mut self) {
+            self.tx = None;
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
     }
 
     /// 監視のワーカーの終わりを待つ側（`ClipboardWatcher` の `Drop`）は、ワーカーが待つ側のスレッドの窓（ビューアの
@@ -1442,6 +1495,132 @@ mod tests {
         })
         .join()
         .unwrap()
+    }
+
+    /// 遅延描画で置いたテキストの中身（最初に描くもの）と、ファイルの一覧を描くときに設定し直す中身。
+    const DELAYED_FIRST_TEXT: &str = "最初";
+    const DELAYED_RESET_TEXT: &str = "ファイルの一覧を描くときに設定し直した、最初より長いテキスト";
+    /// 遅延描画の持ち主が、ファイルの一覧を描くときにテキストを設定し直せたか。
+    static DELAYED_RESET_OK: AtomicBool = AtomicBool::new(false);
+
+    /// 遅延描画のコピー元（ほかのアプリの代わり）。別のスレッドの窓が持ち主になり、テキストとファイルの一覧を
+    /// 遅延描画で置く。ファイルの一覧を描くときに、テキストも別の中身で設定し直す（GetClipboardData の文書が、
+    /// 同じ形式の SetClipboardData の後は前に返したハンドルを使わないよう求める場面）。破棄で持ち主のスレッドを
+    /// 終えて join する（テストが途中で失敗しても、ロックを放す前に終える）。
+    struct DelayedOwner {
+        thread_id: u32,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl DelayedOwner {
+        fn put() -> Self {
+            use windows::Win32::System::Threading::GetCurrentThreadId;
+            use windows::Win32::UI::WindowsAndMessaging::WM_RENDERFORMAT;
+
+            unsafe fn set(id: u32, data: &[u8]) -> bool {
+                let Some(hglobal) = global_copy(data) else {
+                    return false;
+                };
+                if unsafe { SetClipboardData(id, Some(HANDLE(hglobal.0))) }.is_err() {
+                    unsafe {
+                        let _ = GlobalFree(Some(hglobal));
+                    }
+                    return false;
+                }
+                true
+            }
+            unsafe extern "system" fn owner_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+                if msg == WM_RENDERFORMAT {
+                    unsafe {
+                        match wparam.0 as u32 {
+                            13 => {
+                                set(13, &crate::data::utf16_bytes(DELAYED_FIRST_TEXT));
+                            }
+                            15 => {
+                                set(15, &[1u8; 32]);
+                                if set(13, &crate::data::utf16_bytes(DELAYED_RESET_TEXT)) {
+                                    DELAYED_RESET_OK.store(true, Ordering::SeqCst);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    return LRESULT(0);
+                }
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+
+            DELAYED_RESET_OK.store(false, Ordering::SeqCst);
+            let (tx, rx) = mpsc::channel();
+            let thread = thread::spawn(move || unsafe {
+                let class_name = w!("CLCLR_TestDelayedOwner");
+                // 2回目の登録は失敗するが、同じ窓プロシージャのクラスが残っているので使える
+                RegisterClassW(&WNDCLASSW {
+                    lpfnWndProc: Some(owner_proc),
+                    hInstance: GetModuleHandleW(None).unwrap().into(),
+                    lpszClassName: class_name,
+                    ..Default::default()
+                });
+                let hwnd = CreateWindowExW(Default::default(), class_name, w!(""), WS_OVERLAPPED, 0, 0, 0, 0, Some(HWND_MESSAGE), None, None, None)
+                    .unwrap();
+                let mut opened = false;
+                for _ in 0..10 {
+                    if OpenClipboard(Some(hwnd)).is_ok() {
+                        opened = true;
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                assert!(opened, "持ち主の窓でクリップボードを開けない");
+                EmptyClipboard().unwrap();
+                // 中身は描くときに置く（遅延描画）。データを渡さないときは成功しても NULL が返り、windows crate は
+                // それを Err にするので、戻り値は見ない（置けたかは、下の読み取りで分かる）
+                let _ = SetClipboardData(13, None);
+                let _ = SetClipboardData(15, None);
+                let _ = CloseClipboard();
+                tx.send(GetCurrentThreadId()).unwrap();
+                run_message_loop();
+                let _ = DestroyWindow(hwnd);
+            });
+            let thread_id = rx.recv().unwrap();
+            Self { thread_id, thread: Some(thread) }
+        }
+    }
+
+    impl Drop for DelayedOwner {
+        fn drop(&mut self) {
+            use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+            unsafe {
+                let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// 取り込みは、形式ごとにハンドルを取ってすぐ写す: 後の形式（ファイルの一覧）を描くときに持ち主が前の形式
+    /// （テキスト）を設定し直しても、前に取ったハンドルを使わず、設定し直した中身を写す。
+    #[test]
+    fn delayed_render_that_resets_earlier_format_is_read_from_new_handle() {
+        let f = fixture();
+        let port = f.watcher.port();
+        let owner = DelayedOwner::put();
+        let entry = {
+            let guard = port.open().unwrap();
+            read_entry(&guard, &Config::default()).unwrap().unwrap()
+        };
+        clear_clipboard(&port).unwrap();
+        drop(owner);
+        assert!(DELAYED_RESET_OK.load(Ordering::SeqCst), "前提: 持ち主がテキストを設定し直せなかった");
+        let texts: Vec<String> = entry
+            .formats
+            .iter()
+            .filter(|f| f.format_name == "CF_UNICODETEXT")
+            .map(|f| crate::data::utf16_text(&f.data))
+            .collect();
+        assert_eq!(texts, [DELAYED_RESET_TEXT], "{:?}", entry.formats.iter().map(|f| &f.format_name).collect::<Vec<_>>());
+        assert!(entry.formats.iter().any(|f| f.format_name == "CF_HDROP"));
     }
 
     /// 抑止つきの書き込みは、閉じた後の変更番号を記録する。抑止しない書き込み・変換・空にする、は

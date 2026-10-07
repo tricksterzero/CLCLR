@@ -93,6 +93,9 @@ pub struct App {
     preview_id: Cell<Option<Uuid>>,
     /// 操作スレッドとのつなぎ（`attach_actions`。無ければ操作しない）
     actions: RefCell<Option<ActionLink>>,
+    /// 失敗・知らせの通知先（`attach_failures`）。操作スレッドのほか、監視のワーカー・権限の確認も積むので、
+    /// 操作スレッドを作れなかったときも受け取り、終了の要求で閉じる
+    failures: RefCell<Option<FailureSink>>,
     /// 知らせる前の操作の失敗と、表示中か
     notifier: RefCell<Notifier>,
     /// 失敗の知らせ方（メッセージボックス。テストでは差し替える）
@@ -152,7 +155,6 @@ impl Drop for FlagReset<'_> {
 /// 操作スレッドとのつなぎ。依頼の送り手を手放すと操作スレッドは終わる。
 struct ActionLink {
     requests: Sender<Action>,
-    failures: FailureSink,
 }
 
 /// 知らせる前の失敗とデータのチェックの結果（届いた順）。`notifying` は表示中（メッセージボックス・ダイアログの
@@ -242,6 +244,7 @@ impl App {
             last_revision: Cell::new(None),
             preview_id: Cell::new(None),
             actions: RefCell::new(None),
+            failures: RefCell::new(None),
             notifier: RefCell::new(Notifier::default()),
             show_failures: RefCell::new(Rc::new(show_failure_box)),
             show_check: RefCell::new(Rc::new(viewer::show_data_report)),
@@ -323,9 +326,16 @@ impl App {
         *self.tray_source.borrow_mut() = Some((events, waker));
     }
 
-    /// 操作スレッドとつなぐ。失敗は `failures` に積まれ、ビューアが起こされる（`on_wake` で受け取る）。
+    /// 操作スレッドとつなぐ。失敗は `failures` に積まれ、ビューアが起こされる（`on_wake` で受け取る）。通知先も
+    /// つなぐ（`attach_failures`）。
     pub fn attach_actions(&self, requests: Sender<Action>, failures: FailureSink) {
-        *self.actions.borrow_mut() = Some(ActionLink { requests, failures });
+        *self.actions.borrow_mut() = Some(ActionLink { requests });
+        self.attach_failures(failures);
+    }
+
+    /// 失敗・知らせの通知先をつなぐ（操作スレッドの成否と関係なく。監視のワーカー・権限の確認も積む）。
+    pub fn attach_failures(&self, failures: FailureSink) {
+        *self.failures.borrow_mut() = Some(failures);
     }
 
     /// 操作を依頼する（完了を待たない）。終了の要求の後は依頼しない。
@@ -361,7 +371,7 @@ impl App {
             let mut notifier = self.notifier.borrow_mut();
             notifier.pending.drain(..).collect()
         };
-        let closed = self.actions.borrow().as_ref().map(|link| link.failures.close()).unwrap_or_default();
+        let closed = self.failures.borrow().as_ref().map(FailureSink::close).unwrap_or_default();
         for notice in unshown.iter().chain(&closed) {
             eprintln!("{notice}");
         }
@@ -386,7 +396,7 @@ impl App {
     /// ワーカーが同じ通知先へ積む）は、設定に関係なく知らせる（`ActionKind::always_notified`）。
     /// データのチェックの結果は、終了の要求の後でなければいつも出す。
     fn collect_failures(&self) {
-        let notices = self.actions.borrow().as_ref().map(|link| link.failures.drain()).unwrap_or_default();
+        let notices = self.failures.borrow().as_ref().map(FailureSink::drain).unwrap_or_default();
         if notices.is_empty() {
             return;
         }
@@ -495,7 +505,14 @@ impl App {
                         // 閉じている間に終了の要求が来ていたら保存しない
                         viewer::FolderChoice::StopChecking if !self.exiting.get() => self.stop_folder_check(),
                         viewer::FolderChoice::StopChecking | viewer::FolderChoice::Continue => {}
-                        // ダイアログを作れなかった: 本文だけをメッセージボックスで知らせる（警告を見ないまま終わらない）
+                        // ダイアログを作れなかった: 本文だけをメッセージボックスで知らせる（警告を見ないまま終わらない）。
+                        // 作ろうとしている間に終了の要求が来ていればログだけ、隠していれば先頭へ戻して、表示したときに
+                        // 出し直す（そのときもダイアログを作れなければ、メッセージボックスで出す）
+                        viewer::FolderChoice::Failed if self.exiting.get() => eprintln!("{report}"),
+                        viewer::FolderChoice::Failed if self.viewer_hidden.get() => {
+                            self.notifier.borrow_mut().pending.push_front(Notice::FolderReport(report));
+                            break;
+                        }
                         viewer::FolderChoice::Failed => {
                             let show = Rc::clone(&self.show_failures.borrow());
                             show(hwnd, &format!("保存先のフォルダの権限を見直してください\n\n{}", viewer::folder_report_text(&report).0));
@@ -2137,6 +2154,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// 操作スレッドとつないでいなくても（作れなかったとき）、通知先だけつなげば、監視からの取り込みの失敗を受け取って
+    /// 知らせ、終了の要求で通知先を閉じる（閉じた後に届いたものは積まない）。
+    #[test]
+    fn capture_failures_are_notified_without_action_thread() {
+        let config = memory_only_config();
+        let (dir, core) = temp_service(config.clone());
+        let (_tray, tray_rx) = mpsc::channel();
+        let (_hotkey, hotkey_rx) = mpsc::channel();
+        let app = App::new(Arc::new(RwLock::new(config)), core, tray_rx, hotkey_rx);
+        let sink = FailureSink::new(|| {});
+        app.attach_failures(sink.clone());
+        let log: Rc<RefCell<Vec<String>>> = Rc::default();
+        {
+            let log = Rc::clone(&log);
+            app.set_failure_display(move |_hwnd, text| log.borrow_mut().push(text.to_string()));
+        }
+        sink.report(ActionFailure { kind: ActionKind::CapturePanic, message: "止めた".into() });
+        app.on_wake(HWND::default());
+        assert_eq!(log.borrow().as_slice(), ["クリップボードの取り込み中に予期しない誤りが起きました: 止めた"]);
+
+        app.finish_actions();
+        sink.report(ActionFailure { kind: ActionKind::Capture, message: "終了の後".into() });
+        assert!(sink.drain().is_empty(), "終了の要求の後も通知先が開いている");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// 保存先のフォルダの権限の警告: 非表示で起動していれば、ビューアを出してから出す。出せなかった（ほかの表示中）
     /// ときは残して次の起床で出す。「今後は確かめない」は設定ファイルに書けてから共有の設定に反映する。終了の要求の
     /// 後に届いたものは出さず、ビューアも出さない。
@@ -2221,6 +2264,54 @@ mod tests {
         let log = log.borrow();
         assert_eq!(log.len(), 1, "{log:?}");
         assert!(log[0].starts_with("保存先のフォルダの権限を見直してください") && log[0].contains(r"C:\Tools\CLCLR"), "{log:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 警告のダイアログを作れなかったとき、作ろうとしている間にビューアを隠していれば、メッセージボックスを出さずに
+    /// 残して表示したときに出し直し、終了の要求が来ていれば出さない。
+    #[test]
+    fn folder_report_fallback_respects_hide_and_exit_during_dialog() {
+        use crate::folder_security::Unverified;
+        let config = memory_only_config();
+        let (dir, core) = temp_service(config.clone());
+        let (_tray, tray_rx) = mpsc::channel();
+        let (_hotkey, hotkey_rx) = mpsc::channel();
+        let app = Rc::new(App::new(Arc::new(RwLock::new(config)), core, tray_rx, hotkey_rx));
+        let sink = FailureSink::new(|| {});
+        let (requests, _received) = mpsc::channel();
+        app.attach_actions(requests, sink.clone());
+        let log: Rc<RefCell<Vec<String>>> = Rc::default();
+        // ダイアログの間に起きること（1回目は隠す、2回目は何もしない、3回目は終了の要求）
+        let during: Rc<RefCell<VecDeque<&'static str>>> = Rc::new(RefCell::new(VecDeque::from(["hide", "", "exit"])));
+        {
+            let (log_f, log_s, weak) = (Rc::clone(&log), Rc::clone(&log), Rc::downgrade(&app));
+            app.set_failure_display(move |_hwnd, text| log_f.borrow_mut().push(format!("F:{}", text.lines().next().unwrap_or(""))));
+            app.set_folder_display(
+                move |hwnd, _report| {
+                    log_s.borrow_mut().push("S".to_string());
+                    let app = weak.upgrade().unwrap();
+                    match during.borrow_mut().pop_front().unwrap() {
+                        "hide" => app.mark_viewer_hidden(),
+                        "exit" => app.on_close(hwnd),
+                        _ => {}
+                    }
+                    viewer::FolderChoice::Failed
+                },
+                |_hwnd| {},
+            );
+        }
+        let report = || Notice::FolderReport(FolderReport { unverified: vec![Unverified::NoAcl], ..FolderReport::default() });
+        sink.post(report());
+        app.on_wake(HWND::default());
+        assert_eq!(log.borrow().as_slice(), ["S"], "隠したのにメッセージボックスを出した");
+        // 表示したときに出し直し、隠していなければメッセージボックスで出す
+        app.on_shown(HWND::default());
+        app.on_wake(HWND::default());
+        assert_eq!(log.borrow().as_slice(), ["S", "S", "F:保存先のフォルダの権限を見直してください"]);
+        // 終了の要求（トレイなしで閉じる）が来たら出さない
+        sink.post(report());
+        app.on_wake(HWND::default());
+        assert_eq!(log.borrow().len(), 4, "終了の要求の後にメッセージボックスを出した: {:?}", log.borrow());
         let _ = std::fs::remove_dir_all(dir);
     }
 

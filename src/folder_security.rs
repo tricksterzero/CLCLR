@@ -15,7 +15,7 @@
 //! この確認は利用者への助言で、改ざんを見つける仕組みではない（設定ファイルを書き換えられる者は、先に確認を
 //! 止められる。差し替えられた exe は、この確認より先に動く）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -304,6 +304,8 @@ pub enum Unverified {
     Unreadable { path: PathBuf, error: String },
     /// 解釈できない種類の ACE がある
     UnknownAce(PathBuf),
+    /// `blobs` の中のフォルダが深すぎるので、中を確かめていない（`BLOBS_MAX_DEPTH`）
+    TooDeep(PathBuf),
 }
 
 /// 確かめた結果。
@@ -584,8 +586,29 @@ mod win {
 
 pub use win::current_user_sid;
 
+/// 拡張長のパスの接頭辞を外したパス（`\\?\C:\…` → `C:\…`）。ほかの形（`\\?\UNC\…` などネットワークの場所を含む）は
+/// そのまま。
+fn without_verbatim_disk_prefix(dir: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut components = dir.components();
+    match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(letter) => {
+                let mut out = PathBuf::from(format!("{}:\\", char::from(letter)));
+                out.extend(components.filter(|c| !matches!(c, Component::RootDir)));
+                out
+            }
+            _ => dir.to_path_buf(),
+        },
+        _ => dir.to_path_buf(),
+    }
+}
+
 /// 保存先のフォルダ `dir`（`exe_name` は CLCLR.exe のファイル名）を確かめる。読むだけで、何も変えない。
 pub fn check(dir: &Path, exe_name: &OsStr) -> FolderReport {
+    // exe の場所が `\\?\C:\…` の形で届いても、ローカルのパスとして確かめる（`\\` で始まるのでネットワークとみなさない）。
+    // 結果の `dir` も同じ形にする（見つかった項目のパスと比べて、本文の書き分けに使うため）
+    let dir = &without_verbatim_disk_prefix(dir);
     let mut report = FolderReport { dir: dir.to_path_buf(), ..FolderReport::default() };
     let unreadable = |error: String| Unverified::Unreadable { path: dir.to_path_buf(), error };
     let trusted = match current_user_sid() {
@@ -627,12 +650,11 @@ pub fn check(dir: &Path, exe_name: &OsStr) -> FolderReport {
     }
     check_ancestors(dir, &trusted, &mut report);
     check_contents(dir, exe_name, &trusted, &mut report);
-    let sids: Vec<String> = report.findings.iter().flat_map(|f| f.sids.iter().cloned()).collect();
+    // 同じ SID は1回だけ引く（引けなかった SID も、見つかった数だけ引き直さない）
+    let sids: BTreeSet<String> = report.findings.iter().flat_map(|f| f.sids.iter().cloned()).collect();
     for sid in sids {
-        if !report.names.contains_key(&sid) {
-            if let Some(name) = win::account_name(&sid) {
-                report.names.insert(sid, name);
-            }
+        if let Some(name) = win::account_name(&sid) {
+            report.names.insert(sid, name);
         }
     }
     report
@@ -748,15 +770,25 @@ pub(crate) fn check_contents(dir: &Path, exe_name: &OsStr, trusted: &Trusted, re
     }
 }
 
+/// `blobs` の中のフォルダをたどる深さの上限（`blobs` の直下が 1 段目）。CLCLR は中にフォルダを作らないので、外から
+/// 作られた深いフォルダで、スタックやメモリを使い切らないための歯止め。
+const BLOBS_MAX_DEPTH: usize = 16;
+
 /// `blobs` の中の全部を確かめる（中のフォルダは CLCLR が作らないが、あればその中もたどる。リンクはたどらない）。
+/// 再帰せず、たどるフォルダの一覧で回す。`BLOBS_MAX_DEPTH` より深いフォルダは、中を確かめずに「確かめられない」にする。
 fn check_blobs(folder: &Path, trusted: &Trusted, report: &mut FolderReport) {
-    for (path, _, attrs) in entries(folder, report) {
-        if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
-            if inspect(&path, attrs, Role::Folder, trusted, report) {
-                check_blobs(&path, trusted, report);
+    let mut pending = vec![(folder.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = pending.pop() {
+        for (path, _, attrs) in entries(&dir, report) {
+            if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                if depth >= BLOBS_MAX_DEPTH {
+                    report.unverified.push(Unverified::TooDeep(path));
+                } else if inspect(&path, attrs, Role::Folder, trusted, report) {
+                    pending.push((path, depth + 1));
+                }
+            } else {
+                inspect(&path, attrs, Role::DataFile, trusted, report);
             }
-        } else {
-            inspect(&path, attrs, Role::DataFile, trusted, report);
         }
     }
 }
@@ -1083,6 +1115,27 @@ mod tests {
         assert!(!found.findings.iter().any(|f| f.path == sub), "{found:?}");
     }
 
+    /// `blobs` の中のフォルダは `BLOBS_MAX_DEPTH` 段までたどり、それより深いフォルダは中を確かめずに「確かめられない」に
+    /// する（黙って飛ばさない）。上限の段の中のファイルは確かめる。
+    #[test]
+    fn blobs_deeper_than_limit_is_unverified() {
+        let tree = TempTree::new();
+        let me = current_user_sid().unwrap();
+        tree.set_dacl(&tree.0, &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"));
+        let mut deepest_checked = tree.0.join("blobs");
+        for _ in 0..BLOBS_MAX_DEPTH {
+            deepest_checked.push("d");
+        }
+        let too_deep = deepest_checked.join("d");
+        std::fs::create_dir_all(&too_deep).unwrap();
+        let file = deepest_checked.join("b_0.bin");
+        std::fs::write(&file, b"x").unwrap();
+        tree.set_dacl(&file, &format!("D:P(A;;FA;;;{me})(A;;FR;;;WD)"));
+        let found = contents(&tree.0);
+        assert_eq!(found.unverified, [Unverified::TooDeep(too_deep)], "{found:?}");
+        assert_eq!(found.findings.iter().map(|f| (f.path.clone(), f.concern)).collect::<Vec<_>>(), [(file, Concern::Read)]);
+    }
+
     /// `blobs` がジャンクション（フォルダの外を指す）なら、中は確かめずに確かめられないものとして知らせる。
     #[test]
     fn junction_is_unverified() {
@@ -1100,6 +1153,23 @@ mod tests {
         assert!(found.unverified.contains(&Unverified::Link(tree.0.join("blobs"))), "{found:?}");
         assert!(!found.findings.iter().any(|f| f.path.starts_with(outside.0.join("blobs"))));
         std::fs::remove_dir(tree.0.join("blobs")).unwrap();
+    }
+
+    /// `\\?\C:\…` の形のパスは、接頭辞を外したローカルのパスとして確かめる（ネットワークとみなさない）。`\\?\UNC\…` と
+    /// ほかの形はそのまま。
+    #[test]
+    fn verbatim_disk_path_is_checked_as_local() {
+        assert_eq!(without_verbatim_disk_prefix(Path::new(r"\\?\C:\Tools\CLCLR")), PathBuf::from(r"C:\Tools\CLCLR"));
+        assert_eq!(without_verbatim_disk_prefix(Path::new(r"\\?\d:\")), PathBuf::from(r"d:\"));
+        for same in [r"C:\Tools\CLCLR", r"\\?\UNC\server\share\CLCLR", r"\\server\share\CLCLR"] {
+            assert_eq!(without_verbatim_disk_prefix(Path::new(same)), PathBuf::from(same), "{same}");
+        }
+        let tree = TempTree::new();
+        let verbatim = PathBuf::from(format!(r"\\?\{}", tree.0.display()));
+        let (plain, extended) = (check(&tree.0, OsStr::new("CLCLR.exe")), check(&verbatim, OsStr::new("CLCLR.exe")));
+        assert!(!extended.unverified.contains(&Unverified::Remote), "{extended:?}");
+        // 結果の保存先も外した形（見つかった項目のパスと同じ形。警告の本文の書き分けが同じになる）
+        assert_eq!(extended, plain);
     }
 
     /// 実際の保存先（このテストの exe のフォルダ）でも、パニックせずに結果を返す（内容は環境による）。

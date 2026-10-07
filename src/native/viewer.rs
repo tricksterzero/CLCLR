@@ -1533,14 +1533,51 @@ pub fn show_folder_report(hwnd: HWND, report: &FolderReport) -> FolderChoice {
     }
 }
 
+/// 保存先のフォルダとその中の項目（親のフォルダでないもの）で見つかったことから、ほかのアカウントができること（本文に
+/// 並べる句。決まった順で重複なし）。見つかった種類の分だけを書く（読めるだけなら「書き換え」とは書かない）。
+fn folder_finding_effects(report: &FolderReport) -> Vec<&'static str> {
+    const READ: &str = "履歴を読む";
+    const WRITE: &str = "履歴を書き換え・削除する";
+    const EXE: &str = "CLCLR.exe を差し替える";
+    // 引き継がれる許可は読み取りだけのことも、書き込みだけのこともある（Concern::Inherit は両方をまとめる）
+    const INHERIT: &str = "中に新しく作られるファイルを読むか書き換える";
+    const PERMISSIONS: &str = "権限を変える";
+    let mut found = Vec::new();
+    for f in report.findings.iter().filter(|f| !f.ancestor) {
+        // 保存先のフォルダの直下の .exe は、確かめた CLCLR.exe だけ（ほかの .exe は確かめない）
+        let in_dir = f.path.parent() == Some(report.dir.as_path());
+        let is_exe = in_dir && f.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+        let is_dir = f.path == report.dir;
+        let is_folder = is_dir || (in_dir && f.path.file_name().is_some_and(|n| n.eq_ignore_ascii_case("blobs")));
+        let effects: &[&str] = match f.concern {
+            Concern::Read => &[READ],
+            // 保存先のフォルダへの書き込みは、中のファイルの追加・削除（CLCLR.exe の差し替えを含む）
+            Concern::Write if is_exe => &[EXE],
+            Concern::Write if is_dir => &[WRITE, EXE],
+            Concern::Write => &[WRITE],
+            Concern::Inherit => &[INHERIT],
+            Concern::Permissions | Concern::Owner => &[PERMISSIONS],
+            Concern::NullDacl if is_exe => &[EXE, PERMISSIONS],
+            Concern::NullDacl if is_dir => &[WRITE, EXE, PERMISSIONS],
+            Concern::NullDacl if is_folder => &[WRITE, PERMISSIONS],
+            Concern::NullDacl => &[READ, WRITE, PERMISSIONS],
+            // 親のフォルダだけの種類（ここには来ない）
+            Concern::Replace => &[],
+        };
+        found.extend_from_slice(effects);
+    }
+    [READ, WRITE, EXE, INHERIT, PERMISSIONS].into_iter().filter(|e| found.contains(e)).collect()
+}
+
 /// 保存先のフォルダの権限の警告の本文と「詳細」。
 pub(crate) fn folder_report_text(report: &FolderReport) -> (String, String) {
     let mut content = format!(
         "CLCLR は、コピーした内容の履歴を、暗号化せずに次のフォルダへ保存しています。\n{}\n",
         report.dir.display()
     );
-    if report.findings.iter().any(|f| !f.ancestor) {
-        content.push_str("\nほかのアカウントから、履歴を読んだり書き換えたり、CLCLR.exe を差し替えたりできる設定になっています。");
+    let can = folder_finding_effects(report);
+    if !can.is_empty() {
+        content.push_str(&format!("\nほかのアカウントが、{}ことのできる設定になっています。", can.join("、")));
     }
     if report.findings.iter().any(|f| f.ancestor) {
         content.push_str(
@@ -1577,6 +1614,7 @@ pub(crate) fn folder_report_text(report: &FolderReport) -> (String, String) {
         Unverified::Link(path) => format!("{}: リンク（ジャンクション・シンボリックリンクなど）なので、確かめていません", path.display()),
         Unverified::Unreadable { path, error } => format!("{}: 権限を読めません（{error}）", path.display()),
         Unverified::UnknownAce(path) => format!("{}: 解釈できない種類の権限の設定があります", path.display()),
+        Unverified::TooDeep(path) => format!("{}: フォルダが深すぎるため、中を確かめていません", path.display()),
     });
     let mut details = Vec::new();
     if !report.findings.is_empty() {
@@ -6294,7 +6332,9 @@ mod tests {
         });
         let (content, details) = folder_report_text(&report);
         assert!(content.contains(r"C:\Tools\CLCLR"), "{content}");
-        assert!(content.contains("履歴を読んだり書き換えたり"), "{content}");
+        // 読めるだけなら、書き換え・差し替えとは書かない
+        assert!(content.contains("ほかのアカウントが、履歴を読むことのできる設定になっています。"), "{content}");
+        assert!(!content.contains("書き換え") && !content.contains("差し替え"), "{content}");
         assert!(!content.contains("親のフォルダ"), "{content}");
         assert!(!content.contains("確かめられない"), "{content}");
         assert!(details.contains(r"C:\Tools\CLCLR\history.toml: NT AUTHORITY\Authenticated Users、S-1-5-21-9 が中身を読めます"), "{details}");
@@ -6306,13 +6346,35 @@ mod tests {
             ..FolderReport::default()
         };
         let (content, details) = folder_report_text(&report);
-        assert!(!content.contains("履歴を読んだり"), "{content}");
+        assert!(!content.contains("ほかのアカウントが"), "{content}");
         assert!(content.contains("親のフォルダが") && content.contains("確かめられないところ"), "{content}");
         assert!(details.contains("見つかったこと:") && details.contains("確かめられなかったこと:"), "{details}");
         assert!(details.contains(r"C:\Tools\CLCLR\blobs: リンク"), "{details}");
         // 削除・改名だけのときは、権限を変えられるとは書かない
         assert!(details.contains(r"C:\Tools: S-1-5-11 が、このフォルダかその中の項目を削除・改名できます"), "{details}");
         assert!(!details.contains("権限・所有者"), "{details}");
+    }
+
+    /// 本文の「ほかのアカウントができること」は、見つかった種類と項目に合わせる（exe の書き換えは差し替え、保存先の
+    /// フォルダへの書き込みは中の履歴と exe の両方、権限・所有者は権限の変更）。
+    #[test]
+    fn folder_report_text_lists_only_found_effects() {
+        use crate::folder_security::Finding;
+        use std::path::PathBuf;
+        let dir = PathBuf::from(r"C:\Tools\CLCLR");
+        let finding = |path: PathBuf, concern| Finding { path, concern, sids: vec!["S-1-5-11".into()], ancestor: false };
+        let effects = |findings: Vec<Finding>| {
+            let report = FolderReport { dir: dir.clone(), findings, ..FolderReport::default() };
+            folder_report_text(&report).0
+        };
+        let exe_only = effects(vec![finding(dir.join("CLCLR.exe"), Concern::Write)]);
+        assert!(exe_only.contains("ほかのアカウントが、CLCLR.exe を差し替えることのできる設定"), "{exe_only}");
+        assert!(!exe_only.contains("履歴を読む") && !exe_only.contains("履歴を書き換え"), "{exe_only}");
+        let folder = effects(vec![finding(dir.clone(), Concern::Write), finding(dir.join("blobs"), Concern::Permissions)]);
+        assert!(folder.contains("ほかのアカウントが、履歴を書き換え・削除する、CLCLR.exe を差し替える、権限を変えることのできる設定"), "{folder}");
+        let blob = effects(vec![finding(dir.join("blobs").join("a_0.bin"), Concern::Write), finding(dir.clone(), Concern::Inherit)]);
+        assert!(blob.contains("ほかのアカウントが、履歴を書き換え・削除する、中に新しく作られるファイルを読むか書き換えることのできる設定"), "{blob}");
+        assert!(!blob.contains("CLCLR.exe を差し替える"), "{blob}");
     }
 
     /// ピン留めの行（先頭）と履歴の行を入れ、先頭を選んで表示する。

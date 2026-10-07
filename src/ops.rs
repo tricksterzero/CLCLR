@@ -306,7 +306,7 @@ impl Core {
         if !evicted.is_empty() {
             let retire = snapshot.map_or(Retire::Targeted, Retire::Full);
             // 書けなかった項目は消し直す対象に残る（ログは `retire_items` が書く）
-            retire_items(&self.inner,&mut scope.ops, evicted, retire).map_err(OpError::CapturedIndexNotSaved)?;
+            retire_items(&self.inner, &mut scope.ops, evicted, retire).map_err(OpError::CapturedIndexNotSaved)?;
         } else if let Some(metas) = snapshot {
             if let Err(e) = self.inner.storage.save_history_index(&metas) {
                 eprintln!("履歴インデックスの保存に失敗: {e}");
@@ -323,7 +323,7 @@ impl Core {
         let mut scope = self.begin()?;
         let item = self.with_service(|s| s.remove_item(id))?.ok_or(OpError::NotFound)?;
         let retire = self.retire_kind()?;
-        retire_items(&self.inner,&mut scope.ops, vec![item], retire).map_err(OpError::IndexNotSaved)
+        retire_items(&self.inner, &mut scope.ops, vec![item], retire).map_err(OpError::IndexNotSaved)
     }
 
     /// 履歴を全部消す（C版 CLCL の tool_utl「履歴のクリア」の統合）。インデックスを書けなかったときは `IndexNotSaved`。
@@ -331,7 +331,7 @@ impl Core {
         let mut scope = self.begin()?;
         let removed = self.with_service(|s| s.clear_items())?;
         let retire = self.retire_kind()?;
-        retire_items(&self.inner,&mut scope.ops, removed, retire).map_err(OpError::IndexNotSaved)
+        retire_items(&self.inner, &mut scope.ops, removed, retire).map_err(OpError::IndexNotSaved)
     }
 
     /// 設定の保持件数へ切り詰める（設定の反映から、操作スレッドで呼ぶ）。インデックスを書けなかった
@@ -342,7 +342,7 @@ impl Core {
         let evicted = self.with_service(|s| s.trim_items(&cfg.history))?;
         if !evicted.is_empty() {
             let retire = self.retire_kind()?;
-            retire_items(&self.inner,&mut scope.ops, evicted, retire).map_err(OpError::IndexNotSaved)?;
+            retire_items(&self.inner, &mut scope.ops, evicted, retire).map_err(OpError::IndexNotSaved)?;
         }
         Ok(())
     }
@@ -909,10 +909,22 @@ fn retry_pending(inner: &Inner, ops: &mut OpState) {
 /// 今も参照されている blob・サムネイルの名前（比べるための小文字）: メモリの履歴・ピン留めと、`pending`（消し直し
 /// 待ちの項目。インデックスにまだ残っている）。サービスのロックが poison していれば None（読めない状態で消さない）。
 /// 呼ぶときにサービスのロックを持っていないこと。
+/// ロックの中では、メタデータを複製せずに参照でたどり、名前だけを集める。
 fn live_references(inner: &Inner, pending: &[EntryMeta]) -> Option<HashSet<String>> {
     let service = inner.service.lock().ok()?;
-    let pinned = item_metas(&service.pinned);
-    Some(reference_keys(service.history.iter().map(|item| &item.meta).chain(&pinned).chain(pending)))
+    let mut pinned = Vec::new();
+    pinned_meta_refs(&service.pinned, &mut pinned);
+    Some(reference_keys(service.history.iter().map(|item| &item.meta).chain(pinned).chain(pending)))
+}
+
+/// ピン留めの木のアイテム（フォルダの中も）のメタデータへの参照（`item_metas` と同じ並びで、複製しない）。
+fn pinned_meta_refs<'a>(nodes: &'a [PinnedNode], out: &mut Vec<&'a EntryMeta>) {
+    for node in nodes {
+        match node {
+            PinnedNode::Item(meta) => out.push(meta),
+            PinnedNode::Folder(folder) => pinned_meta_refs(&folder.children, out),
+        }
+    }
 }
 
 /// 除いた項目の blob・サムネイルのうち、`protected`（今も参照されている名前。`live_references`）に無いものを消す
@@ -1011,8 +1023,8 @@ fn persist_enabled(config: &Config) -> bool {
 }
 
 /// 履歴追加音を鳴らす（C版 CLCL の tool_utl「音を鳴らす」の統合。watcherスレッドから呼ばれる）。
-/// ファイル未指定・再生失敗時はシステム音にフォールバック（C版と同じ）。ネットワークの場所のファイル
-/// （`is_local_path` が偽）は開かずにシステム音を鳴らす（コピーのたびに外へ接続しないため）。
+/// ファイル未指定・再生失敗時はシステム音にフォールバック（C版と同じ）。ファイルは `sound_file_path` の絶対パスで
+/// 鳴らし、ネットワークの場所のファイルは開かずにシステム音を鳴らす（コピーのたびに外へ接続しないため）。
 fn play_add_sound(sound_file: &str) {
     use windows::core::PCWSTR;
     use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT};
@@ -1025,16 +1037,39 @@ fn play_add_sound(sound_file: &str) {
     // 次の再生まで持っている
     static SOUND_BUF: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 
-    let played = if sound_file.is_empty() || !is_local_path(sound_file) {
-        false
-    } else {
-        let mut buf = SOUND_BUF.lock().unwrap_or_else(|p| p.into_inner());
-        *buf = sound_file.encode_utf16().chain([0]).collect();
-        unsafe { PlaySoundW(PCWSTR(buf.as_ptr()), None, SND_FILENAME | SND_ASYNC | SND_NODEFAULT) }.as_bool()
+    let played = match sound_file_path(sound_file) {
+        None => false,
+        Some(path) => {
+            use std::os::windows::ffi::OsStrExt;
+            let mut buf = SOUND_BUF.lock().unwrap_or_else(|p| p.into_inner());
+            *buf = path.as_os_str().encode_wide().chain([0]).collect();
+            unsafe { PlaySoundW(PCWSTR(buf.as_ptr()), None, SND_FILENAME | SND_ASYNC | SND_NODEFAULT) }.as_bool()
+        }
     };
     if !played {
         let _ = unsafe { MessageBeep(MB_ICONASTERISK) };
     }
+}
+
+/// 追加音のファイルを鳴らす絶対パス。相対のパス（`a.wav`・`sub\a.wav`）は exe のフォルダ（`storage::base_dir`）
+/// からのパスにする（PlaySound は相対の名前を、作業フォルダのほか Windows のフォルダ・PATH・ネットワークに割り当てた
+/// フォルダからも探すので、絶対パスにしてから判定し、同じパスで鳴らす）。ルートからの相対（`\a.wav`）・ドライブの中の
+/// 相対（`C:a.wav`）は、作業フォルダから絶対パスにする。空・絶対パスにできない・この PC のドライブでない
+/// （`is_local_path` が偽）ときは None。
+pub(crate) fn sound_file_path(sound_file: &str) -> Option<std::path::PathBuf> {
+    use std::path::{Component, Path};
+    if sound_file.is_empty() {
+        return None;
+    }
+    let path = Path::new(sound_file);
+    let path = if path.has_root() || matches!(path.components().next(), Some(Component::Prefix(_))) {
+        path.to_path_buf()
+    } else {
+        crate::storage::base_dir().join(path)
+    };
+    // 文字列の上での組み立てで、ファイルには触れない（GetFullPathNameW）
+    let absolute = std::path::absolute(path).ok()?;
+    is_local_path(&absolute.to_string_lossy()).then_some(absolute)
 }
 
 /// パスがこの PC のドライブを指すか（追加音のファイルに使う）。偽にするのは、先頭が区切り2つ（`\\`・`//`。
@@ -1202,6 +1237,23 @@ pub(crate) mod tests {
         assert!(is_local_path(exe), "前提: {exe} がローカルのドライブにある");
         for path in ["a.wav", r"\a.wav", "/a.wav", &exe[..2]] {
             assert!(is_local_path(path), "{path} をネットワークとした");
+        }
+    }
+
+    /// 追加音の相対のパスは exe のフォルダからの絶対パスにする（PlaySound に作業フォルダ・PATH・ネットワークに割り当てた
+    /// フォルダを探させない）。絶対パスはそのまま、ルートからの相対も絶対パスにする。空・ネットワークの場所は None。
+    #[test]
+    fn sound_file_path_resolves_relative_names_to_exe_folder() {
+        let base = crate::storage::base_dir();
+        for relative in ["a.wav", r"sub\a.wav"] {
+            assert_eq!(sound_file_path(relative), Some(std::path::absolute(base.join(relative)).unwrap()), "{relative}");
+        }
+        let absolute = std::env::current_exe().unwrap().with_file_name("a.wav");
+        assert_eq!(sound_file_path(absolute.to_str().unwrap()), Some(absolute));
+        let root_relative = sound_file_path(r"\a.wav").expect("前提: 作業フォルダのドライブがローカル");
+        assert!(root_relative.is_absolute() && root_relative.ends_with("a.wav"), "{root_relative:?}");
+        for none in ["", r"\\server\share\a.wav", "//server/share/a.wav", r"\\?\UNC\server\share\a.wav"] {
+            assert_eq!(sound_file_path(none), None, "{none}");
         }
     }
 
@@ -2135,6 +2187,36 @@ pub(crate) mod tests {
         assert!(blob_path(&dir, &a).exists(), "残る履歴が参照する blob を消した");
         core.delete_history(b.id).unwrap();
         assert!(!blob_path(&dir, &a).exists(), "どこからも参照されない blob を残した");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 参照を集めるときにたどるピン留めのメタデータ（複製しない `pinned_meta_refs`）は、フォルダの中も含めて
+    /// `item_metas` と同じ項目を同じ並びで返す。
+    #[test]
+    fn pinned_meta_refs_match_item_metas_including_folders() {
+        let (dir, core) = temp_core(Config::default());
+        for text in ["一", "二", "三"] {
+            core.capture(text_entry(text)).unwrap();
+        }
+        core.create_folder(None, "フォルダ").unwrap();
+        let folder = core.read(|s| s.pinned.iter().find_map(|n| matches!(n, PinnedNode::Folder(_)).then(|| n.id()))).unwrap().unwrap();
+        core.create_folder(Some(folder), "中のフォルダ").unwrap();
+        let inner = core
+            .read(|s| store::find_folder(&s.pinned, folder).unwrap().children.iter().find_map(|n| matches!(n, PinnedNode::Folder(_)).then(|| n.id())))
+            .unwrap()
+            .unwrap();
+        let ids: Vec<Uuid> = core.read(|s| s.history.iter().map(|i| i.meta.id).collect()).unwrap();
+        core.pin(ids[0], None).unwrap();
+        core.pin(ids[1], Some(folder)).unwrap();
+        core.pin(ids[2], Some(inner)).unwrap();
+        core.read(|s| {
+            let mut refs = Vec::new();
+            pinned_meta_refs(&s.pinned, &mut refs);
+            let copied = item_metas(&s.pinned);
+            assert_eq!(refs.len(), 3);
+            assert_eq!(refs.iter().map(|m| m.id).collect::<Vec<_>>(), copied.iter().map(|m| m.id).collect::<Vec<_>>());
+        })
+        .unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
