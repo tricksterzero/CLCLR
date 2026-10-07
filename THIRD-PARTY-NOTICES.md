@@ -56,7 +56,7 @@ SOFTWARE.
 | toml_datetime | 1.1.1 | MIT OR Apache-2.0 | Copyright (c) Individual contributors | https://github.com/toml-rs/toml |
 | toml_parser | 1.1.3 | MIT OR Apache-2.0 | Copyright (c) Individual contributors | https://github.com/toml-rs/toml |
 | toml_writer | 1.1.2 | MIT OR Apache-2.0 | Copyright (c) Individual contributors | https://github.com/toml-rs/toml |
-| uuid | 1.26.1 | Apache-2.0 OR MIT | Copyright (c) 2014 The Rust Project Developers; Copyright (c) 2018 Ashley Mannix, Christopher Armstrong, Dylan DPC, Hunar Roop Kahlon | https://github.com/uuid-rs/uuid |
+| uuid | 1.27.0 | Apache-2.0 OR MIT | Copyright (c) 2014 The Rust Project Developers; Copyright (c) 2018 Ashley Mannix, Christopher Armstrong, Dylan DPC, Hunar Roop Kahlon | https://github.com/uuid-rs/uuid |
 | windows | 0.62.2 | MIT OR Apache-2.0 | Copyright (c) Microsoft Corporation. | https://github.com/microsoft/windows-rs |
 | windows-collections | 0.3.2 | MIT OR Apache-2.0 | Copyright (c) Microsoft Corporation. | https://github.com/microsoft/windows-rs |
 | windows-core | 0.62.2 | MIT OR Apache-2.0 | Copyright (c) Microsoft Corporation. | https://github.com/microsoft/windows-rs |
