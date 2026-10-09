@@ -1503,6 +1503,17 @@ mod tests {
     /// 遅延描画の持ち主が、ファイルの一覧を描くときにテキストを設定し直せたか。
     static DELAYED_RESET_OK: AtomicBool = AtomicBool::new(false);
 
+    /// 遅延描画で置くファイルの一覧（無いファイルを1つ指す、正しい形の DROPFILES。wide）。実際のクリップボードに
+    /// 置くので、ほかのアプリ（エクスプローラーなど）も読む。形が壊れていると、読んだ側が範囲の外を読んで落ちうる。
+    fn delayed_hdrop() -> Vec<u8> {
+        let mut data = vec![0u8; 20];
+        data[0..4].copy_from_slice(&20u32.to_le_bytes()); // pFiles（ヘッダの直後）
+        data[16..20].copy_from_slice(&1u32.to_le_bytes()); // fWide
+        data.extend(crate::data::utf16_bytes(r"C:\clclr-test-nonexistent\file.txt")); // NUL 終端まで
+        data.extend([0, 0]); // 一覧の終わり
+        data
+    }
+
     /// 遅延描画のコピー元（ほかのアプリの代わり）。別のスレッドの窓が持ち主になり、テキストとファイルの一覧を
     /// 遅延描画で置く。ファイルの一覧を描くときに、テキストも別の中身で設定し直す（GetClipboardData の文書が、
     /// 同じ形式の SetClipboardData の後は前に返したハンドルを使わないよう求める場面）。破棄で持ち主のスレッドを
@@ -1537,7 +1548,7 @@ mod tests {
                                 set(13, &crate::data::utf16_bytes(DELAYED_FIRST_TEXT));
                             }
                             15 => {
-                                set(15, &[1u8; 32]);
+                                set(15, &delayed_hdrop());
                                 if set(13, &crate::data::utf16_bytes(DELAYED_RESET_TEXT)) {
                                     DELAYED_RESET_OK.store(true, Ordering::SeqCst);
                                 }
@@ -2017,9 +2028,11 @@ mod tests {
         assert!(total > 64 && limit == 64, "{total} {limit}");
         assert!(o.entries.try_recv().is_err(), "上限を超えたコピーを取り込んだ");
 
-        // 取り込まない形式（CF_TEXT など、既定で無視する形式）は合計に数えない
-        set_clipboard(&port, &[text("テキスト"), Format { format_name: "CF_TEXT".to_string(), format_id: 1, data: vec![b'x'; 200] }])
-            .unwrap();
+        // 取り込まない形式（CF_TEXT など、既定で無視する形式）は合計に数えない。CF_TEXT もほかのアプリが読むので、
+        // NUL で終える（200 バイト）
+        let mut ansi = vec![b'x'; 199];
+        ansi.push(0);
+        set_clipboard(&port, &[text("テキスト"), Format { format_name: "CF_TEXT".to_string(), format_id: 1, data: ansi }]).unwrap();
         let copied = seq();
         assert_eq!(o.next_outcome(), Outcome::Captured { seq: copied });
         assert_eq!(entry_text(&o.entries.try_recv().unwrap()), "テキスト");
