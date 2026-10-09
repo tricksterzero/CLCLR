@@ -283,12 +283,13 @@ fn main() {
     let (hotkey_tx, hotkey_rx) = mpsc::channel();
     let app = Rc::new(App::new(Arc::clone(&config), core.clone(), tray_rx, hotkey_rx));
     App::bind_self(&app);
-    let viewer_size = {
-        let [w, h] = config.read().unwrap().general.viewer_size();
-        (w as u32, h as u32)
+    let (viewer_size, viewer_position) = {
+        let general = &config.read().unwrap().general;
+        let [w, h] = general.viewer_size();
+        ((w as u32, h as u32), general.viewer_position.map(|[x, y]| (x, y)))
     };
     let handler: Rc<dyn ViewerHandler> = app.clone();
-    let viewer = match ViewerWindow::create(APP_DISPLAY_NAME, viewer_size, handler) {
+    let viewer = match ViewerWindow::create(APP_DISPLAY_NAME, viewer_size, viewer_position, handler) {
         Ok(v) => v,
         Err(e) => {
             report_error(&format!("ビューアの窓を作れないため、終了します。\n\n{e}"));

@@ -104,6 +104,11 @@ pub struct GeneralConfig {
     /// 更新し、次回起動で復元する。最小化・最大化中の値は記録しない
     pub viewer_width: u32,
     pub viewer_height: u32,
+    /// ビューアの前回の位置（窓の左上。物理px の画面座標で、主モニターより左・上のモニターでは負になる）。
+    /// 大きさと同じく隠す時・終了時に更新し、次回起動で復元する（最小化・最大化中の位置は記録しない）。
+    /// 未保存なら `None`（鍵を書かない）で、位置は Windows に任せる。大きさと単位が違うのは、倍率の違う
+    /// モニターが並ぶと、96 DPI 基準の位置では場所が決まらないため
+    pub viewer_position: Option<[i32; 2]>,
     /// 設定画面の前回のサイズ（論理px）。今の設定画面は大きさが固定で使わないが、設定ファイルの互換のため、
     /// 名前・型・既定値は変えずに残す
     pub settings_width: u32,
@@ -437,6 +442,7 @@ impl Default for GeneralConfig {
             // ビューアのクライアント領域の既定の大きさ
             viewer_width: 900,
             viewer_height: 700,
+            viewer_position: None,
             // 設定画面の既定の大きさ（今の設定画面は使わない。設定ファイルの互換のため残す）
             settings_width: 600,
             settings_height: 640,
@@ -667,7 +673,9 @@ pub struct ConfigIssue {
 /// 触っていなければ残る。
 ///
 /// 3つとも `Config` から `toml::Value` にして比べる（`#[serde(default)]` の省略鍵も既定値が入るので、鍵は
-/// そろう）。表は鍵ごとに、それ以外（数値・文字・真偽・配列）は1つの値として比べる。配列
+/// そろう。例外は `None` で鍵を書かない `viewer_position` で、開いた後に初めて保存すると今の値にだけ鍵がある。
+/// 結果は今の値から始め、ドラフトにある鍵だけを合わせるので、その鍵は今の値が残る）。表は鍵ごとに、それ以外
+/// （数値・文字・真偽・配列）は1つの値として比べる。配列
 /// （`format_filters`・`window_filters`・`modifiers`）は丸ごと1つの値: これらを変える経路は設定画面だけ
 /// なので、行ごとに合わせる必要が無い。ほかの経路で配列を変えるようにするときは、合わせ方を見直す。
 pub fn merge_edit(base: &Config, draft: &Config, current: &Config) -> Result<Config, ConfigError> {
@@ -949,6 +957,21 @@ mod tests {
         assert_eq!(back.general.viewer_size(), [1024.0, 700.0]);
     }
 
+    /// 位置は未保存なら鍵を書かず、保存したら負の座標も含めて戻る。位置の保存を足す前の設定ファイルは未保存として読む。
+    #[test]
+    fn viewer_position_round_trips_through_toml() {
+        let text = toml::to_string(&Config::default()).unwrap();
+        assert!(!text.contains("viewer_position"), "未保存の位置を書いた: {text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap().general.viewer_position, None);
+        let old: Config = toml::from_str("[general]\nviewer_width = 800\n").unwrap();
+        assert_eq!(old.general.viewer_position, None);
+
+        let mut cfg = Config::default();
+        cfg.general.viewer_position = Some([-1920, -40]);
+        let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.general.viewer_position, Some([-1920, -40]));
+    }
+
     #[test]
     fn settings_size_defaults_and_round_trips() {
         assert_eq!(GeneralConfig::default().settings_size(), [600, 640]);
@@ -1227,6 +1250,7 @@ mod tests {
         let mut c = Config::default();
         c.general.clipboard_watch = false;
         c.general.viewer_width = 1234;
+        c.general.viewer_position = Some([-1500, 20]);
         c.general.notify_action_errors = false;
         c.history.max = 77;
         c.history.grouping.enabled = true;
@@ -1301,6 +1325,17 @@ mod tests {
         assert_eq!(merged.hotkey.popup_menu.modifiers, ["ctrl"]);
         assert_eq!(merged.general.clipboard_watch, current.general.clipboard_watch);
         assert_eq!(merged.general.viewer_width, 999);
+
+        // 開いたときに未保存だった位置（鍵が無い）を、開いている間に保存したときも、今の値が残る
+        let mut current3 = base.clone();
+        current3.general.viewer_position = Some([-100, 50]);
+        assert_eq!(merge_edit(&base, &draft, &current3).unwrap().general.viewer_position, Some([-100, 50]));
+        // 開いたときに保存済みで、開いている間に保存し直したときも、今の値
+        let mut base4 = base.clone();
+        base4.general.viewer_position = Some([10, 10]);
+        let mut current4 = base4.clone();
+        current4.general.viewer_position = Some([30, 40]);
+        assert_eq!(merge_edit(&base4, &base4, &current4).unwrap().general.viewer_position, Some([30, 40]));
 
         // 画面でも監視を変えていれば、画面の値を使う
         let mut draft2 = base.clone();

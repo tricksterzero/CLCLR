@@ -365,7 +365,7 @@ impl App {
         if let Some(hwnd) = hwnd {
             viewer::cancel_modal(hwnd);
             viewer::retry_modal_close(hwnd);
-            self.save_viewer_size(hwnd);
+            self.save_viewer_placement(hwnd);
         }
         let unshown: Vec<Notice> = {
             let mut notifier = self.notifier.borrow_mut();
@@ -647,27 +647,31 @@ impl App {
         self.save_config();
     }
 
-    /// ビューアの大きさ（最小化・最大化していないときのクライアント領域、96 DPI 基準）を、
-    /// 変わっていれば設定ファイルへ書く（隠すとき・終了時）。下限より小さい値は下限にする。
-    /// 共有の設定へは書けてから反映する（書けなかったときは、次に隠す・終了するときに書き直す）。
-    fn save_viewer_size(&self, hwnd: HWND) {
-        let Some((w, h)) = viewer::normal_size(hwnd) else {
+    /// ビューアの大きさ（最小化・最大化していないときのクライアント領域、96 DPI 基準）と位置（そのときの
+    /// 窓の左上、物理 px の画面座標）を、どちらかが変わっていれば設定ファイルへ書く（隠すとき・終了時）。
+    /// 下限より小さい大きさは下限にする。共有の設定へは書けてから反映する（書けなかったときは、次に
+    /// 隠す・終了するときに書き直す）。
+    fn save_viewer_placement(&self, hwnd: HWND) {
+        let (Some((w, h)), Some((x, y))) = (viewer::normal_size(hwnd), viewer::normal_position(hwnd)) else {
             return;
         };
         let size = (w.max(crate::config::VIEWER_MIN_WIDTH), h.max(crate::config::VIEWER_MIN_HEIGHT));
+        let position = Some([x, y]);
         let mut next = self.config.read().unwrap().clone();
-        if (next.general.viewer_width, next.general.viewer_height) == size {
+        if (next.general.viewer_width, next.general.viewer_height) == size && next.general.viewer_position == position {
             return;
         }
         next.general.viewer_width = size.0;
         next.general.viewer_height = size.1;
+        next.general.viewer_position = position;
         match next.save(&self.config_path) {
             Ok(()) => {
                 let mut cfg = self.config.write().unwrap();
                 cfg.general.viewer_width = size.0;
                 cfg.general.viewer_height = size.1;
+                cfg.general.viewer_position = position;
             }
-            Err(e) => eprintln!("ビューアの大きさの保存に失敗: {e}"),
+            Err(e) => eprintln!("ビューアの大きさと位置の保存に失敗: {e}"),
         }
     }
 
@@ -1179,7 +1183,7 @@ impl ViewerHandler for App {
         if let Some(window) = self.settings.borrow().as_ref() {
             window.hide();
         }
-        self.save_viewer_size(hwnd);
+        self.save_viewer_placement(hwnd);
         self.preview_id.set(None);
         viewer::set_preview_none(hwnd);
         if let Some(link) = self.search.borrow().as_ref() {
@@ -1382,9 +1386,10 @@ mod tests {
     }
 
     /// 最前面の切り替えは設定ファイルに書く。ビューアの大きさ（最小化・最大化していないときの
-    /// クライアント領域、96 DPI 基準）は、隠すときに変わっていれば書き、変わっていなければ書かない。
+    /// クライアント領域、96 DPI 基準）と位置（そのときの窓の左上）は、隠すときにどちらかが変わっていれば
+    /// 書き、どちらも変わっていなければ書かない。
     #[test]
-    fn topmost_and_viewer_size_are_saved_to_config_file() {
+    fn topmost_and_viewer_placement_are_saved_to_config_file() {
         use windows::Win32::Foundation::{LPARAM, WPARAM};
         use windows::Win32::UI::HiDpi::GetDpiForWindow;
         use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, SIZE_RESTORED, WM_SIZE};
@@ -1395,7 +1400,7 @@ mod tests {
         app.set_config_path(path.clone());
         let app = Rc::new(app);
         let handler: Rc<dyn ViewerHandler> = app.clone();
-        let window = viewer::ViewerWindow::create("CLCLR app size test", (640, 480), handler).unwrap();
+        let window = viewer::ViewerWindow::create("CLCLR app size test", (640, 480), None, handler).unwrap();
         let hwnd = window.hwnd();
 
         app.on_tool_command(hwnd, ToolCommand::ToggleTopmost);
@@ -1409,12 +1414,25 @@ mod tests {
         app.on_hidden(hwnd);
         let saved = Config::load(&path).unwrap().general;
         assert_eq!((saved.viewer_width, saved.viewer_height), (800, 600));
+        let (x, y) = viewer::normal_position(hwnd).unwrap();
+        assert_eq!(saved.viewer_position, Some([x, y]));
 
         std::fs::remove_file(&path).unwrap();
         app.on_hidden(hwnd);
-        assert!(!path.exists(), "大きさが変わっていないのに書いた");
+        assert!(!path.exists(), "大きさも位置も変わっていないのに書いた");
+
+        // 位置だけが変わったときも書く
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER};
+            let _ = SetWindowPos(hwnd, None, x + 15, y + 25, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        app.on_hidden(hwnd);
+        let saved = Config::load(&path).unwrap().general;
+        assert_eq!(saved.viewer_position, Some([x + 15, y + 25]));
+        assert_eq!((saved.viewer_width, saved.viewer_height), (800, 600));
 
         // 書けなかった（置き場所が同じ名前のフォルダでふさがっている）ときは、次に隠すときに書き直す
+        std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         unsafe {
             SendMessageW(hwnd, WM_SIZE, Some(WPARAM(SIZE_RESTORED as usize)), Some(LPARAM(px(650) << 16 | px(900))));
@@ -1484,7 +1502,7 @@ mod tests {
         }
         let app = Rc::new(test_app(&service));
         let handler: Rc<dyn ViewerHandler> = app.clone();
-        let window = viewer::ViewerWindow::create("CLCLR app test", (400, 300), handler).unwrap();
+        let window = viewer::ViewerWindow::create("CLCLR app test", (400, 300), None, handler).unwrap();
         let hwnd = window.hwnd();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (res_tx, res_rx) = std::sync::mpsc::channel();
@@ -2735,7 +2753,7 @@ mod tests {
         base.general.show_trayicon = false;
         let (dir, app, _rx, _sink) = settings_app(base.clone());
         let handler: Rc<dyn ViewerHandler> = app.clone();
-        let window = viewer::ViewerWindow::create("CLCLR apply test", (400, 300), handler).unwrap();
+        let window = viewer::ViewerWindow::create("CLCLR apply test", (400, 300), None, handler).unwrap();
         let hwnd = window.hwnd();
         let watcher = ClipboardWatcher::spawn(Arc::clone(&app.config), |_| {}, |_| {}).unwrap();
         app.set_parts(Parts { watcher, tray: None, hotkeys: None });
@@ -2789,7 +2807,7 @@ mod tests {
             base.general.show_trayicon = stage != "before_tray_create";
             let (dir, app, _rx, _sink) = settings_app(base.clone());
             let handler: Rc<dyn ViewerHandler> = app.clone();
-            let window = viewer::ViewerWindow::create("CLCLR apply exit test", (400, 300), handler).unwrap();
+            let window = viewer::ViewerWindow::create("CLCLR apply exit test", (400, 300), None, handler).unwrap();
             let hwnd = window.hwnd();
             let watcher = ClipboardWatcher::spawn(Arc::clone(&app.config), |_| {}, |_| {}).unwrap();
             let (tray_tx, _tray_rx) = mpsc::channel();
@@ -2877,7 +2895,7 @@ mod tests {
         let (dir, app, _rx, _sink) = settings_app(memory_only_config());
         App::bind_self(&app);
         let handler: Rc<dyn ViewerHandler> = app.clone();
-        let window = viewer::ViewerWindow::create("CLCLR settings test", (400, 300), handler).unwrap();
+        let window = viewer::ViewerWindow::create("CLCLR settings test", (400, 300), None, handler).unwrap();
         let hwnd = window.hwnd();
         app.on_open_settings(hwnd);
         let dialog = settings_hwnd(&app).expect("設定画面を開いていない");
@@ -2921,7 +2939,7 @@ mod tests {
             let (dir, app, _rx, _sink) = settings_app(base.clone());
             App::bind_self(&app);
             let handler: Rc<dyn ViewerHandler> = app.clone();
-            let window = viewer::ViewerWindow::create("CLCLR settings reentry test", (400, 300), handler).unwrap();
+            let window = viewer::ViewerWindow::create("CLCLR settings reentry test", (400, 300), None, handler).unwrap();
             let hwnd = window.hwnd();
             let watcher = ClipboardWatcher::spawn(Arc::clone(&app.config), |_| {}, |_| {}).unwrap();
             let (tray_tx, _tray_rx) = mpsc::channel();

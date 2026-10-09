@@ -55,6 +55,10 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::Controls::{ImageList_Create, ImageList_Destroy, HIMAGELIST, ILC_COLOR32, LVM_SETIMAGELIST, LVSIL_SMALL};
 use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER, WM_DPICHANGED, WM_ENDSESSION};
+use windows::Win32::UI::WindowsAndMessaging::{IsZoomed, WM_MOVE};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromRect, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_DELETE};
 use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
@@ -603,6 +607,9 @@ struct WindowCtx {
     /// 最小化・最大化していないときのクライアント領域の大きさ（96 DPI 基準の px）。隠すとき・終了時に
     /// 設定へ保存する（`normal_size`）
     normal_size: Cell<(u32, u32)>,
+    /// 最小化・最大化していないときの窓の左上（物理 px の画面座標。`GetWindowRect`）。隠すとき・終了時に
+    /// 設定へ保存する（`normal_position`）
+    normal_position: Cell<(i32, i32)>,
     /// ツリーの「履歴」の項目（件数の表示を書き換える。0 は無し）と、表示している件数
     history_item: Cell<isize>,
     history_count: Cell<usize>,
@@ -688,11 +695,25 @@ pub struct ViewerWindow {
 impl ViewerWindow {
     /// 非表示のビューア窓と子コントロールを作る。`logical_size` はクライアント領域の大きさ
     /// （96 DPI 基準の px。設定の `viewer_width`・`viewer_height` と同じく、枠とメニューバーを除いた大きさ）。
-    pub fn create(title: &str, logical_size: (u32, u32), handler: Rc<dyn ViewerHandler>) -> WinResult<Self> {
+    /// `position` は窓の左上（物理 px の画面座標。設定の `viewer_position`）。その位置の窓がどのモニターにも
+    /// 重ならなければ使わず、`None` と同じく Windows に任せる。重なれば、そのモニターの作業領域に収める
+    /// （`fit_to_work_area`）。
+    pub fn create(
+        title: &str,
+        logical_size: (u32, u32),
+        position: Option<(i32, i32)>,
+        handler: Rc<dyn ViewerHandler>,
+    ) -> WinResult<Self> {
         init_common_controls();
         register_class()?;
         let mut menu = create_menu_bar(unsafe { GetDpiForSystem() })?;
         let (width, height) = window_size_for_client(logical_size, unsafe { GetDpiForSystem() });
+        // 大きさは置く先のモニターの DPI で後から合わせ直すので、ここではシステムの DPI での大きさで判定する
+        let position = position.filter(|&(x, y)| {
+            let rc = RECT { left: x, top: y, right: x.saturating_add(width), bottom: y.saturating_add(height) };
+            !unsafe { MonitorFromRect(&rc, MONITOR_DEFAULTTONULL) }.is_invalid()
+        });
+        let (x, y) = position.unwrap_or((CW_USEDEFAULT, CW_USEDEFAULT));
         let title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
         let created = unsafe {
             CreateWindowExW(
@@ -700,8 +721,8 @@ impl ViewerWindow {
                 CLASS_NAME,
                 PCWSTR(title.as_ptr()),
                 VIEWER_STYLE,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
+                x,
+                y,
                 width,
                 height,
                 None,
@@ -746,6 +767,7 @@ impl ViewerWindow {
             open_folder: Cell::new(None),
             accel: create_accelerators(),
             normal_size: Cell::new(logical_size),
+            normal_position: Cell::new((0, 0)),
             history_item: Cell::new(0),
             history_count: Cell::new(0),
             tree_width: Cell::new(None),
@@ -788,6 +810,13 @@ impl ViewerWindow {
         let (width, height) = window_size_for_client(logical_size, unsafe { GetDpiForWindow(hwnd) });
         unsafe {
             let _ = SetWindowPos(hwnd, None, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        if position.is_some() {
+            fit_to_work_area(hwnd);
+        }
+        // Windows に任せた位置は作成中（コンテキストを置く前）に決まるので、ここで覚える
+        if let (Some(ctx), Some(origin)) = (unsafe { ctx_ref(hwnd) }, window_origin(hwnd)) {
+            ctx.normal_position.set(origin);
         }
         layout(hwnd);
         Ok(window)
@@ -994,6 +1023,11 @@ pub fn set_topmost(hwnd: HWND, on: bool) {
 /// 最小化・最大化していないときのクライアント領域の大きさ（96 DPI 基準の px）。
 pub fn normal_size(hwnd: HWND) -> Option<(u32, u32)> {
     unsafe { ctx_ref(hwnd) }.map(|ctx| ctx.normal_size.get())
+}
+
+/// 最小化・最大化していないときの窓の左上（物理 px の画面座標）。
+pub fn normal_position(hwnd: HWND) -> Option<(i32, i32)> {
+    unsafe { ctx_ref(hwnd) }.map(|ctx| ctx.normal_position.get())
 }
 
 /// ビューア窓（とその子コントロール）宛てのキー操作をアクセラレータ（Ctrl+F）で変換する。
@@ -1215,6 +1249,54 @@ fn window_size_for_client(logical: (u32, u32), dpi: u32) -> (i32, i32) {
         let _ = AdjustWindowRectExForDpi(&mut rc, VIEWER_STYLE, true, WINDOW_EX_STYLE::default(), dpi);
     }
     (rc.right - rc.left, rc.bottom - rc.top)
+}
+
+/// 窓の左上（物理 px の画面座標）。取れなければ `None`。
+fn window_origin(hwnd: HWND) -> Option<(i32, i32)> {
+    let mut rc = RECT::default();
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rc) }.ok()?;
+    Some((rc.left, rc.top))
+}
+
+/// 窓を、いちばん重なるモニターの作業領域（タスクバーなどを除いた範囲。タスクバーがどの辺にあっても
+/// `rcWork` の4辺で決まる）に収める。起動時に保存した位置へ置いたときだけ使う。
+fn fit_to_work_area(hwnd: HWND) {
+    let mut rc = RECT::default();
+    if unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rc) }.is_err() {
+        return;
+    }
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if !unsafe { GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info) }.as_bool() {
+        return;
+    }
+    let (frame_x, frame_bottom) = frame_thickness(unsafe { GetDpiForWindow(hwnd) });
+    let (x, y) = fit_into(rc, info.rcWork, frame_x, frame_bottom);
+    if (x, y) != (rc.left, rc.top) {
+        unsafe {
+            let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+}
+
+/// 窓の枠の太さ（左右の1辺と下。`dpi` の px）。
+fn frame_thickness(dpi: u32) -> (i32, i32) {
+    let mut rc = RECT::default();
+    unsafe {
+        let _ = AdjustWindowRectExForDpi(&mut rc, VIEWER_STYLE, false, WINDOW_EX_STYLE::default(), dpi);
+    }
+    (rc.right.max(0), rc.bottom.max(0))
+}
+
+/// `rc` を `work` に収めたときの左上。左右と下は枠の太さ（`frame_x`・`frame_bottom`）まではみ出してよい
+/// （画面の端に寄せた窓を、枠の分のはみ出しだけで起動のたびにずらさないため）。上ははみ出させない
+/// （タイトルバーをつかめるように）。作業領域より大きい向きは、左・上をそろえる。
+fn fit_into(rc: RECT, work: RECT, frame_x: i32, frame_bottom: i32) -> (i32, i32) {
+    let (width, height) = (rc.right - rc.left, rc.bottom - rc.top);
+    let (left, right) = (work.left - frame_x, work.right + frame_x);
+    let (top, bottom) = (work.top, work.bottom + frame_bottom);
+    let x = if width >= right - left { left } else { rc.left.clamp(left, right - width) };
+    let y = if height >= bottom - top { top } else { rc.top.clamp(top, bottom - height) };
+    (x, y)
 }
 
 /// px を 96 DPI 基準へ戻す（四捨五入）。
@@ -4041,6 +4123,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 layout(hwnd);
                 LRESULT(0)
             }
+            // 最小化・最大化していないときの位置だけを覚える（保存は隠すとき・終了時。最小化中は -32000 などが来る）
+            WM_MOVE => {
+                if let Some(ctx) = ctx_ref(hwnd) {
+                    if !IsIconic(hwnd).as_bool() && !IsZoomed(hwnd).as_bool() {
+                        if let Some(origin) = window_origin(hwnd) {
+                            ctx.normal_position.set(origin);
+                        }
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             // 境目（子コントロールの間のすき間。窓自身のクライアント領域）の上なら矢印のカーソルにする
             WM_SETCURSOR if HWND(wparam.0 as *mut _) == hwnd && (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
                 let mut pt = POINT::default();
@@ -4756,7 +4849,7 @@ mod tests {
     fn create_test_window() -> (ViewerWindow, Rc<Recorder>) {
         let recorder = Rc::new(Recorder::default());
         let handler: Rc<dyn ViewerHandler> = recorder.clone();
-        let window = ViewerWindow::create("CLCLR viewer test", (400, 300), handler).unwrap();
+        let window = ViewerWindow::create("CLCLR viewer test", (400, 300), None, handler).unwrap();
         (window, recorder)
     }
 
@@ -6024,7 +6117,7 @@ mod tests {
         let _gui = crate::tray::lock_gui_resource_tests();
         let recorder = Rc::new(Recorder::default());
         let handler: Rc<dyn ViewerHandler> = recorder.clone();
-        let window = ViewerWindow::create("CLCLR viewer size test", (640, 480), handler).unwrap();
+        let window = ViewerWindow::create("CLCLR viewer size test", (640, 480), None, handler).unwrap();
         let hwnd = window.hwnd();
         let dpi = unsafe { GetDpiForWindow(hwnd) };
         let mut rc = RECT::default();
@@ -6053,6 +6146,124 @@ mod tests {
             let _ = SetWindowPos(hwnd, None, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
         assert_eq!(normal_size(hwnd), Some((800, 600)));
+    }
+
+    /// 作業領域に収める計算。タスクバーが下・上・左・右のどこにあっても、作業領域の4辺で決まる。
+    /// 左右と下は枠の太さまではみ出してよく、上ははみ出させない。作業領域より大きい向きは左・上をそろえる。
+    #[test]
+    fn fit_into_keeps_window_inside_work_area_on_every_taskbar_edge() {
+        let rect = |x: i32, y: i32, w: i32, h: i32| RECT { left: x, top: y, right: x + w, bottom: y + h };
+        let screen = (1920, 1080);
+        // タスクバー（高さ・幅 48）が下・上・左・右にあるときの作業領域
+        let bottom = rect(0, 0, screen.0, screen.1 - 48);
+        let top = rect(0, 48, screen.0, screen.1 - 48);
+        let left = rect(48, 0, screen.0 - 48, screen.1);
+        let right = rect(0, 0, screen.0 - 48, screen.1);
+        let (frame_x, frame_bottom) = (8, 8);
+        for work in [bottom, top, left, right] {
+            // 中にあれば動かさない
+            assert_eq!(fit_into(rect(300, 200, 800, 600), work, frame_x, frame_bottom), (300, 200));
+            // 左上の外（タスクバーの上を含む）からは、作業領域の左上へ。左は枠の分まで、上ははみ出させない
+            assert_eq!(fit_into(rect(-500, -500, 800, 600), work, frame_x, frame_bottom), (work.left - frame_x, work.top));
+            // 右下の外からは、右・下の端へ（枠の分まではみ出してよい）
+            assert_eq!(
+                fit_into(rect(5000, 5000, 800, 600), work, frame_x, frame_bottom),
+                (work.right + frame_x - 800, work.bottom + frame_bottom - 600)
+            );
+        }
+        // 枠の分だけ外に出ている窓は動かさない
+        assert_eq!(fit_into(rect(-8, 0, 800, 1040), bottom, frame_x, frame_bottom), (-8, 0));
+        // 作業領域より大きい向きは左・上をそろえる
+        assert_eq!(fit_into(rect(100, 100, 3000, 2000), top, frame_x, frame_bottom), (-frame_x, 48));
+        // 負の座標のモニター（主モニターの左）でも同じ
+        let negative = rect(-1920, -200, 1920, 1032);
+        assert_eq!(fit_into(rect(-100, 100, 800, 600), negative, frame_x, frame_bottom), (-800 + frame_x, 100));
+    }
+
+    /// 主モニターの作業領域（テスト用）。
+    fn primary_work_area() -> RECT {
+        use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        unsafe {
+            assert!(GetMonitorInfoW(MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY), &mut info).as_bool());
+        }
+        info.rcWork
+    }
+
+    fn window_rect(hwnd: HWND) -> RECT {
+        let mut rc = RECT::default();
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rc) }.unwrap();
+        rc
+    }
+
+    /// 保存した位置に窓を作り、その位置を覚える。動かすと覚え直し、最大化・最小化中の位置は覚えない。
+    #[test]
+    fn create_at_saved_position_and_remember_normal_position() {
+        use windows::Win32::UI::WindowsAndMessaging::{GWL_STYLE, WS_MAXIMIZE};
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let work = primary_work_area();
+        let saved = (work.left + 40, work.top + 30);
+        let recorder = Rc::new(Recorder::default());
+        let handler: Rc<dyn ViewerHandler> = recorder.clone();
+        let window = ViewerWindow::create("CLCLR viewer position test", (400, 300), Some(saved), handler).unwrap();
+        let hwnd = window.hwnd();
+        let rc = window_rect(hwnd);
+        assert_eq!((rc.left, rc.top), saved);
+        assert_eq!(normal_position(hwnd), Some(saved));
+
+        let moved = (saved.0 + 10, saved.1 + 20);
+        unsafe {
+            let _ = SetWindowPos(hwnd, None, moved.0, moved.1, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        assert_eq!(normal_position(hwnd), Some(moved));
+
+        // 最大化中（スタイルだけ立てて表示はしない）に動いても覚えない
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style | WS_MAXIMIZE.0 as isize);
+            let _ = SetWindowPos(hwnd, None, saved.0, saved.1, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+        }
+        assert_eq!(normal_position(hwnd), Some(moved), "最大化中の位置を覚えた");
+    }
+
+    /// 保存した位置の窓がどのモニターにも重ならなければ（モニターを外したときなど）、その位置を使わない。
+    #[test]
+    fn create_ignores_position_off_every_monitor() {
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let recorder = Rc::new(Recorder::default());
+        let handler: Rc<dyn ViewerHandler> = recorder.clone();
+        let window = ViewerWindow::create("CLCLR viewer off-screen test", (400, 300), Some((100_000, 100_000)), handler).unwrap();
+        let hwnd = window.hwnd();
+        let rc = window_rect(hwnd);
+        assert!(!unsafe { MonitorFromRect(&rc, MONITOR_DEFAULTTONULL) }.is_invalid(), "画面の外に作った: {rc:?}");
+        assert_eq!(normal_position(hwnd), Some((rc.left, rc.top)));
+    }
+
+    /// 保存した位置の窓が作業領域から一部はみ出していれば、いちばん重なるモニターの作業領域に収める。
+    #[test]
+    fn create_fits_partly_outside_position_into_work_area() {
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let work = primary_work_area();
+        // 主モニターの作業領域の右下の角に、窓の大部分がはみ出す位置
+        let saved = (work.right - 100, work.bottom - 50);
+        let recorder = Rc::new(Recorder::default());
+        let handler: Rc<dyn ViewerHandler> = recorder.clone();
+        let window = ViewerWindow::create("CLCLR viewer fit test", (400, 300), Some(saved), handler).unwrap();
+        let hwnd = window.hwnd();
+        let rc = window_rect(hwnd);
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        unsafe {
+            assert!(GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).as_bool());
+        }
+        let (frame_x, frame_bottom) = frame_thickness(unsafe { GetDpiForWindow(hwnd) });
+        let w = info.rcWork;
+        assert_ne!((rc.left, rc.top), saved, "動かしていない");
+        assert!(
+            rc.left >= w.left - frame_x && rc.right <= w.right + frame_x && rc.top >= w.top && rc.bottom <= w.bottom + frame_bottom,
+            "作業領域 {w:?} に収まっていない: {rc:?}"
+        );
+        assert_eq!(normal_position(hwnd), Some((rc.left, rc.top)));
     }
 
     /// ツリーの「履歴」は件数を添えて表示し、件数だけが変わったときは項目の表示名だけを
