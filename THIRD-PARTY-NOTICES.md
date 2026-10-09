@@ -70,7 +70,7 @@ SOFTWARE.
 
 ## 4. Rust の標準ライブラリ
 
-`CLCLR.exe` には Rust の標準ライブラリ（Rust 1.98.1）が組み込まれています。標準ライブラリは MIT OR Apache-2.0（Copyright: The Rust Project Developers。https://github.com/rust-lang/rust ）で、MIT ライセンスで利用しています。ただし、次の部分は別のライセンスです（Rust のツールチェーンに付く `share/doc/rust/COPYRIGHT-library.html` の記載による。標準ライブラリを作るのに使われた外部のクレートの表示も、このファイルにあります）。
+`CLCLR.exe` には Rust の標準ライブラリ（Rust 1.99.0）が組み込まれています。標準ライブラリは MIT OR Apache-2.0（Copyright: The Rust Project Developers。https://github.com/rust-lang/rust ）で、MIT ライセンスで利用しています。ただし、次の部分は別のライセンスです（Rust のツールチェーンに付く `share/doc/rust/COPYRIGHT-library.html` の記載による。標準ライブラリを作るのに使われた外部のクレートの表示も、このファイルにあります）。
 
 - `library/core/src/unicode`（Unicode の文字の性質のデータ）: Unicode-3.0。Copyright 1991-2024 Unicode, Inc. 許諾の表示は次のとおりです
 
