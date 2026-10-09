@@ -905,10 +905,19 @@ impl Drop for ViewerWindow {
 }
 
 /// 窓を表示して前面へ出す（最小化中なら元に戻す）。キーボードのフォーカスは一覧に置く。
+/// 作業領域からはみ出していれば、起動時と同じく収める（`fit_to_work_area`。動作中にタイトルバーを
+/// タスクバーの下や画面の外へ動かしてつかめなくなっても、出し直せば戻るように）。最大化中は動かさない。
 pub fn show(hwnd: HWND) {
     unsafe {
-        let cmd = if IsIconic(hwnd).as_bool() { SW_RESTORE } else { SW_SHOW };
-        let _ = ShowWindow(hwnd, cmd);
+        let iconic = IsIconic(hwnd).as_bool();
+        // 最小化中は、元に戻した後の位置で収める（最小化中の窓の矩形は、元に戻したときの位置ではない）
+        if !iconic && !IsZoomed(hwnd).as_bool() {
+            fit_to_work_area(hwnd);
+        }
+        let _ = ShowWindow(hwnd, if iconic { SW_RESTORE } else { SW_SHOW });
+        if iconic && !IsZoomed(hwnd).as_bool() {
+            fit_to_work_area(hwnd);
+        }
         let _ = SetForegroundWindow(hwnd);
     }
     focus_list(hwnd);
@@ -1259,7 +1268,8 @@ fn window_origin(hwnd: HWND) -> Option<(i32, i32)> {
 }
 
 /// 窓を、いちばん重なるモニターの作業領域（タスクバーなどを除いた範囲。タスクバーがどの辺にあっても
-/// `rcWork` の4辺で決まる）に収める。起動時に保存した位置へ置いたときだけ使う。
+/// `rcWork` の4辺で決まる）に収める。起動時に保存した位置へ置いたときと、表示するとき（`show`）に使う。
+/// 中に収まっていれば動かさない。
 fn fit_to_work_area(hwnd: HWND) {
     let mut rc = RECT::default();
     if unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rc) }.is_err() {
@@ -6225,6 +6235,40 @@ mod tests {
             SetWindowLongPtrW(hwnd, GWL_STYLE, style);
         }
         assert_eq!(normal_position(hwnd), Some(moved), "最大化中の位置を覚えた");
+    }
+
+    /// 表示するとき、作業領域からはみ出していれば収める（動作中にタイトルバーをつかめない所へ動かしても、
+    /// 出し直せば戻る）。収まっていれば動かさない。
+    #[test]
+    fn show_fits_window_moved_outside_work_area() {
+        let _gui = crate::tray::lock_gui_resource_tests();
+        let work = primary_work_area();
+        let inside = (work.left + 40, work.top + 30);
+        let recorder = Rc::new(Recorder::default());
+        let handler: Rc<dyn ViewerHandler> = recorder.clone();
+        let window = ViewerWindow::create("CLCLR viewer show fit test", (400, 300), Some(inside), handler).unwrap();
+        let hwnd = window.hwnd();
+
+        show(hwnd);
+        let rc = window_rect(hwnd);
+        assert_eq!((rc.left, rc.top), inside, "収まっている窓を動かした");
+        hide(hwnd);
+
+        // 作業領域の左端から大きくはみ出させる（左にタスクバーがあってその下へ動かした場合と同じ形）
+        let outside = (work.left - 300, work.top + 30);
+        unsafe {
+            let _ = SetWindowPos(hwnd, None, outside.0, outside.1, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        show(hwnd);
+        let rc = window_rect(hwnd);
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        unsafe {
+            assert!(GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).as_bool());
+        }
+        let (frame_x, _) = frame_thickness(unsafe { GetDpiForWindow(hwnd) });
+        assert!(rc.left >= info.rcWork.left - frame_x, "作業領域 {:?} の外のまま: {rc:?}", info.rcWork);
+        assert_eq!(normal_position(hwnd), Some((rc.left, rc.top)));
+        hide(hwnd);
     }
 
     /// 保存した位置の窓がどのモニターにも重ならなければ（モニターを外したときなど）、その位置を使わない。
