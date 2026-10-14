@@ -51,12 +51,12 @@ SOFTWARE.
 | quick-error | 2.0.1 | MIT OR Apache-2.0 | Copyright (c) 2015 The quick-error Developers | https://github.com/tailhook/quick-error |
 | serde | 1.0.229 | MIT OR Apache-2.0 | （LICENSE-MIT に著作権者の記載なし） | https://github.com/serde-rs/serde |
 | serde_core | 1.0.229 | MIT OR Apache-2.0 | （LICENSE-MIT に著作権者の記載なし） | https://github.com/serde-rs/serde |
-| serde_spanned | 1.1.1 | MIT OR Apache-2.0 | Copyright (c) Individual contributors | https://github.com/toml-rs/toml |
-| toml | 1.1.6 | MIT OR Apache-2.0 | Copyright (c) Individual contributors | https://github.com/toml-rs/toml |
-| toml_datetime | 1.1.1 | MIT OR Apache-2.0 | Copyright (c) Individual contributors | https://github.com/toml-rs/toml |
-| toml_parser | 1.1.3 | MIT OR Apache-2.0 | Copyright (c) Individual contributors | https://github.com/toml-rs/toml |
-| toml_writer | 1.1.2 | MIT OR Apache-2.0 | Copyright (c) Individual contributors | https://github.com/toml-rs/toml |
-| uuid | 1.27.0 | Apache-2.0 OR MIT | Copyright (c) 2014 The Rust Project Developers; Copyright (c) 2018 Ashley Mannix, Christopher Armstrong, Dylan DPC, Hunar Roop Kahlon | https://github.com/uuid-rs/uuid |
+| serde_spanned | 1.1.2 | MIT OR Apache-2.0 | Copyright (c) Individual contributors | https://github.com/toml-rs/toml |
+| toml | 1.1.8 | MIT OR Apache-2.0 | Copyright (c) Individual contributors | https://github.com/toml-rs/toml |
+| toml_datetime | 1.1.2 | MIT OR Apache-2.0 | Copyright (c) Individual contributors | https://github.com/toml-rs/toml |
+| toml_parser | 1.1.5 | MIT OR Apache-2.0 | Copyright (c) Individual contributors | https://github.com/toml-rs/toml |
+| toml_writer | 1.1.3 | MIT OR Apache-2.0 | Copyright (c) Individual contributors | https://github.com/toml-rs/toml |
+| uuid | 1.28.0 | Apache-2.0 OR MIT | Copyright (c) 2014 The Rust Project Developers; Copyright (c) 2018 Ashley Mannix, Christopher Armstrong, Dylan DPC, Hunar Roop Kahlon | https://github.com/uuid-rs/uuid |
 | windows | 0.62.2 | MIT OR Apache-2.0 | Copyright (c) Microsoft Corporation. | https://github.com/microsoft/windows-rs |
 | windows-collections | 0.3.2 | MIT OR Apache-2.0 | Copyright (c) Microsoft Corporation. | https://github.com/microsoft/windows-rs |
 | windows-core | 0.62.2 | MIT OR Apache-2.0 | Copyright (c) Microsoft Corporation. | https://github.com/microsoft/windows-rs |
