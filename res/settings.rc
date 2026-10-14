@@ -22,11 +22,11 @@ EXSTYLE WS_EX_CONTROLPARENT
 FONT 9, "Yu Gothic UI", 400, 0, 0x80
 BEGIN
     AUTOCHECKBOX "クリップボードを監視する(&W)", IDC_GEN_WATCH, 7, 7, 266, 10, WS_TABSTOP
-    AUTOCHECKBOX "トレイアイコンを表示する(&T)", IDC_GEN_TRAY, 7, 22, 266, 10, WS_TABSTOP
-    AUTOCHECKBOX "起動時にビューアを表示しない（トレイ常駐で開始）(&H)", IDC_GEN_START_HIDDEN, 7, 37, 266, 10, WS_TABSTOP
-    LTEXT "（次の起動から有効）", -1, 19, 49, 254, 8
-    AUTOCHECKBOX "起動時にクリップボードを同期する(&S)", IDC_GEN_SYNC, 7, 64, 266, 10, WS_TABSTOP
-    LTEXT "（空なら最新の履歴を戻し、データがあれば取り込む）", -1, 19, 76, 254, 8
+    AUTOCHECKBOX "起動時にクリップボードを同期する(&S)", IDC_GEN_SYNC, 7, 22, 266, 10, WS_TABSTOP
+    LTEXT "（空なら最新の履歴を戻し、データがあれば取り込む）", -1, 19, 34, 254, 8
+    AUTOCHECKBOX "トレイアイコンを表示する(&T)", IDC_GEN_TRAY, 7, 49, 266, 10, WS_TABSTOP
+    AUTOCHECKBOX "起動時にビューアを表示しない（トレイ常駐で開始）(&H)", IDC_GEN_START_HIDDEN, 7, 64, 266, 10, WS_TABSTOP
+    LTEXT "（次の起動から有効）", -1, 19, 76, 254, 8
     AUTOCHECKBOX "ビューアの操作の失敗を知らせる(&N)", IDC_GEN_NOTIFY, 7, 91, 266, 10, WS_TABSTOP
     AUTOCHECKBOX "起動時に保存先のフォルダの権限を確かめる(&P)", IDC_GEN_FOLDER_CHECK, 7, 106, 266, 10, WS_TABSTOP
     LTEXT "（ほかのアカウントから履歴を読み書きできそうなら知らせる。次の起動から有効）", -1, 19, 118, 254, 8
@@ -54,14 +54,14 @@ BEGIN
     EDITTEXT IDC_HIS_FORMAT, 126, 81, 80, 12, ES_AUTOHSCROLL | WS_TABSTOP
     LTEXT "（%1=先頭番号、%2=末尾番号）", -1, 126, 95, 147, 8
     LTEXT "", IDC_HIS_TOTAL, 19, 107, 254, 8
-    LTEXT "重複チェック(&D)", -1, 7, 124, 116, 8
-    COMBOBOX IDC_HIS_OVERLAP, 126, 122, 100, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT "追加までの遅延（ミリ秒）(&Y)", -1, 7, 140, 116, 8
-    EDITTEXT IDC_HIS_INTERVAL, 126, 138, 50, 12, ES_NUMBER | WS_TABSTOP
+    AUTOCHECKBOX "終了時に履歴を保存する(&X)", IDC_HIS_SAVE_EXIT, 7, 122, 130, 10, WS_TABSTOP
+    AUTOCHECKBOX "変更の都度履歴を保存する(&C)", IDC_HIS_SAVE_CHANGE, 140, 122, 133, 10, WS_TABSTOP
+    LTEXT "（両方オフで完全メモリモード。保存の有無の切り替えは次の起動から有効）", -1, 19, 134, 254, 8
+    LTEXT "重複チェック(&D)", -1, 7, 151, 116, 8
+    COMBOBOX IDC_HIS_OVERLAP, 126, 149, 100, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT "追加までの遅延（ミリ秒）(&Y)", -1, 7, 167, 116, 8
+    EDITTEXT IDC_HIS_INTERVAL, 126, 165, 50, 12, ES_NUMBER | WS_TABSTOP
     CONTROL "", IDC_HIS_INTERVAL_SPIN, "msctls_updown32", UDS_SETBUDDYINT | UDS_NOTHOUSANDS | UDS_ALIGNRIGHT | UDS_AUTOBUDDY | UDS_ARROWKEYS, 0, 0, 0, 0
-    AUTOCHECKBOX "終了時に履歴を保存する(&X)", IDC_HIS_SAVE_EXIT, 7, 155, 130, 10, WS_TABSTOP
-    AUTOCHECKBOX "変更の都度履歴を保存する(&C)", IDC_HIS_SAVE_CHANGE, 140, 155, 133, 10, WS_TABSTOP
-    LTEXT "（両方オフで完全メモリモード。保存の有無の切り替えは次の起動から有効）", -1, 19, 167, 254, 8
     AUTOCHECKBOX "アイテム送出によるクリップボード変更を履歴に加えない(&E)", IDC_HIS_DELETE_ON_SEND, 7, 182, 266, 10, WS_TABSTOP
     AUTOCHECKBOX "履歴に追加された時に音を鳴らす(&U)", IDC_HIS_SOUND, 7, 197, 266, 10, WS_TABSTOP
     LTEXT "WAVファイル（空欄はシステム音）(&A)", -1, 19, 213, 116, 8
