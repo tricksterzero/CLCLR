@@ -707,7 +707,9 @@ fn append_menu_row(menu: &mut PopupMenu, target: HMENU, i: usize, ordinal: usize
 
 /// メニューを出す位置。`use_caret` が偽（トレイのクリック）ならマウスの位置、真なら設定の
 /// `menu_position` に従い、キャレットが取れなければマウスの位置。UI Automation の問い合わせは、
-/// 応答しないアプリでは打ち切りまで（`uia_caret::QUERY_WAIT`）このスレッドを止める。
+/// 応答しないアプリでは `uia_caret::QUERY_WAIT` までこのスレッドを止める。UI Automation はその時点で
+/// フォーカスのある要素を見るので、問い合わせの間に前面の窓が `focus` で記録したもの（選んだ後に貼り付ける先）
+/// から替わっていれば、その位置は使わない。
 fn menu_point(ctx: &HotkeyContext, config: &Config, focus: &FocusInfo, use_caret: bool) -> (i32, i32) {
     if !use_caret {
         return cursor_pos();
@@ -716,7 +718,8 @@ fn menu_point(ctx: &HotkeyContext, config: &Config, focus: &FocusInfo, use_caret
         MenuPosition::Mouse => None,
         MenuPosition::Caret => focus.caret_pos,
         MenuPosition::CaretUia => focus.caret_pos.or_else(|| {
-            ctx.uia.get_or_init(UiaCaret::spawn).as_ref()?.query(uia_caret::QUERY_WAIT)
+            let point = ctx.uia.get_or_init(UiaCaret::spawn).as_ref()?.query(uia_caret::QUERY_WAIT)?;
+            focus.is_foreground().then_some(point)
         }),
     };
     caret.unwrap_or_else(cursor_pos)

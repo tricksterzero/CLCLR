@@ -1758,10 +1758,11 @@ mod tests {
     #[test]
     fn load_then_read_round_trips() {
         let _gui = crate::tray::lock_gui_resource_tests();
-        // フィルタが空・リストにない形式の両方の値も
+        // フィルタが空・リストにない形式の両方の値も。メニューを出す位置は、既定・unusual と合わせて3つとも通す
         let mut empty = Config::default();
         empty.format_filters.clear();
         empty.window_filters.clear();
+        empty.hotkey.menu_position = MenuPosition::Caret;
         let mut empty_add = empty.clone();
         empty_add.format_filter_default = FilterAction::Add;
         for base in [Config::default(), unusual(), empty, empty_add] {

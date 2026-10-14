@@ -36,6 +36,15 @@ impl FocusInfo {
     pub fn has_target(&self) -> bool {
         self.active_wnd != 0
     }
+
+    /// 今の前面の窓が、記録した窓のままか。
+    pub fn is_foreground(&self) -> bool {
+        self.matches_window(unsafe { GetForegroundWindow() }.0 as isize)
+    }
+
+    fn matches_window(&self, hwnd: isize) -> bool {
+        hwnd == self.active_wnd
+    }
 }
 
 /// 座標が仮想スクリーン（全モニタを包含する矩形）内にあるかを判定する。
@@ -247,7 +256,7 @@ pub fn send_paste(fi: &FocusInfo) -> Result<(), PasteSkipped> {
     if !wait_modifiers_released() {
         return Err(PasteSkipped::ModifiersHeld);
     }
-    if unsafe { GetForegroundWindow() }.0 as isize != fi.active_wnd {
+    if !fi.is_foreground() {
         return Err(PasteSkipped::ForegroundChanged);
     }
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
@@ -356,6 +365,16 @@ mod tests {
     fn send_paste_skips_when_foreground_is_not_the_restored_window() {
         let fi = FocusInfo { active_wnd: 0x7FFF_0000, focus_wnd: 0x7FFF_0000, caret_pos: None };
         assert_eq!(send_paste(&fi), Err(PasteSkipped::ForegroundChanged));
+    }
+
+    /// 前面の窓が記録した窓なら真、違えば偽（メニューの位置に UI Automation の結果を使うかの判定と、
+    /// 自動貼り付けの前の確かめが使う `is_foreground` の比べ方）。実際の前面の窓は変わりうるので、比べる部分を見る。
+    #[test]
+    fn matches_window_compares_with_recorded_window() {
+        let fi = FocusInfo { active_wnd: 0x1234, focus_wnd: 0x5678, caret_pos: None };
+        assert!(fi.matches_window(0x1234));
+        assert!(!fi.matches_window(0x5678), "フォーカスの窓と比べた");
+        assert!(!fi.matches_window(0));
     }
 
     /// キャレットを持たないスレッドに対しては`None`を返すこと。テスト実行スレッド
