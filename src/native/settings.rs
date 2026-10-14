@@ -35,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{
-    Config, ConfigIssue, DoublePressAction, FilterAction, FormatFilter, OverlapCheck, WindowFilter,
+    Config, ConfigIssue, DoublePressAction, FilterAction, FormatFilter, MenuPosition, OverlapCheck, WindowFilter,
 };
 use crate::native::app::ApplyError;
 
@@ -179,6 +179,11 @@ const DOUBLE_PRESSES: [(DoublePressAction, &str); 5] = [
     (DoublePressAction::MenuPinned, "メニュー表示（ピン留めのみ）"),
     (DoublePressAction::MenuHistory, "メニュー表示（履歴のみ）"),
     (DoublePressAction::Viewer, "ビューア表示"),
+];
+const MENU_POSITIONS: [(MenuPosition, &str); 3] = [
+    (MenuPosition::CaretUia, "入力位置（より多くのアプリで探す）"),
+    (MenuPosition::Caret, "入力位置（従来の方法）"),
+    (MenuPosition::Mouse, "マウスの位置"),
 ];
 /// ホットキーの修飾キー（設定の文字と、チェックボックス）。読み戻すときはこの順。
 const MODIFIERS: [(&str, i32); 4] = [("ctrl", IDC_HK_CTRL), ("shift", IDC_HK_SHIFT), ("alt", IDC_HK_ALT), ("win", IDC_HK_WIN)];
@@ -644,6 +649,8 @@ fn load(ctx: &Ctx) {
     set_text(hotkey, IDC_HK_KEY, &k.popup_menu.key);
     set_check(hotkey, IDC_HK_AUTOPASTE, k.auto_paste);
     set_check(hotkey, IDC_HK_PINNED_FIRST, k.menu_pinned_first);
+    let position = MENU_POSITIONS.iter().position(|(v, _)| *v == k.menu_position).unwrap_or(0);
+    fill_combo(hotkey, IDC_HK_MENU_POS, &MENU_POSITIONS.map(|(_, l)| l), position);
     set_check(hotkey, IDC_HK_TOOLTIP, k.tooltip.enabled);
     for (id, value) in [(IDC_HK_DP_CTRL, k.double_press_ctrl), (IDC_HK_DP_SHIFT, k.double_press_shift), (IDC_HK_DP_ALT, k.double_press_alt)] {
         let index = DOUBLE_PRESSES.iter().position(|(v, _)| *v == value).unwrap_or(0);
@@ -1017,6 +1024,7 @@ fn read_draft(pages: &[HWND], base: &Config, formats: &[FormatRow], windows: &[W
     c.hotkey.popup_menu.key = get_text(hotkey, IDC_HK_KEY);
     c.hotkey.auto_paste = get_check(hotkey, IDC_HK_AUTOPASTE);
     c.hotkey.menu_pinned_first = get_check(hotkey, IDC_HK_PINNED_FIRST);
+    c.hotkey.menu_position = MENU_POSITIONS[combo_index(hotkey, IDC_HK_MENU_POS).min(MENU_POSITIONS.len() - 1)].0;
     c.hotkey.tooltip.enabled = get_check(hotkey, IDC_HK_TOOLTIP);
     let dp = |id| DOUBLE_PRESSES[combo_index(hotkey, id).min(DOUBLE_PRESSES.len() - 1)].0;
     c.hotkey.double_press_ctrl = dp(IDC_HK_DP_CTRL);
@@ -1669,6 +1677,7 @@ mod tests {
         c.hotkey.auto_paste = false;
         c.hotkey.menu_max_items = 9;
         c.hotkey.menu_pinned_first = true;
+        c.hotkey.menu_position = MenuPosition::Mouse;
         c.hotkey.tooltip.delay_ms = 0;
         c.hotkey.tooltip.max_chars = 99_999;
         c.hotkey.tooltip.max_lines = 3;

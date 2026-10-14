@@ -11,7 +11,7 @@
 //! ペースト送出（Ctrl+V）の間はホットキーを一時解除する（貼り付け先アプリの
 //! ショートカットと衝突しないため。C版と同じ手順）。
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, RwLock};
@@ -41,7 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::clipboard::ClipboardPort;
-use crate::config::{Config, DoublePressAction, Hotkey};
+use crate::config::{Config, DoublePressAction, Hotkey, MenuPosition};
 use crate::data::EntryKind;
 use crate::icons;
 use crate::menu_draw::{self, escape_menu_text, MenuImage, PopupMenu};
@@ -50,6 +50,7 @@ use crate::ops::Core;
 use crate::paste::{capture_focus, cursor_pos, restore_focus, FocusInfo};
 use crate::storage::EntryMeta;
 use crate::store::{self, PinnedNode};
+use crate::uia_caret::{self, UiaCaret};
 
 // --- Public events ---
 
@@ -147,6 +148,8 @@ struct HotkeyContext {
     reregister_pending: Cell<u64>,
     /// ポップアップ処理中に届いた終了依頼（処理後に`DestroyWindow`）
     shutdown_pending: Cell<bool>,
+    /// UI Automation でキャレットの位置を取るスレッド（初めて要るときに作る。作れなければ `None` のまま）
+    uia: OnceCell<Option<UiaCaret>>,
 }
 
 /// `GWLP_USERDATA`のコンテキストを共有参照で取り出す。窓の破棄後（null）は`None`。
@@ -702,10 +705,27 @@ fn append_menu_row(menu: &mut PopupMenu, target: HMENU, i: usize, ordinal: usize
     menu.append_command(target, i + 1, &label, MENU_ITEM_FLAGS(0), Some(image));
 }
 
+/// メニューを出す位置。`use_caret` が偽（トレイのクリック）ならマウスの位置、真なら設定の
+/// `menu_position` に従い、キャレットが取れなければマウスの位置。UI Automation の問い合わせは、
+/// 応答しないアプリでは打ち切りまで（`uia_caret::QUERY_WAIT`）このスレッドを止める。
+fn menu_point(ctx: &HotkeyContext, config: &Config, focus: &FocusInfo, use_caret: bool) -> (i32, i32) {
+    if !use_caret {
+        return cursor_pos();
+    }
+    let caret = match config.hotkey.menu_position {
+        MenuPosition::Mouse => None,
+        MenuPosition::Caret => focus.caret_pos,
+        MenuPosition::CaretUia => focus.caret_pos.or_else(|| {
+            ctx.uia.get_or_init(UiaCaret::spawn).as_ref()?.query(uia_caret::QUERY_WAIT)
+        }),
+    };
+    caret.unwrap_or_else(cursor_pos)
+}
+
 /// ポップアップメニューを表示し、選択されたらUIへイベントを送る。
 /// このスレッド上でモーダルに動く（TrackPopupMenuが自前でメッセージを回す）。
-/// `use_caret`: ホットキー経由（テキスト入力中に開くことが多い）は`true`でキャレット
-/// 位置を優先。トレイアイコンのクリック経由は`false`でマウス位置に固定する
+/// `use_caret`: ホットキー・二度押し経由（テキスト入力中に開くことが多い）は`true`で、設定に
+/// 従ってキャレット位置を優先。トレイアイコンのクリック経由は`false`でマウス位置に固定する
 /// （たまたま裏で編集中のウィンドウがあっても、クリックしたトレイの近くに出すのが自然）。
 fn show_popup_menu(hwnd: HWND, ctx: &HotkeyContext, use_caret: bool, content: MenuContent) {
     // 処理中フラグ（メニュー表示から送出の完了まで）。この間に届いた終了・再登録の依頼は
@@ -725,13 +745,8 @@ fn show_popup_menu(hwnd: HWND, ctx: &HotkeyContext, use_caret: bool, content: Me
     };
     load_menu_thumbnails(&mut layout, &ctx.core.storage());
 
-    // キャレット位置（取れなければ、またはuse_caret=falseならマウス位置）に表示する。
-    // 行のサムネイルの大きさを、その位置のモニターの DPI に合わせるため、先に決める
-    let (x, y) = if use_caret {
-        focus.caret_pos.unwrap_or_else(cursor_pos)
-    } else {
-        cursor_pos()
-    };
+    // 行のサムネイルの大きさを、表示する位置のモニターの DPI に合わせるため、位置を先に決める
+    let (x, y) = menu_point(ctx, &config, &focus, use_caret);
     // メニュー全体（子メニューを含む）を、表示する位置のモニターの DPI で描く
     let dpi = menu_tooltip::dpi_at_point(x, y);
     let thumb_size = menu_tooltip::scale_for_dpi(MENU_THUMB_SIZE as i32, dpi) as u32;
@@ -1112,6 +1127,7 @@ impl Hotkeys {
                         dp_last_up: Cell::new(0),
                         reregister_pending: Cell::new(0),
                         shutdown_pending: Cell::new(false),
+                        uia: OnceCell::new(),
                     }));
                     // メッセージ専用窓（HWND_MESSAGE）ではなく通常の非表示トップレベル窓に
                     // する。TrackPopupMenuのオーナーはフォアグラウンド化できる実ウィンドウで

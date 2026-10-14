@@ -157,6 +157,8 @@ pub struct HotkeyConfig {
     /// ポップアップメニューで「ピン留め(&P)」の子メニューを履歴より上に出す（既定は履歴が上。
     /// 履歴とピン留めの両方を出すメニューだけに効く。ユーザー要望 2026-09-26）
     pub menu_pinned_first: bool,
+    /// ホットキーと二度押しで出すメニューの位置（トレイのメニューは、つねにマウスの位置）
+    pub menu_position: MenuPosition,
     /// 修飾キー二度押し（Ctrl×2等）のアクション。既定はすべて無効（C版準拠）。
     /// いずれかが有効な間だけ低レベルキーフック（WH_KEYBOARD_LL）を張る
     pub double_press_ctrl: DoublePressAction,
@@ -190,6 +192,19 @@ impl Default for MenuTooltipConfig {
             max_lines: 20,
         }
     }
+}
+
+/// メニューを出す位置。キャレットが取れないときは、どれもマウスの位置に出す。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MenuPosition {
+    /// Win32 のキャレット、取れなければ UI Automation のキャレット（既定）
+    #[default]
+    CaretUia,
+    /// Win32 のキャレットだけ（1.3.0 までの動き）
+    Caret,
+    /// つねにマウスの位置
+    Mouse,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +259,7 @@ impl Default for HotkeyConfig {
             auto_paste: true,
             menu_max_items: 20,
             menu_pinned_first: false,
+            menu_position: MenuPosition::default(),
             double_press_ctrl: DoublePressAction::None,
             double_press_shift: DoublePressAction::None,
             double_press_alt: DoublePressAction::None,
@@ -909,6 +925,23 @@ mod tests {
         assert!(cfg.hotkey.menu_pinned_first);
         let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
         assert!(back.hotkey.menu_pinned_first);
+    }
+
+    /// メニューを出す位置: 既定は UI Automation も使う。項目の無い以前の設定ファイルも既定で読め、
+    /// 設定ファイルでの名前で書いて読み戻すと同じ値になる。
+    #[test]
+    fn menu_position_defaults_to_caret_uia_and_round_trips() {
+        assert_eq!(Config::default().hotkey.menu_position, MenuPosition::CaretUia);
+        let cfg: Config = toml::from_str("[hotkey]\nmenu_max_items = 7\n").unwrap();
+        assert_eq!(cfg.hotkey.menu_position, MenuPosition::CaretUia);
+        for (value, name) in [(MenuPosition::CaretUia, "caret_uia"), (MenuPosition::Caret, "caret"), (MenuPosition::Mouse, "mouse")] {
+            let mut cfg = Config::default();
+            cfg.hotkey.menu_position = value;
+            let text = toml::to_string(&cfg).unwrap();
+            assert!(text.contains(&format!("menu_position = \"{name}\"")), "{text}");
+            let back: Config = toml::from_str(&text).unwrap();
+            assert_eq!(back.hotkey.menu_position, value);
+        }
     }
 
     #[test]

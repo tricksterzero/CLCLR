@@ -21,6 +21,7 @@ mod storage;
 mod store;
 mod tools;
 mod tray;
+mod uia_caret;
 mod ui_thread;
 
 use std::rc::Rc;

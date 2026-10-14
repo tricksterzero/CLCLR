@@ -64,6 +64,7 @@
 #define IDC_HK_DP_SHIFT     1317
 #define IDC_HK_DP_ALT       1318
 #define IDC_HK_PINNED_FIRST 1319
+#define IDC_HK_MENU_POS     1320
 
 // テキスト変換
 #define IDC_TX_QUOTE        1400

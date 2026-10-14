@@ -70,9 +70,8 @@ fn caret_client_pos_is_plausible(pt: POINT) -> bool {
 ///
 /// なお、Electron/Chromium・WPF・WinUI3等の自前描画キャレットを使うアプリ（新しいWin11
 /// メモ帳を含む）はWin32のシステムキャレットを一切公開しないため、この2段構えでも
-/// キャレット位置は取得できずマウス位置にフォールバックする。これはC版CLCLでも同様
-/// （`get_focus_info`は同じWin32 APIしか使っていない）で、Win32レベルでの解消は
-/// UI Automationへの移行が必要な別範囲の話になる。
+/// キャレット位置は取得できない。C版CLCLも同様（`get_focus_info`は同じWin32 APIしか使っていない）。
+/// こうしたアプリでは、設定によって UI Automation で探す（`uia_caret`。呼ぶのは`hotkey::menu_point`）。
 fn caret_screen_pos(target_thread: u32, focus_wnd: HWND) -> Option<(i32, i32)> {
     unsafe {
         let mut info = GUITHREADINFO {
