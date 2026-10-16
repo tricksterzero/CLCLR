@@ -4,7 +4,7 @@
 
 ## ソースからのビルド
 
-Rust（edition 2024 に対応した版。開発では 1.99.0 を使っています）と、MSVC のツールチェーン（Visual Studio の C++ ビルドツールと Windows SDK。exe のリソースのコンパイルに使います）が要ります。
+Rust（edition 2024 に対応した版。開発では 1.99.1 を使っています）と、MSVC のツールチェーン（Visual Studio の C++ ビルドツールと Windows SDK。exe のリソースのコンパイルに使います）が要ります。
 
 ```powershell
 cargo build --release   # target\release\CLCLR.exe ができる
