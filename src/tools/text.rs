@@ -177,19 +177,27 @@ pub fn convert_date(text: &str, date_format: &str, time_format: &str) -> String 
 /// ピン留めアイテムの送出前処理: 設定が有効ならテキスト中の %d/%t を日時に
 /// 変換した複製を返す（C版 CLCL の tool_text の日時変換。定型文テンプレート用途）。
 /// メニュー送出（hotkey.rs）とビューア送出（native/actions.rs）で共用する。
+///
+/// 置き換えたときは CF_UNICODETEXT だけを残す。ほかの形式（形式フィルタで足した HTML Format・
+/// Rich Text Format など）は置き換えられないため、残すと貼り付け先がそちらを選び、%d/%t のままの
+/// 内容が貼られる。置き換えるものが無ければ、全形式をそのまま返す。
 pub fn convert_entry_date(mut entry: crate::data::Entry, cfg: &TextToolsConfig) -> crate::data::Entry {
     if !cfg.convert_date_on_send {
         return entry;
     }
+    let mut replaced = false;
     for fmt in &mut entry.formats {
         if fmt.format_name == "CF_UNICODETEXT" {
-            let converted = convert_date(
-                &crate::data::utf16_text(&fmt.data),
-                &cfg.date_format,
-                &cfg.time_format,
-            );
-            fmt.data = crate::data::utf16_bytes(&converted);
+            let text = crate::data::utf16_text(&fmt.data);
+            let converted = convert_date(&text, &cfg.date_format, &cfg.time_format);
+            if converted != text {
+                fmt.data = crate::data::utf16_bytes(&converted);
+                replaced = true;
+            }
         }
+    }
+    if replaced {
+        entry.formats.retain(|fmt| fmt.format_name == "CF_UNICODETEXT");
     }
     entry
 }
@@ -349,6 +357,44 @@ mod tests {
         let converted = convert_entry_date(entry, &c);
         // CF_UNICODETEXTではないため変換対象にならず、バイト列はそのまま
         assert_eq!(converted.formats[0].data, b"C:\\a.txt");
+    }
+
+    fn html_format(html: &str) -> crate::data::Format {
+        crate::data::Format { format_name: "HTML Format".to_string(), format_id: 0xC0FF, data: html.as_bytes().to_vec() }
+    }
+
+    fn format_names(entry: &crate::data::Entry) -> Vec<&str> {
+        entry.formats.iter().map(|f| f.format_name.as_str()).collect()
+    }
+
+    #[test]
+    fn convert_entry_date_keeps_only_text_when_replaced() {
+        let mut c = cfg();
+        c.convert_date_on_send = true;
+        let entry = crate::data::Entry::new(vec![html_format("<b>%d</b>"), unicodetext_format("日付:%d")]);
+        let converted = convert_entry_date(entry, &c);
+        // 置き換えられない HTML Format は外し、置き換えたテキストだけを送る
+        assert_eq!(format_names(&converted), ["CF_UNICODETEXT"]);
+        assert!(!crate::data::utf16_text(&converted.formats[0].data).contains("%d"));
+    }
+
+    #[test]
+    fn convert_entry_date_keeps_all_formats_without_placeholders() {
+        let mut c = cfg();
+        c.convert_date_on_send = true;
+        let entry = crate::data::Entry::new(vec![html_format("<b>固定</b>"), unicodetext_format("固定")]);
+        let converted = convert_entry_date(entry, &c);
+        assert_eq!(format_names(&converted), ["HTML Format", "CF_UNICODETEXT"]);
+        assert_eq!(converted.formats[0].data, "<b>固定</b>".as_bytes());
+    }
+
+    #[test]
+    fn convert_entry_date_keeps_all_formats_when_disabled() {
+        let mut c = cfg();
+        c.convert_date_on_send = false;
+        let entry = crate::data::Entry::new(vec![html_format("<b>%d</b>"), unicodetext_format("%d")]);
+        let converted = convert_entry_date(entry, &c);
+        assert_eq!(format_names(&converted), ["HTML Format", "CF_UNICODETEXT"]);
     }
 
     #[test]

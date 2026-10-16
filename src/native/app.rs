@@ -1289,6 +1289,7 @@ impl ViewerHandler for App {
             RowCommand::Reorder(_) | RowCommand::Place { .. } | RowCommand::Move(_) => return,
             _ if folder => return,
             RowCommand::Send => Action::Send { id, pinned },
+            RowCommand::SendTextOnly => Action::SendTextOnly { id, pinned },
             RowCommand::Pin(_) if pinned => return,
             RowCommand::Pin(to) => Action::Pin { id, to },
             RowCommand::OpenImage => Action::OpenImage { id, pinned },
@@ -1714,6 +1715,7 @@ mod tests {
         app.on_row_command(hwnd, history_row, RowCommand::Move(Some(folder)));
         app.on_row_command(hwnd, history_row, RowCommand::OpenImage);
         app.on_row_command(hwnd, history_row, RowCommand::Transform(TextTransform::ToUpper));
+        app.on_row_command(hwnd, history_row, RowCommand::SendTextOnly);
         app.source.set(Source::History);
         app.on_row_command(hwnd, pinned_row, RowCommand::Pin(None));
         app.on_row_command(hwnd, pinned_row, RowCommand::Move(Some(folder)));
@@ -1733,6 +1735,7 @@ mod tests {
                 Action::Pin { id, to: Some(folder) },
                 Action::OpenImage { id, pinned: false },
                 Action::Transform { id, pinned: false, transform: TextTransform::ToUpper },
+                Action::SendTextOnly { id, pinned: false },
                 Action::MovePinned { id, to: Some(folder), before: None },
                 Action::MovePinned { id, to: None, before: None },
                 Action::OpenImageLocation { id, pinned: true },
@@ -1801,6 +1804,7 @@ mod tests {
             can_pin,
             has_image,
             has_text,
+            can_send_text_only: false,
             pin_targets: root_only.clone(),
             current,
             reorder,
@@ -1808,6 +1812,13 @@ mod tests {
         };
         assert_eq!(app.row_menu(history(text_id)), Some(expect(true, false, true, None, None)));
         assert_eq!(app.row_menu(history(image_id)), Some(expect(true, true, false, None, None)));
+        // テキストとほかの形式があるときだけ「テキストだけで送る」を出す
+        let mut both = text_entry("文と絵");
+        both.formats.extend(dib_entry().formats);
+        core.capture(both).unwrap();
+        let both_id = crate::ops::tests::front_id(&core);
+        let both_menu = RowMenu { can_send_text_only: true, ..expect(true, true, true, None, None) };
+        assert_eq!(app.row_menu(history(both_id)), Some(both_menu));
         core.pin(text_id, None).unwrap();
         let pinned_id = crate::ops::tests::pinned_item(&core, 0).id;
         let alone = Some(Reorder { up: false, down: false });

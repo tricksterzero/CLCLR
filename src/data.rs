@@ -70,6 +70,16 @@ impl Entry {
         }
         hash
     }
+
+    /// CF_UNICODETEXT だけを残す（「テキストだけで送る」。ビューアの右クリックとホットキーのメニューで共用）。
+    /// テキストが無ければ何も変えず false（呼び出し側が、送らないか全形式で送るかを決める）。
+    pub fn retain_text_only(&mut self) -> bool {
+        if !self.formats.iter().any(|f| f.format_name == "CF_UNICODETEXT") {
+            return false;
+        }
+        self.formats.retain(|f| f.format_name == "CF_UNICODETEXT");
+        true
+    }
 }
 
 /// エントリのデータ種別（種別アイコンの選択に使う。ビューアの一覧とホットキーのメニューで共用）。
@@ -210,5 +220,16 @@ mod tests {
         assert_eq!(a.content_hash(), b.content_hash());
         assert_ne!(a.content_hash(), c.content_hash());
         assert_ne!(a.content_hash(), d.content_hash());
+    }
+
+    #[test]
+    fn retain_text_only_keeps_text_or_leaves_entry_without_text() {
+        let mut both = Entry::new(vec![fmt("HTML Format", b"<b>x</b>"), fmt("CF_UNICODETEXT", b"x"), fmt("CF_DIB", b"d")]);
+        assert!(both.retain_text_only());
+        let names: Vec<&str> = both.formats.iter().map(|f| f.format_name.as_str()).collect();
+        assert_eq!(names, ["CF_UNICODETEXT"]);
+        let mut image = Entry::new(vec![fmt("CF_DIB", b"d")]);
+        assert!(!image.retain_text_only());
+        assert_eq!(image.formats.len(), 1, "テキストの無い項目の形式を消した");
     }
 }

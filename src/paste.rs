@@ -299,6 +299,12 @@ pub fn shift_held() -> bool {
     unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000 != 0 }
 }
 
+/// Ctrlキーが押されているか（メニュー選択時にCtrl押下ならテキストだけで送る。Ctrl を押したままの Enter・クリックでは
+/// 選べるが、Ctrl を押したままのアクセスキー（数字）では、自前描画のメニューは項目を選ばない）。
+pub fn ctrl_held() -> bool {
+    unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 != 0 }
+}
+
 /// Ctrl/Shift/Alt が全て離されるまで待つ（最大2秒でタイムアウト）。離されたら true、時間切れなら false。
 fn wait_modifiers_released() -> bool {
     for _ in 0..100 {

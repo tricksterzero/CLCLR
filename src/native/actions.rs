@@ -55,6 +55,8 @@ const MAX_SHELL_LAUNCHES: usize = 4;
 pub enum Action {
     /// クリップボードへ送る（貼り付けはしない）
     Send { id: Uuid, pinned: bool },
+    /// `Send` と同じく送るが、CF_UNICODETEXT だけを書く（書式付きの形式などを落とす）
+    SendTextOnly { id: Uuid, pinned: bool },
     /// CF_UNICODETEXT に変換を当てた結果を、新しいテキストとしてクリップボードへ書く
     Transform { id: Uuid, pinned: bool, transform: TextTransform },
     /// 画像を一時フォルダへ書き出し（WebP で保存してあればそのまま、ほかは BMP）、関連付けで開く
@@ -172,7 +174,7 @@ impl ActionKind {
 impl Action {
     fn kind(&self) -> ActionKind {
         match self {
-            Self::Send { .. } => ActionKind::Send,
+            Self::Send { .. } | Self::SendTextOnly { .. } => ActionKind::Send,
             Self::Transform { .. } => ActionKind::Transform,
             Self::OpenImage { .. } => ActionKind::OpenImage,
             Self::OpenImageLocation { .. } => ActionKind::OpenImageLocation,
@@ -678,7 +680,8 @@ impl<E: Effects> Worker<E> {
     fn handle(&self, action: Action) {
         let kind = action.kind();
         let result = match action {
-            Action::Send { id, pinned } => self.send(id, pinned),
+            Action::Send { id, pinned } => self.send(id, pinned, false),
+            Action::SendTextOnly { id, pinned } => self.send(id, pinned, true),
             Action::Transform { id, pinned, transform } => self.transform(id, pinned, transform),
             Action::OpenImage { id, pinned } => self.export_image(id, pinned, ShellAction::Open),
             Action::OpenImageLocation { id, pinned } => self.export_image(id, pinned, ShellAction::Reveal),
@@ -703,10 +706,14 @@ impl<E: Effects> Worker<E> {
     }
 
     /// 送る: ピン留めなら日付の変換を通し、`delete_on_send` なら自分の
-    /// 書き込みを履歴に積まない。
-    fn send(&self, id: Uuid, pinned: bool) -> Result<(), Stop> {
+    /// 書き込みを履歴に積まない。`text_only` なら CF_UNICODETEXT だけを書く（テキストが無ければ何もしない。
+    /// 何も書かずに送ると、クリップボードを空にしてしまう）。
+    fn send(&self, id: Uuid, pinned: bool, text_only: bool) -> Result<(), Stop> {
         let ticket = self.core.admit()?;
-        let entry = self.core.load_for_send_admitted(&ticket, id, pinned)?;
+        let mut entry = self.core.load_for_send_admitted(&ticket, id, pinned)?;
+        if text_only && !entry.retain_text_only() {
+            return Ok(());
+        }
         let (delete_on_send, text_cfg) = {
             let cfg = self.config.read().unwrap_or_else(|p| p.into_inner());
             (cfg.history.delete_on_send, cfg.tools.text.clone())
@@ -1158,6 +1165,44 @@ mod tests {
         };
         assert_eq!(text_of(off), "日付 %d");
         let text = text_of(on);
+        assert!(text.starts_with("日付 ") && !text.contains("%d"), "{text}");
+    }
+
+    /// テキストだけで送る: CF_UNICODETEXT のほかの形式（ここでは画像）を落とし、送ると同じく抑止の設定に従う。
+    /// テキストの無い項目では何も書かない（空のクリップボードにしない）。
+    #[test]
+    fn send_text_only_drops_other_formats_and_skips_items_without_text() {
+        let h = Harness::new(Fake::default());
+        let mut entry = text_entry("文と絵");
+        entry.formats.extend(dib_entry().formats);
+        h.core.capture(entry).unwrap();
+        h.handle(Action::SendTextOnly { id: front_id(&h.core), pinned: false });
+        h.core.capture(dib_entry()).unwrap();
+        h.handle(Action::SendTextOnly { id: front_id(&h.core), pinned: false });
+        let calls = h.fake.calls();
+        let [Call::Send { formats, should_suppress }] = calls.as_slice() else {
+            panic!("{calls:?}");
+        };
+        let names: Vec<&str> = formats.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["CF_UNICODETEXT"]);
+        assert_eq!(text_of(formats), "文と絵");
+        assert!(*should_suppress);
+        assert!(h.failures().is_empty());
+    }
+
+    /// テキストだけで送るときも、ピン留めなら日付を変換する。
+    #[test]
+    fn send_text_only_from_pinned_converts_date() {
+        let h = Harness::new(Fake::default());
+        h.core.capture(text_entry("日付 %d")).unwrap();
+        h.core.pin(front_id(&h.core), None).unwrap();
+        let id = pinned_item(&h.core, 0).id;
+        let mut enabled = Config::default();
+        enabled.tools.text.convert_date_on_send = true;
+        h.worker_with(enabled).handle(Action::SendTextOnly { id, pinned: true });
+        let calls = h.fake.calls();
+        let [Call::Send { formats, .. }] = calls.as_slice() else { panic!("{calls:?}") };
+        let text = text_of(formats);
         assert!(text.starts_with("日付 ") && !text.contains("%d"), "{text}");
     }
 

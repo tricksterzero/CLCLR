@@ -40,6 +40,9 @@ pub struct RowMenu {
     pub has_image: bool,
     /// 「テキスト変換」の子メニュー（CF_UNICODETEXT があるときだけ）
     pub has_text: bool,
+    /// 「テキストだけで送る」（CF_UNICODETEXT と、ほかの形式もあるときだけ。テキストだけなら「クリップボードへ
+    /// 送る」と同じになるため）
+    pub can_send_text_only: bool,
     /// ピン留めの入れる先（`pin_targets`。先頭はルート）。フォルダがあれば「ピン留めに追加」を入れる先を
     /// 選ぶ子メニューにし、ピン留めの行には「移動」の子メニューを出す（フォルダの行は、自分とその中を除く。
     /// `pin_targets_except`）
@@ -104,13 +107,18 @@ impl RowMenu {
     /// 形式名の一覧から作る（入れる先は空。呼び出し側が `pin_targets`・`current` を入れる）。
     pub fn from_formats<'a>(names: impl IntoIterator<Item = &'a str>, can_pin: bool) -> Self {
         let mut menu = Self { can_pin, ..Self::default() };
+        let mut has_other = false;
         for name in names {
             match name {
-                "CF_DIB" => menu.has_image = true,
+                "CF_DIB" => {
+                    menu.has_image = true;
+                    has_other = true;
+                }
                 "CF_UNICODETEXT" => menu.has_text = true,
-                _ => {}
+                _ => has_other = true,
             }
         }
+        menu.can_send_text_only = menu.has_text && has_other;
         menu
     }
 }
@@ -131,6 +139,8 @@ pub enum RowCommand {
     /// 項目を送る。フォルダの行では開く（ビューアがツリーでそのフォルダを選ぶので、`on_row_command` には
     /// 来ない）
     Send,
+    /// 項目の CF_UNICODETEXT だけを送る（書式付きの形式などを落とす）
+    SendTextOnly,
     /// 履歴の行をピン留めへ（内の値は入れる先。None はルート）
     Pin(Option<Uuid>),
     /// ピン留めの行（項目・フォルダ）を、入れる先（None はルート）の末尾へ移す（右クリックの「移動」）

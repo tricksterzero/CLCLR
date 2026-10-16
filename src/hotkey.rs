@@ -792,6 +792,8 @@ fn show_popup_menu(hwnd: HWND, ctx: &HotkeyContext, use_caret: bool, content: Me
                 None,
             )
         };
+        // Ctrl を押したまま選んだらテキストだけで送る（選んだ直後に読む。Shift は送出の後で読む）
+        let text_only = crate::paste::ctrl_held();
         menu_tooltip::end_session();
         let _ = PostMessageW(Some(hwnd), 0, WPARAM(0), LPARAM(0)); // WM_NULL
         // メニュー（子メニューごと）を破棄してから、項目の描画の材料（サムネイル・フォント）を解放する
@@ -806,7 +808,7 @@ fn show_popup_menu(hwnd: HWND, ctx: &HotkeyContext, use_caret: bool, content: Me
             .checked_sub(1)
             .and_then(|i| layout.rows.get(i));
         match picked {
-            Some(row) => send_pick(hwnd, ctx, row.id, row.pinned, &focus),
+            Some(row) => send_pick(hwnd, ctx, row.id, row.pinned, text_only, &focus),
             // キャンセル時は元ウィンドウへフォーカスを返すだけ（C版準拠）。戻り値（復帰成否）は
             // 後続処理が無いため使わない
             None => {
@@ -822,7 +824,8 @@ fn show_popup_menu(hwnd: HWND, ctx: &HotkeyContext, use_caret: bool, content: Me
 /// フォーカス復帰の`SetForegroundWindow`は、フォアグラウンド（メニューのオーナー窓）を所有する
 /// このスレッドから呼ばないと効かない（別のスレッドから呼ぶと成功を返しつつ実際には
 /// 切り替わらず、Ctrl+Vが自分の隠し窓に消えることを実機で確認）。
-fn send_pick(hwnd: HWND, ctx: &HotkeyContext, id: Uuid, pinned: bool, focus: &FocusInfo) {
+/// `text_only`（Ctrl を押したまま選んだ）なら CF_UNICODETEXT だけを送る（`entry_for_send`）。
+fn send_pick(hwnd: HWND, ctx: &HotkeyContext, id: Uuid, pinned: bool, text_only: bool, focus: &FocusInfo) {
     // 読み込みは受け付け・操作用のロックの下で、サービスのロックの外で行う（取り込みの変換中は
     // 待つことがあるが、このスレッドなのでビューアのメインスレッドは止まらない）。受け付けで
     // 覆うのは読み込みと、後のクリップボードへの書き込み（フォーカスの復帰・貼り付けまで延ばすと、
@@ -841,11 +844,7 @@ fn send_pick(hwnd: HWND, ctx: &HotkeyContext, id: Uuid, pinned: bool, focus: &Fo
         let cfg = ctx.config.read().unwrap();
         (cfg.history.delete_on_send, cfg.hotkey.auto_paste, cfg.tools.text.clone())
     };
-    let entry = if pinned {
-        crate::tools::text::convert_entry_date(entry, &text_cfg)
-    } else {
-        entry
-    };
+    let entry = entry_for_send(entry, pinned, text_only, &text_cfg);
 
     // フォーカス復帰の成否はauto_paste実行の可否判定に使う（クリップボードへの書き込み
     // 自体は復帰の成否と無関係に行うため、ここでは早期returnしない）
@@ -886,6 +885,20 @@ fn send_pick(hwnd: HWND, ctx: &HotkeyContext, id: Uuid, pinned: bool, focus: &Fo
         }
     }
     (ctx.repaint)();
+}
+
+/// メニューで選んだ項目の、送る形式。`text_only` なら CF_UNICODETEXT だけにする（テキストの無い項目は、
+/// 全形式のまま送る。Ctrl を押していても、貼り付けたいものは送る）。ピン留めなら日時の置き換えを通す。
+fn entry_for_send(
+    mut entry: crate::data::Entry,
+    pinned: bool,
+    text_only: bool,
+    text_cfg: &crate::config::TextToolsConfig,
+) -> crate::data::Entry {
+    if text_only {
+        entry.retain_text_only();
+    }
+    if pinned { crate::tools::text::convert_entry_date(entry, text_cfg) } else { entry }
 }
 
 /// 登録できなかったときは、その説明を返す。
@@ -1859,5 +1872,27 @@ mod tests {
             drop(thread);
             assert!(started.elapsed() < Duration::from_secs(2), "フックのスレッドがすぐに止まらなかった");
         }
+    }
+
+    /// メニューで選んだ項目の送る形式: Ctrl（`text_only`）ならテキストだけ、テキストの無い項目は全形式のまま。
+    /// ピン留めは、テキストだけにしても日時を置き換える。
+    #[test]
+    fn entry_for_send_keeps_text_only_when_asked() {
+        use crate::data::{utf16_bytes, utf16_text, Entry, Format};
+        let format = |name: &str, data: Vec<u8>| Format { format_name: name.to_string(), format_id: 0, data };
+        let names = |entry: &Entry| entry.formats.iter().map(|f| f.format_name.clone()).collect::<Vec<_>>();
+        let both = || Entry::new(vec![format("HTML Format", b"<b>%d</b>".to_vec()), format("CF_UNICODETEXT", utf16_bytes("%d"))]);
+        let mut cfg = crate::config::TextToolsConfig::default();
+        cfg.convert_date_on_send = false;
+
+        assert_eq!(names(&entry_for_send(both(), false, false, &cfg)), ["HTML Format", "CF_UNICODETEXT"]);
+        assert_eq!(names(&entry_for_send(both(), false, true, &cfg)), ["CF_UNICODETEXT"]);
+        let image = Entry::new(vec![format("CF_DIB", vec![1, 2, 3])]);
+        assert_eq!(names(&entry_for_send(image, false, true, &cfg)), ["CF_DIB"], "テキストの無い項目の形式を落とした");
+
+        cfg.convert_date_on_send = true;
+        let pinned = entry_for_send(both(), true, true, &cfg);
+        assert_eq!(names(&pinned), ["CF_UNICODETEXT"]);
+        assert!(!utf16_text(&pinned.formats[0].data).contains("%d"));
     }
 }

@@ -3788,6 +3788,7 @@ const MENU_RENAME: usize = 5;
 const MENU_OPEN_IMAGE_LOCATION: usize = 6;
 const MENU_MOVE_UP: usize = 7;
 const MENU_MOVE_DOWN: usize = 8;
+const MENU_SEND_TEXT_ONLY: usize = 9;
 const MENU_TRANSFORM_BASE: usize = 100;
 const MENU_TARGET_BASE: usize = 1000;
 /// `TrackPopupMenu` が返すコマンド ID は 16 ビットに収める
@@ -3839,6 +3840,9 @@ fn build_row_menu(spec: &RowMenu, dpi: u32) -> WinResult<PopupMenu> {
         return Ok(menu);
     }
     menu.append_command(root, MENU_SEND, "クリップボードへ送る", MF_STRING, None);
+    if spec.can_send_text_only {
+        menu.append_command(root, MENU_SEND_TEXT_ONLY, "テキストだけで送る", MF_STRING, None);
+    }
     if spec.can_pin {
         if has_folders {
             if let Some(sub) = menu.add_submenu("ピン留めに追加", None) {
@@ -3875,6 +3879,7 @@ fn build_row_menu(spec: &RowMenu, dpi: u32) -> WinResult<PopupMenu> {
 fn row_command(id: usize, spec: &RowMenu) -> Option<RowCommand> {
     match id {
         MENU_SEND => Some(RowCommand::Send),
+        MENU_SEND_TEXT_ONLY if spec.can_send_text_only => Some(RowCommand::SendTextOnly),
         MENU_PIN => Some(RowCommand::Pin(None)),
         MENU_OPEN_IMAGE => Some(RowCommand::OpenImage),
         MENU_OPEN_IMAGE_LOCATION => Some(RowCommand::OpenImageLocation),
@@ -5711,16 +5716,26 @@ mod tests {
         let _gui = crate::tray::lock_gui_resource_tests();
         use windows::Win32::UI::WindowsAndMessaging::{GetMenuItemCount, GetSubMenu};
         let minimal = build_row_menu(&RowMenu { can_pin: false, has_image: false, has_text: false, ..RowMenu::default() }, 96).unwrap();
-        let full = build_row_menu(&RowMenu { can_pin: true, has_image: true, has_text: true, ..RowMenu::default() }, 96).unwrap();
+        let full = build_row_menu(
+            &RowMenu { can_pin: true, has_image: true, has_text: true, can_send_text_only: true, ..RowMenu::default() },
+            96,
+        )
+        .unwrap();
         unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::GetMenuItemID;
             assert_eq!(GetMenuItemCount(Some(minimal.handle())), 2, "送る・削除だけのはず");
-            // 送る・ピン留めに追加・画像を関連付けで開く・画像を書き出してフォルダで表示・テキスト変換・削除
-            assert_eq!(GetMenuItemCount(Some(full.handle())), 6);
-            let sub = GetSubMenu(full.handle(), 4);
+            // 送る・テキストだけで送る・ピン留めに追加・画像を関連付けで開く・画像を書き出してフォルダで表示・テキスト変換・削除
+            assert_eq!(GetMenuItemCount(Some(full.handle())), 7);
+            assert_eq!(GetMenuItemID(full.handle(), 1), MENU_SEND_TEXT_ONLY as u32, "送るのすぐ下のはず");
+            let sub = GetSubMenu(full.handle(), 5);
             assert_eq!(GetMenuItemCount(Some(sub)), TextTransform::ALL.len() as i32);
         }
         let spec = RowMenu::default();
         assert_eq!(row_command(MENU_SEND, &spec), Some(RowCommand::Send));
+        // 「テキストだけで送る」は、それを出したメニューだけ
+        assert_eq!(row_command(MENU_SEND_TEXT_ONLY, &spec), None);
+        let text_only = RowMenu { has_text: true, can_send_text_only: true, ..RowMenu::default() };
+        assert_eq!(row_command(MENU_SEND_TEXT_ONLY, &text_only), Some(RowCommand::SendTextOnly));
         assert_eq!(row_command(MENU_PIN, &spec), Some(RowCommand::Pin(None)));
         assert_eq!(row_command(MENU_OPEN_IMAGE, &spec), Some(RowCommand::OpenImage));
         assert_eq!(row_command(MENU_OPEN_IMAGE_LOCATION, &spec), Some(RowCommand::OpenImageLocation));
