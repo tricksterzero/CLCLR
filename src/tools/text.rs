@@ -65,13 +65,14 @@ impl TextTransform {
     }
 }
 
-/// 全角の英数字・記号（U+FF01〜U+FF5E）と全角スペース（U+3000）を半角（ASCII）に、全角の円記号（U+FFE5）を
+/// 全角の英数字・記号（U+FF01〜U+FF5D）と全角スペース（U+3000）を半角（ASCII）に、全角の円記号（U+FFE5）を
 /// 半角の円記号（U+00A5）にする。対応は Unicode の文字データベースの互換分解（`<wide>`）による。カタカナと、
-/// ほかの全角の形の記号（￠・￡ など）は変えない。
+/// ほかの全角の形の記号（￠・￡ など）は変えない。全角チルダ（U+FF5E）も変えない（Windows では日本語の「～」
+/// （Shift_JIS の 0x8160）がこの文字になり、「1～3」などの波ダッシュとして使われるため）。
 fn to_halfwidth(text: &str) -> String {
     text.chars()
         .map(|c| match c {
-            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+            '\u{FF01}'..='\u{FF5D}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
             '\u{3000}' => ' ',
             '\u{FFE5}' => '\u{A5}',
             _ => c,
@@ -343,21 +344,21 @@ mod tests {
         assert_eq!(out.as_bytes()[7], b'-');
     }
 
-    /// 全角の英数字・記号の94文字はどれも ASCII の `!`〜`~` に、全角スペースは半角スペースに、`￥` は U+00A5 になる。
+    /// 全角の英数字・記号の93文字はどれも ASCII の `!`〜`}` に、全角スペースは半角スペースに、`￥` は U+00A5 になる。
     #[test]
     fn to_halfwidth_maps_fullwidth_ascii_space_and_yen() {
-        let fullwidth: String = (0xFF01..=0xFF5E).map(|cp| char::from_u32(cp).unwrap()).collect();
-        let ascii: String = (0x21..=0x7E).map(|cp| char::from_u32(cp).unwrap()).collect();
+        let fullwidth: String = (0xFF01..=0xFF5D).map(|cp| char::from_u32(cp).unwrap()).collect();
+        let ascii: String = (0x21..=0x7D).map(|cp| char::from_u32(cp).unwrap()).collect();
         assert_eq!(to_halfwidth(&fullwidth), ascii);
         assert_eq!(to_halfwidth("\u{3000}"), " ");
         assert_eq!(to_halfwidth("\u{FFE5}"), "\u{A5}");
         assert_eq!(TextTransform::ToHalfwidth.apply("ＡＢＣ　１２３＠ｅｘａｍｐｌｅ．ｊｐ", &cfg()), "ABC 123@example.jp");
     }
 
-    /// カタカナ・ほかの全角の形の記号・全角の形でない記号・半角の文字は変えない。
+    /// カタカナ・全角チルダ（日本語の「～」）・ほかの全角の形の記号・全角の形でない記号・半角の文字は変えない。
     #[test]
     fn to_halfwidth_leaves_other_characters() {
-        let unchanged = "カタカナｶﾀｶﾅ漢字〜ー“”￠￡abc 1\u{A5}\\";
+        let unchanged = "カタカナｶﾀｶﾅ漢字1\u{FF5E}3〜ー“”￠￡abc 1\u{A5}\\~";
         assert_eq!(to_halfwidth(unchanged), unchanged);
     }
 
