@@ -22,11 +22,12 @@ pub enum TextTransform {
     WordBreak,
     PutText,
     DeleteCrlf,
+    ToHalfwidth,
 }
 
 impl TextTransform {
     /// メニュー表示順の全変換。
-    pub const ALL: [TextTransform; 7] = [
+    pub const ALL: [TextTransform; 8] = [
         Self::ToLower,
         Self::ToUpper,
         Self::Quote,
@@ -34,6 +35,7 @@ impl TextTransform {
         Self::WordBreak,
         Self::PutText,
         Self::DeleteCrlf,
+        Self::ToHalfwidth,
     ];
 
     pub fn label(self) -> &'static str {
@@ -45,6 +47,7 @@ impl TextTransform {
             Self::WordBreak => "テキスト整形（折り返し）",
             Self::PutText => "テキストの挟み込み",
             Self::DeleteCrlf => "改行の除去",
+            Self::ToHalfwidth => "全角英数記号を半角に変換",
         }
     }
 
@@ -57,8 +60,23 @@ impl TextTransform {
             Self::WordBreak => word_break(text, cfg.word_break_width as usize),
             Self::PutText => format!("{}{}{}", cfg.put_text_open, text, cfg.put_text_close),
             Self::DeleteCrlf => delete_crlf(text, cfg.delete_crlf_trim_leading),
+            Self::ToHalfwidth => to_halfwidth(text),
         }
     }
+}
+
+/// 全角の英数字・記号（U+FF01〜U+FF5E）と全角スペース（U+3000）を半角（ASCII）に、全角の円記号（U+FFE5）を
+/// 半角の円記号（U+00A5）にする。対応は Unicode の文字データベースの互換分解（`<wide>`）による。カタカナと、
+/// ほかの全角の形の記号（￠・￡ など）は変えない。
+fn to_halfwidth(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+            '\u{3000}' => ' ',
+            '\u{FFE5}' => '\u{A5}',
+            _ => c,
+        })
+        .collect()
 }
 
 /// 各行頭に引用符を付加する。
@@ -323,6 +341,24 @@ mod tests {
         assert_eq!(out.len(), 10);
         assert_eq!(out.as_bytes()[4], b'-');
         assert_eq!(out.as_bytes()[7], b'-');
+    }
+
+    /// 全角の英数字・記号の94文字はどれも ASCII の `!`〜`~` に、全角スペースは半角スペースに、`￥` は U+00A5 になる。
+    #[test]
+    fn to_halfwidth_maps_fullwidth_ascii_space_and_yen() {
+        let fullwidth: String = (0xFF01..=0xFF5E).map(|cp| char::from_u32(cp).unwrap()).collect();
+        let ascii: String = (0x21..=0x7E).map(|cp| char::from_u32(cp).unwrap()).collect();
+        assert_eq!(to_halfwidth(&fullwidth), ascii);
+        assert_eq!(to_halfwidth("\u{3000}"), " ");
+        assert_eq!(to_halfwidth("\u{FFE5}"), "\u{A5}");
+        assert_eq!(TextTransform::ToHalfwidth.apply("ＡＢＣ　１２３＠ｅｘａｍｐｌｅ．ｊｐ", &cfg()), "ABC 123@example.jp");
+    }
+
+    /// カタカナ・ほかの全角の形の記号・全角の形でない記号・半角の文字は変えない。
+    #[test]
+    fn to_halfwidth_leaves_other_characters() {
+        let unchanged = "カタカナｶﾀｶﾅ漢字〜ー“”￠￡abc 1\u{A5}\\";
+        assert_eq!(to_halfwidth(unchanged), unchanged);
     }
 
     fn unicodetext_format(text: &str) -> crate::data::Format {
