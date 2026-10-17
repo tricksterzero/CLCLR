@@ -671,7 +671,8 @@ try {
     foreach ($instance in $toolsBefore.visualStudio) {
         Write-Host "Visual Studio: $($instance.displayName) $($instance.productDisplayVersion)"
         foreach ($toolset in $instance.toolsets) {
-            Write-Host "  MSVC $($toolset.version)（link.exe $($toolset.link)）"
+            $linkVersion = if ($toolset.link) { $toolset.link['version'] } else { 'なし' }
+            Write-Host "  MSVC $($toolset.version)（link.exe $linkVersion）"
         }
     }
 
