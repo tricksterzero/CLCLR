@@ -32,11 +32,14 @@ GitHub へのリリース（タグの作成と gh release create）は外から�
 既にあるタグ・GitHub 以外の origin を、止めずに警告だけにする（試しに作るとき用）。下書きの zip は配らない。
 
 .PARAMETER BuildToolsBaseline
-前に書き出した build-tools-<版>.json。指定すると、テストの前に取った目録をこのファイルの目録と比べ、違っていれば
-止める（下書きでは警告だけにする）。
+前に書き出した build-tools-<版>.json。テストの前に取った目録をこのファイルの目録と比べ、違っていれば止める
+（下書きでは警告だけにする）。下書きでないときは必須（省くと、採用した道具との比較をせずに進んでしまうため止める）。
 
 .EXAMPLE
-powershell -ExecutionPolicy Bypass -File scripts\release.ps1
+powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -BuildToolsBaseline <採用した目録の build-tools-<版>.json>
+
+.EXAMPLE
+powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -Draft
 #>
 [CmdletBinding()]
 param(
@@ -54,6 +57,8 @@ $root = Split-Path -Parent $PSScriptRoot
 # 相対パスは、リポジトリのフォルダへ移る前の、呼び出したときのフォルダを基点にする
 if ($BuildToolsBaseline) {
     $BuildToolsBaseline = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BuildToolsBaseline)
+} elseif (-not $Draft) {
+    throw '-BuildToolsBaseline に、採用した道具の目録のファイル（build-tools-<版>.json）を渡してください（下書きでないときは必須です）'
 }
 $packageFiles = @('README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md')
 
@@ -325,7 +330,8 @@ function Get-JsonProperty($object, [string]$name) {
 # ファイルの版（ファイルが無ければ $null）
 function Get-FileVersionOrNull([string]$path) {
     if (Test-Path -LiteralPath $path -PathType Leaf) {
-        return (Get-Item -LiteralPath $path).VersionInfo.FileVersion
+        # -Force: 隠しファイルも読む（-Force が無いと、Test-Path が真でも Get-Item が見つからないと言って止まる）
+        return (Get-Item -LiteralPath $path -Force).VersionInfo.FileVersion
     }
     return $null
 }
@@ -338,10 +344,10 @@ function Get-FileRecord([string]$path) {
     return $null
 }
 
-# フォルダの中のフォルダの名前（フォルダが無ければ空）
+# フォルダの中のフォルダの名前（フォルダが無ければ空）。隠しフォルダも含める（道具を探す側は隠しフォルダも見る）
 function Get-SubfolderName([string]$path) {
     if (Test-Path -LiteralPath $path -PathType Container) {
-        return @(Get-ChildItem -LiteralPath $path -Directory | ForEach-Object { $_.Name } | Sort-Object)
+        return @(Get-ChildItem -LiteralPath $path -Directory -Force | ForEach-Object { $_.Name } | Sort-Object)
     }
     return @()
 }
@@ -394,16 +400,23 @@ function Get-BuildToolInventory {
     })
 
     # Windows SDK（Windows 10 以降の SDK の場所は、レジストリの KitsRoot10 にある）
+    # キーが無いときだけ「SDK なし」にする（読めないときは、SDK の有無を確かめられていないので止める）
     $kitsRoot = $null
-    $installedRoots = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -ErrorAction SilentlyContinue
+    $installedRoots = $null
+    try {
+        $installedRoots = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -ErrorAction Stop
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        $installedRoots = $null
+    }
     if ($installedRoots) {
         $kitsRoot = Get-JsonProperty $installedRoots 'KitsRoot10'
     }
     $windowsSdk = $null
     if ($kitsRoot) {
         $binDir = Join-Path $kitsRoot 'bin'
-        # bin の下のフォルダ（版、または x64 などの直下の置き場）の x64\rc.exe。embed-resource は、環境変数 RC
-        # などで指定されていなければ、この順（フォルダを列挙した順）で最初に見つかったものを使う
+        # bin の下のフォルダ（版、または x64 などの直下の置き場）の x64\rc.exe をすべて記録する（並びは名前の順）。
+        # embed-resource は、環境変数 RC などで指定されていなければ、bin の下をファイルシステムが列挙した順に見て、
+        # 最初に x64\rc.exe があるものを使う（この並びと同じとは限らない）
         $rcFiles = @(foreach ($folder in Get-SubfolderName $binDir) {
             $rc = Join-Path $binDir "$folder\x64\rc.exe"
             if (Test-Path -LiteralPath $rc -PathType Leaf) {
@@ -681,6 +694,13 @@ try {
     if (Test-Path -LiteralPath $zip) {
         Remove-Item -LiteralPath $zip -Force
     }
+    # 前の実行の目録のファイルを、この実行の zip の隣に残さない（この実行の目録は、取り直して比べた後に書く）
+    foreach ($suffix in '', '-before', '-after') {
+        $oldToolsPath = Join-Path $dist "build-tools-$version$suffix.json"
+        if (Test-Path -LiteralPath $oldToolsPath) {
+            Remove-Item -LiteralPath $oldToolsPath -Force
+        }
+    }
     # zip の項目の名前と元のファイル
     $sources = [ordered]@{ 'CLCLR.exe' = $exe }
     foreach ($file in $packageFiles) {
@@ -730,11 +750,17 @@ try {
     # テスト・ビルドの間に道具が変わっていないか（変わっていれば、成果物がどの道具で作られたかを言えないので、
     # 下書きでも止める）
     Write-Step 'ビルドに使う道具の目録を取り直して比べる'
-    $toolsAfter = Get-BuildToolInventory
+    $beforePath = Join-Path $dist "build-tools-$version-before.json"
+    try {
+        $toolsAfter = Get-BuildToolInventory
+    } catch {
+        # 取り直せなかったときも、比べる元（テストの前の目録）を残してから止まる
+        [System.IO.File]::WriteAllText($beforePath, (($toolsBefore | ConvertTo-Json -Depth 10) -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding $false))
+        throw "ビルドに使う道具の目録を取り直せませんでした（テストの前の目録は $beforePath）。この実行の成果物は使えません: $($_.Exception.Message)"
+    }
     if ((ConvertTo-InventoryText $toolsAfter) -cne $toolsBeforeText) {
         $afterPath = Join-Path $dist "build-tools-$version-after.json"
         [System.IO.File]::WriteAllText($afterPath, (($toolsAfter | ConvertTo-Json -Depth 10) -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding $false))
-        $beforePath = Join-Path $dist "build-tools-$version-before.json"
         [System.IO.File]::WriteAllText($beforePath, (($toolsBefore | ConvertTo-Json -Depth 10) -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding $false))
         throw "テスト・ビルドの間に、ビルドに使う道具の目録が変わりました（$beforePath と $afterPath を比べてください）。この実行の成果物は使えません"
     }
