@@ -156,7 +156,7 @@ BEGIN
     LTEXT "（0=無制限。これより大きいデータは取り込まない）", -1, 70, 210, 203, 8
 END
 
-// ウィンドウフィルタ。コピー元の窓がこれに当たると取り込まない。
+// ウィンドウフィルタ。コピー元のウィンドウがこれに当たると取り込まない。
 IDD_PAGE_WINDOW DIALOGEX 0, 0, 280, 232
 STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
 EXSTYLE WS_EX_CONTROLPARENT
