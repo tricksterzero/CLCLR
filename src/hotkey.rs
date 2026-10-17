@@ -792,8 +792,8 @@ fn show_popup_menu(hwnd: HWND, ctx: &HotkeyContext, use_caret: bool, content: Me
                 None,
             )
         };
-        // Ctrl を押したまま選んだらテキストだけで送る（選んだ直後に読む。Shift は送出の後で読む）
-        let text_only = crate::paste::ctrl_held();
+        // 修飾キーは選んだ直後に読む（`PickKeys`）
+        let keys = PickKeys::read();
         menu_tooltip::end_session();
         let _ = PostMessageW(Some(hwnd), 0, WPARAM(0), LPARAM(0)); // WM_NULL
         // メニュー（子メニューごと）を破棄してから、項目の描画の材料（サムネイル・フォント）を解放する
@@ -808,7 +808,7 @@ fn show_popup_menu(hwnd: HWND, ctx: &HotkeyContext, use_caret: bool, content: Me
             .checked_sub(1)
             .and_then(|i| layout.rows.get(i));
         match picked {
-            Some(row) => send_pick(hwnd, ctx, row.id, row.pinned, text_only, &focus),
+            Some(row) => send_pick(hwnd, ctx, row.id, row.pinned, keys, &focus),
             // キャンセル時は元ウィンドウへフォーカスを返すだけ（C版準拠）。戻り値（復帰成否）は
             // 後続処理が無いため使わない
             None => {
@@ -824,8 +824,8 @@ fn show_popup_menu(hwnd: HWND, ctx: &HotkeyContext, use_caret: bool, content: Me
 /// フォーカス復帰の`SetForegroundWindow`は、フォアグラウンド（メニューのオーナー窓）を所有する
 /// このスレッドから呼ばないと効かない（別のスレッドから呼ぶと成功を返しつつ実際には
 /// 切り替わらず、Ctrl+Vが自分の隠し窓に消えることを実機で確認）。
-/// `text_only`（Ctrl を押したまま選んだ）なら CF_UNICODETEXT だけを送る（`entry_for_send`）。
-fn send_pick(hwnd: HWND, ctx: &HotkeyContext, id: Uuid, pinned: bool, text_only: bool, focus: &FocusInfo) {
+/// `keys` は選んだときの修飾キー（`PickKeys`）。
+fn send_pick(hwnd: HWND, ctx: &HotkeyContext, id: Uuid, pinned: bool, keys: PickKeys, focus: &FocusInfo) {
     // 読み込みは受け付け・操作用のロックの下で、サービスのロックの外で行う（取り込みの変換中は
     // 待つことがあるが、このスレッドなのでビューアのメインスレッドは止まらない）。受け付けで
     // 覆うのは読み込みと、後のクリップボードへの書き込み（フォーカスの復帰・貼り付けまで延ばすと、
@@ -844,7 +844,7 @@ fn send_pick(hwnd: HWND, ctx: &HotkeyContext, id: Uuid, pinned: bool, text_only:
         let cfg = ctx.config.read().unwrap();
         (cfg.history.delete_on_send, cfg.hotkey.auto_paste, cfg.tools.text.clone())
     };
-    let entry = entry_for_send(entry, pinned, text_only, &text_cfg);
+    let entry = entry_for_send(entry, pinned, keys.text_only, &text_cfg);
 
     // フォーカス復帰の成否はauto_paste実行の可否判定に使う（クリップボードへの書き込み
     // 自体は復帰の成否と無関係に行うため、ここでは早期returnしない）
@@ -863,12 +863,12 @@ fn send_pick(hwnd: HWND, ctx: &HotkeyContext, id: Uuid, pinned: bool, text_only:
             return;
         }
     }
-    // C版準拠: Shift押下中は自動ペーストを抑制。送出中はホットキーを
+    // C版準拠: Shift を押して選んだら自動ペーストを抑制（`PickKeys::no_paste`）。送出中はホットキーを
     // 一時解除して貼り付け先のCtrl+Vと衝突しないようにする（同一スレッド上
     // なのでsuspend/resumeのメッセージ往復は不要、直接呼ぶ）。フォーカス復帰に
     // 失敗した場合はauto_pasteをスキップする（対象ウィンドウが消滅していた場合等に
     // 誤ったウィンドウへCtrl+Vを送出しないため）
-    if auto_paste && focus_restored && !crate::paste::shift_held() {
+    if auto_paste && focus_restored && !keys.no_paste {
         unregister_all(hwnd);
         // send_pasteのSendInputはWH_KEYBOARD_LLにも乗るが、目印（`paste::PASTE_INPUT_MARK`）を付けてあり、
         // フックが二度押し判定へ転送しない（`should_forward`。Ctrl down→V down/up(リセット)→Ctrl up(新規1回
@@ -885,6 +885,24 @@ fn send_pick(hwnd: HWND, ctx: &HotkeyContext, id: Uuid, pinned: bool, text_only:
         }
     }
     (ctx.repaint)();
+}
+
+/// メニューで項目を選んだときの修飾キー。`TrackPopupMenu` が戻った直後（読み込み・書き込みより前）に読む。
+/// C版は送った後に `GetKeyState` で読むが、`GetKeyState` はスレッドがキーのメッセージを読んだ時点の状態を返し、
+/// 送る間はメッセージを読まないので、選んだときの状態になる。ここは `GetAsyncKeyState`（読んだ時点の状態）なので、
+/// 選んだ直後に読んで同じにする（後で読むと、送る間に離したキーを「押していない」と読む）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PickKeys {
+    /// Ctrl: CF_UNICODETEXT だけを送る（`entry_for_send`）
+    text_only: bool,
+    /// Shift: 自動の貼り付けをしない
+    no_paste: bool,
+}
+
+impl PickKeys {
+    fn read() -> Self {
+        Self { text_only: crate::paste::ctrl_held(), no_paste: crate::paste::shift_held() }
+    }
 }
 
 /// メニューで選んだ項目の、送る形式。`text_only` なら CF_UNICODETEXT だけにする（テキストの無い項目は、
