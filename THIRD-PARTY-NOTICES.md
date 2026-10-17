@@ -42,7 +42,7 @@ SOFTWARE.
 
 `CLCLR.exe` に組み込まれるクレートです（ビルドのときだけ使うもの・手続き型マクロは含めません）。複数のライセンスから選べるもの（`MIT OR Apache-2.0` など）は、MIT ライセンスで利用しています。MIT ライセンスの本文は下の「4」です。
 
-| クレート | 版 | ライセンス | 著作権者 | リポジトリ |
+| クレート | バージョン | ライセンス | 著作権者 | リポジトリ |
 |---|---|---|---|---|
 | byteorder-lite | 0.1.0 | Unlicense OR MIT | Copyright (c) 2015 Andrew Gallant | https://github.com/image-rs/byteorder-lite |
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 | Copyright (c) 2014 Alex Crichton | https://github.com/rust-lang/cfg-if |

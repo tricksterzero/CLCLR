@@ -6,38 +6,38 @@ CLCLR の配布用の zip と、リリースのページの文面を作る（Git
 次の順に行い、どこかで失敗したら止まる。
 
 1. 作業ツリーに未コミットの変更が無く、main の最新（origin/main と同じ）であることを確かめる
-2. Cargo.toml の版を読み、CHANGELOG.md にその版の節（「## v版（公開日）」）があることと、タグ v<版> が
+2. Cargo.toml のバージョンを読み、CHANGELOG.md にそのバージョンの節（「## v<バージョン>（公開日）」）があることと、タグ v<バージョン> が
    origin にまだ無いことを確かめる
 3. cargo test（debug）と cargo build --release。どちらも C ランタイムを静的にリンクし（-C target-feature=+crt-static）、
-   Control Flow Guard を付ける（-C control-flow-guard）。exe はこのビルドで cargo が知らせたものを使い、版と x64 で
+   Control Flow Guard を付ける（-C control-flow-guard）。exe はこのビルドで cargo が知らせたものを使い、バージョンと x64 で
    あることと、C ランタイムの DLL を import していないことと、CFG と CET シャドウスタック互換（build.rs が付ける）の
-   印があることを確かめる。release のビルドでは
+   フラグがあることを確かめる。release のビルドでは
    Cargo のホームのパスを「cargo」に置き換え（--remap-path-prefix）、exe にユーザーのフォルダと Cargo のホームの
    パスが残っていないことを確かめる（探すのはこの2つのパスだけ）。どちらも --locked を付け、Cargo.lock を書き換える
    必要があれば（Cargo.toml と食い違うときなど）止まる
-4. <出力先>\dist\CLCLR-<版>-x64.zip を作る（CLCLR.exe・README.md・LICENSE・THIRD-PARTY-NOTICES.md の4つ）。
+4. <出力先>\dist\CLCLR-<バージョン>-x64.zip を作る（CLCLR.exe・README.md・LICENSE・THIRD-PARTY-NOTICES.md の4つ）。
    作った zip の項目がちょうどその4つで、中身が元のファイルと同じであることと、テスト・ビルドの間に作業ツリーと
    コミットが変わっていないことを確かめる
-5. zip と exe（zip の中のもの）の SHA-256 を出し、リリースのページの文面 <出力先>\dist\release-notes-<版>.md を作る
-6. ビルドに使う道具の目録（Rust のツールチェーン、Visual Studio と MSVC、Windows SDK、静的にリンクする C ランタイムの
-   ライブラリ、道具を探すときに読むレジストリの値、道具の選び方に関わる環境変数と Cargo の設定ファイル）を、テストの
+5. zip と exe（zip の中のもの）の SHA-256 を出し、リリースのページの文面 <出力先>\dist\release-notes-<バージョン>.md を作る
+6. ビルドに使うツールの目録（Rust のツールチェーン、Visual Studio と MSVC、Windows SDK、静的にリンクする C ランタイムの
+   ライブラリ、ツールを探すときに読むレジストリの値、ツールの選び方に関わる環境変数と Cargo の設定ファイル）を、テストの
    前と zip を作った後に取って比べ、
-   違っていれば止める（下書きでも止める）。目録と exe の SHA-256・Rich ヘッダーを <出力先>\dist\build-tools-<版>.json
+   違っていれば止める（ドラフトでも止める）。目録と exe の SHA-256・Rich ヘッダーを <出力先>\dist\build-tools-<バージョン>.json
    に書く
 
 GitHub へのリリース（タグの作成と gh release create）は外から見える操作なので、このスクリプトでは行わず、
 最後に実行するコマンドを表示するだけにする（リポジトリは origin、タグの位置は確かめたコミットの SHA で指定する）。
 
 .PARAMETER Draft
-下書き。main 以外のブランチ・未コミットの変更・origin/main との違い・CHANGELOG.md の公開日の「未定」・
-既にあるタグ・GitHub 以外の origin を、止めずに警告だけにする（試しに作るとき用）。下書きの zip は配らない。
+ドラフト。main 以外のブランチ・未コミットの変更・origin/main との違い・CHANGELOG.md の公開日の「未定」・
+既にあるタグ・GitHub 以外の origin を、止めずに警告だけにする（試しに作るとき用）。ドラフトの zip は配らない。
 
 .PARAMETER BuildToolsBaseline
-前に書き出した build-tools-<版>.json。テストの前に取った目録をこのファイルの目録と比べ、違っていれば止める
-（下書きでは警告だけにする）。下書きでないときは必須（省くと、採用した道具との比較をせずに進んでしまうため止める）。
+前に書き出した build-tools-<バージョン>.json。テストの前に取った目録をこのファイルの目録と比べ、違っていれば止める
+（ドラフトでは警告だけにする）。ドラフトでないときは必須（省くと、採用したツールとの比較をせずに進んでしまうため止める）。
 
 .EXAMPLE
-powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -BuildToolsBaseline <採用した目録の build-tools-<版>.json>
+powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -BuildToolsBaseline <採用した目録の build-tools-<バージョン>.json>
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -Draft
@@ -59,7 +59,7 @@ $root = Split-Path -Parent $PSScriptRoot
 if ($BuildToolsBaseline) {
     $BuildToolsBaseline = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BuildToolsBaseline)
 } elseif (-not $Draft) {
-    throw '-BuildToolsBaseline に、採用した道具の目録のファイル（build-tools-<版>.json）を渡してください（下書きでないときは必須です）'
+    throw '-BuildToolsBaseline に、採用したツールの目録のファイル（build-tools-<バージョン>.json）を渡してください（ドラフトでないときは必須です）'
 }
 $packageFiles = @('README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md')
 
@@ -67,10 +67,10 @@ function Write-Step([string]$message) {
     Write-Host "== $message" -ForegroundColor Cyan
 }
 
-# 下書きなら警告だけ、そうでなければ止める
+# ドラフトなら警告だけ、そうでなければ止める
 function Stop-OrWarn([string]$message) {
     if ($Draft) {
-        Write-Host "警告（下書きなので続けます）: $message" -ForegroundColor Yellow
+        Write-Host "警告（ドラフトなので続けます）: $message" -ForegroundColor Yellow
     } else {
         throw $message
     }
@@ -131,7 +131,7 @@ function Test-X64Exe([string]$path) {
     return ($signature -eq 0x00004550 -and $machine -eq 0x8664)
 }
 
-# exe（x64 の PE。PE32+）に Control Flow Guard の印があるか（オプションヘッダーの DllCharacteristics の
+# exe（x64 の PE。PE32+）に Control Flow Guard のフラグがあるか（オプションヘッダーの DllCharacteristics の
 # IMAGE_DLLCHARACTERISTICS_GUARD_CF = 0x4000。PE32+ ではオプションヘッダーの先頭から 70 バイト目）
 function Test-GuardCf([string]$path) {
     $bytes = [System.IO.File]::ReadAllBytes($path)
@@ -142,7 +142,7 @@ function Test-GuardCf([string]$path) {
     return (([System.BitConverter]::ToUInt16($bytes, $optional + 70) -band 0x4000) -ne 0)
 }
 
-# exe（x64 の PE。PE32+）に CET シャドウスタック互換の印があるか（デバッグのディレクトリの、種類 20 =
+# exe（x64 の PE。PE32+）に CET シャドウスタック互換のフラグがあるか（デバッグのディレクトリの、種類 20 =
 # IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS の項目が指す値の、ビット 0 = IMAGE_DLLCHARACTERISTICS_EX_CET_COMPAT）
 function Test-CetCompat([string]$path) {
     $bytes = [System.IO.File]::ReadAllBytes($path)
@@ -287,7 +287,7 @@ function Get-PackageVersion([string]$cargoToml) {
     throw 'Cargo.toml の [package] に version がありません'
 }
 
-# CHANGELOG.md の「## v版（公開日）」の節（公開日と本文）
+# CHANGELOG.md の「## v<バージョン>（公開日）」の節（公開日と本文）
 function Get-ChangelogSection([string]$changelog, [string]$version) {
     $lines = @(Get-Content -LiteralPath $changelog -Encoding UTF8)
     $pattern = '^## v' + [regex]::Escape($version) + '（(.+)）\s*$'
@@ -328,7 +328,7 @@ function Get-JsonProperty($object, [string]$name) {
     return $null
 }
 
-# ファイルの版（ファイルが無ければ $null）
+# ファイルのバージョン（ファイルが無ければ $null）
 function Get-FileVersionOrNull([string]$path) {
     if (Test-Path -LiteralPath $path -PathType Leaf) {
         # -Force: 隠しファイルも読む（-Force が無いと、Test-Path が真でも Get-Item が見つからないと言って止まる）
@@ -345,7 +345,7 @@ function Get-FileRecord([string]$path) {
     return $null
 }
 
-# 実行ファイルの版と SHA-256（ファイルが無ければ $null）
+# 実行ファイルのバージョンと SHA-256（ファイルが無ければ $null）
 function Get-ExeRecord([string]$path) {
     if (Test-Path -LiteralPath $path -PathType Leaf) {
         return [ordered]@{ version = Get-FileVersionOrNull $path; sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
@@ -374,7 +374,7 @@ function Get-RegistryValue([Microsoft.Win32.RegistryView]$view, [string]$subKey,
 
 # 既定のツールセットを決めるファイル（VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt）の中身。末尾の空白
 # を除く。ファイルが無ければ $null。リンカーを探す側は、ファイル全体を UTF-8 として読み（BOM は消さない）、末尾の
-# 空白を除いた文字列をツールセットの版にする。同じ名前のフォルダがある、読めない、UTF-8 として正しくないときは止める
+# 空白を除いた文字列をツールセットのバージョンにする。同じ名前のフォルダがある、読めない、UTF-8 として正しくないときは止める
 function Get-DefaultToolsetText([string]$installationPath) {
     $path = Join-Path $installationPath 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt'
     if (Test-Path -LiteralPath $path -PathType Container) {
@@ -389,7 +389,7 @@ function Get-DefaultToolsetText([string]$installationPath) {
     return $utf8.GetString($bytes).TrimEnd()
 }
 
-# フォルダの中のフォルダの名前（フォルダが無ければ空）。隠しフォルダも含める（道具を探す側は隠しフォルダも見る）
+# フォルダの中のフォルダの名前（フォルダが無ければ空）。隠しフォルダも含める（ツールを探す側は隠しフォルダも見る）
 function Get-SubfolderName([string]$path) {
     if (Test-Path -LiteralPath $path -PathType Container) {
         return @(Get-ChildItem -LiteralPath $path -Directory -Force | ForEach-Object { $_.Name } | Sort-Object)
@@ -397,9 +397,9 @@ function Get-SubfolderName([string]$path) {
     return @()
 }
 
-# ビルドに使う道具の目録。Rust のツールチェーン、Visual Studio と MSVC のツールセット（リンカーの版と SHA-256、
-# 静的にリンクする C ランタイムのライブラリ、既定のツールセット）、Windows SDK（版、rc.exe、静的にリンクする UCRT
-# のライブラリ）、リンカーが SDK を探すときに読むレジストリの値、道具の選び方に関わる環境変数と Cargo の設定ファイル。
+# ビルドに使うツールの目録。Rust のツールチェーン、Visual Studio と MSVC のツールセット（リンカーのバージョンと SHA-256、
+# 静的にリンクする C ランタイムのライブラリ、既定のツールセット）、Windows SDK（バージョン、rc.exe、静的にリンクする UCRT
+# のライブラリ）、リンカーが SDK を探すときに読むレジストリの値、ツールの選び方に関わる環境変数と Cargo の設定ファイル。
 # どれも exe の中身を左右する。見るのは入っているものと選び方の指定で、ビルドで実際にどれが使われたかまでは確かめない
 function Get-BuildToolInventory {
     $rustc = @(& rustc --version --verbose)
@@ -469,7 +469,7 @@ function Get-BuildToolInventory {
     $windowsSdk = $null
     if ($kitsRoot) {
         $binDir = Join-Path $kitsRoot 'bin'
-        # bin の下のフォルダ（版、または x64 などの直下の置き場）の x64\rc.exe をすべて記録する（並びは名前の順）。
+        # bin の下のフォルダ（バージョン、または x64 などの直下の置き場）の x64\rc.exe をすべて記録する（並びは名前の順）。
         # embed-resource は、環境変数 RC などで指定されていなければ、bin の下をファイルシステムが列挙した順に見て、
         # 最初に x64\rc.exe があるものを使う（この並びと同じとは限らない）
         $rcFiles = @(foreach ($folder in Get-SubfolderName $binDir) {
@@ -482,7 +482,7 @@ function Get-BuildToolInventory {
         $windowsSdk = [ordered]@{
             root    = $kitsRoot
             lib     = @(Get-SubfolderName $libDir)
-            # リンカーを探す側は、ucrt のフォルダがある版から UCRT を、um\x64\kernel32.lib がある版から import
+            # リンカーを探す側は、ucrt のフォルダがあるバージョンから UCRT を、um\x64\kernel32.lib があるバージョンから import
             # ライブラリを選ぶ
             libVersions = @(foreach ($version in Get-SubfolderName $libDir) {
                 [ordered]@{
@@ -503,7 +503,7 @@ function Get-BuildToolInventory {
         }
     }
 
-    # 道具の選び方に関わる環境変数（PATH は、ほかのソフトを入れるだけで変わるので含めない）。リンカーと rc.exe を
+    # ツールの選び方に関わる環境変数（PATH は、ほかのソフトを入れるだけで変わるので含めない）。リンカーと rc.exe を
     # 探す側、cargo（使う rustc）、リンカー自身（LINK・_LINK_ の引数）が読むもの
     $environment = [ordered]@{}
     foreach ($variable in 'VCINSTALLDIR', 'VCToolsInstallDir', 'WindowsSdkDir', 'LIB', 'INCLUDE', 'RC', 'RC_x86_64-pc-windows-msvc', 'RC_x86_64_pc_windows_msvc', 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER', 'CARGO_BUILD_TARGET', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_BUILD_RUSTFLAGS', 'RUSTUP_TOOLCHAIN', 'VSTEL_MSBuildProjectFullPath', 'VCToolsVersion', 'WindowsSDKVersion', 'RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'CARGO_BUILD_RUSTC', 'CARGO_BUILD_RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER', 'LINK', '_LINK_') {
@@ -550,12 +550,12 @@ function ConvertTo-InventoryText($inventory) {
     return ($inventory | ConvertTo-Json -Depth 10 -Compress | ConvertFrom-Json | ConvertTo-Json -Depth 10 -Compress)
 }
 
-# exe（PE）の Rich ヘッダーの項目（製品 ID・ビルド番号・数。リンクしたオブジェクトとライブラリを作った道具の番号）。
+# exe（PE）の Rich ヘッダーの項目（製品 ID・ビルド番号・数。リンクしたオブジェクトとライブラリを作ったツールの番号）。
 # 無ければ空
 function Get-RichHeaderEntry([string]$path) {
     $bytes = [System.IO.File]::ReadAllBytes($path)
     $pe = [System.BitConverter]::ToInt32($bytes, 0x3C)
-    # "Rich" の印と、その後ろの鍵（項目はこの鍵との XOR で書かれている）
+    # "Rich" のマーカーと、その後ろの鍵（項目はこの鍵との XOR で書かれている）
     $rich = -1
     for ($i = 0x80; $i + 8 -le $pe; $i += 4) {
         if ([System.BitConverter]::ToUInt32($bytes, $i) -eq 0x68636952) {
@@ -567,7 +567,7 @@ function Get-RichHeaderEntry([string]$path) {
         return @()
     }
     $key = [System.BitConverter]::ToUInt32($bytes, $rich + 4)
-    # 先頭の "DanS" の印（鍵との XOR で書かれている）
+    # 先頭の "DanS" のマーカー（鍵との XOR で書かれている）
     $start = -1
     for ($i = $rich - 4; $i -ge 0x80; $i -= 4) {
         if (([System.BitConverter]::ToUInt32($bytes, $i) -bxor $key) -eq 0x536E6144) {
@@ -609,7 +609,7 @@ try {
         Stop-OrWarn "origin が GitHub のリポジトリではありません（$originUrl）"
     }
 
-    Write-Step '版と変更履歴を確かめる'
+    Write-Step 'バージョンと変更履歴を確かめる'
     $version = Get-PackageVersion (Join-Path $root 'Cargo.toml')
     $section = Get-ChangelogSection (Join-Path $root 'CHANGELOG.md') $version
     if ($section.Date -eq '未定') {
@@ -625,7 +625,7 @@ try {
     if ($remoteTags.Count -gt 0) {
         Stop-OrWarn "タグ $tag が origin に既にあります"
     }
-    Write-Host "版: $version  公開日: $($section.Date)"
+    Write-Host "バージョン: $version  公開日: $($section.Date)"
 
     # テストと release のビルドでは、コンパイラへの指定を CARGO_ENCODED_RUSTFLAGS で渡す。外から rustflags の環境変数
     # が設定されていると、どちらかが黙って無視される（Cargo は rustflags の出どころを足し合わせず、最初の1つだけを使う）
@@ -641,10 +641,10 @@ try {
     # - Control Flow Guard（CFG）を付ける。間接呼び出しの呼び先を Windows が確かめ、正しい呼び先でなければプロセスを
     #   終える（メモリが壊されたときに、呼び先を書き換えて処理を乗っ取られないようにする）
     $hardening = '-Ctarget-feature=+crt-static' + [char]0x1F + '-Ccontrol-flow-guard'
-    # テストとビルドには --locked を付け、コミットした Cargo.lock の依存の版のままで行う（Cargo.lock を書き換える
+    # テストとビルドには --locked を付け、コミットした Cargo.lock の依存関係のバージョンのままで行う（Cargo.lock を書き換える
     # 必要があれば、コンパイルを始める前に止まる）
 
-    Write-Step 'ビルドに使う道具の目録を取る'
+    Write-Step 'ビルドに使うツールの目録を取る'
     $toolsBefore = Get-BuildToolInventory
     $toolsBeforeText = ConvertTo-InventoryText $toolsBefore
     if ($BuildToolsBaseline) {
@@ -656,7 +656,7 @@ try {
             throw "比べる目録のファイルに inventory がありません（$BuildToolsBaseline）"
         }
         if ((ConvertTo-InventoryText $baseline) -cne $toolsBeforeText) {
-            Stop-OrWarn "ビルドに使う道具の目録が $BuildToolsBaseline と違います"
+            Stop-OrWarn "ビルドに使うツールの目録が $BuildToolsBaseline と違います"
         } else {
             Write-Host "目録は $BuildToolsBaseline と同じです"
         }
@@ -730,23 +730,23 @@ try {
     }
     $fileVersion = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion
     if ($fileVersion -ne "$version.0") {
-        throw "CLCLR.exe のファイルバージョン（$fileVersion）が Cargo.toml の版（$version）と合いません"
+        throw "CLCLR.exe のファイルバージョン（$fileVersion）が Cargo.toml のバージョン（$version）と合いません"
     }
     if (-not (Test-X64Exe $exe)) {
         throw "CLCLR.exe が x64 の実行ファイルではありません（$exe）"
     }
     # CRT を静的にリンクしたので、Visual C++ の実行環境と UCRT の DLL は import していないはず（古い C ランタイムの
-    # msvcrt.dll・msvcr<版>.dll も、混ざっていないことを確かめる）
+    # msvcrt.dll・msvcr<バージョン>.dll も、混ざっていないことを確かめる）
     $runtimeImports = @(Get-ImportedDll $exe | Where-Object { $_ -match '^(vcruntime|msvcp|msvcr|ucrtbase|api-ms-win-crt-)' })
     if ($runtimeImports.Count -gt 0) {
         throw "CLCLR.exe が C ランタイムの DLL を import しています（$($runtimeImports -join '、')）。CRT の静的リンクが効いていません"
     }
     if (-not (Test-GuardCf $exe)) {
-        throw "CLCLR.exe に Control Flow Guard（CFG）の印がありません。CFG の指定が効いていません"
+        throw "CLCLR.exe に Control Flow Guard（CFG）のフラグがありません。CFG の指定が効いていません"
     }
-    # CET シャドウスタック互換の印（build.rs がリンカへ /CETCOMPAT を渡す）
+    # CET シャドウスタック互換のフラグ（build.rs がリンカへ /CETCOMPAT を渡す）
     if (-not (Test-CetCompat $exe)) {
-        throw "CLCLR.exe に CET シャドウスタック互換の印がありません（build.rs の /CETCOMPAT が効いていません）"
+        throw "CLCLR.exe に CET シャドウスタック互換のフラグがありません（build.rs の /CETCOMPAT が効いていません）"
     }
     $leaks = @(Find-LocalPath $exe @($userProfile, $cargoHome, (Get-ShortFolderPath $userProfile), (Get-ShortFolderPath $cargoHome)))
     if ($leaks.Count -gt 0) {
@@ -816,22 +816,22 @@ try {
         Stop-OrWarn 'テスト・ビルドの間に作業ツリーかコミットが変わりました'
     }
 
-    # テスト・ビルドの間に道具が変わっていないか（変わっていれば、成果物がどの道具で作られたかを言えないので、
-    # 下書きでも止める）
-    Write-Step 'ビルドに使う道具の目録を取り直して比べる'
+    # テスト・ビルドの間にツールが変わっていないか（変わっていれば、成果物がどのツールで作られたかを言えないので、
+    # ドラフトでも止める）
+    Write-Step 'ビルドに使うツールの目録を取り直して比べる'
     $beforePath = Join-Path $dist "build-tools-$version-before.json"
     try {
         $toolsAfter = Get-BuildToolInventory
     } catch {
         # 取り直せなかったときも、比べる元（テストの前の目録）を残してから止まる
         [System.IO.File]::WriteAllText($beforePath, (($toolsBefore | ConvertTo-Json -Depth 10) -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding $false))
-        throw "ビルドに使う道具の目録を取り直せませんでした（テストの前の目録は $beforePath）。この実行の成果物は使えません: $($_.Exception.Message)"
+        throw "ビルドに使うツールの目録を取り直せませんでした（テストの前の目録は $beforePath）。この実行の成果物は使えません: $($_.Exception.Message)"
     }
     if ((ConvertTo-InventoryText $toolsAfter) -cne $toolsBeforeText) {
         $afterPath = Join-Path $dist "build-tools-$version-after.json"
         [System.IO.File]::WriteAllText($afterPath, (($toolsAfter | ConvertTo-Json -Depth 10) -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding $false))
         [System.IO.File]::WriteAllText($beforePath, (($toolsBefore | ConvertTo-Json -Depth 10) -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding $false))
-        throw "テスト・ビルドの間に、ビルドに使う道具の目録が変わりました（$beforePath と $afterPath を比べてください）。この実行の成果物は使えません"
+        throw "テスト・ビルドの間に、ビルドに使うツールの目録が変わりました（$beforePath と $afterPath を比べてください）。この実行の成果物は使えません"
     }
     $buildTools = [ordered]@{
         inventory = $toolsBefore
@@ -855,7 +855,7 @@ try {
     $rustc = "$($rustc[0])".Trim()
     $draftNote = ''
     if ($Draft) {
-        $draftNote = "> 下書き（scripts\release.ps1 -Draft で作ったもの）。この zip は配らない。`n`n"
+        $draftNote = "> ドラフト（scripts\release.ps1 -Draft で作ったもの）。この zip は配らない。`n`n"
     }
     $notes = @"
 $draftNote## CLCLR $tag（$($section.Date)）
@@ -889,7 +889,7 @@ $($section.Body)
     Write-Host "目録:  $buildToolsPath"
     Write-Host ''
     if ($Draft) {
-        Write-Host '下書きなので、GitHub へ出すコマンドは表示しません。' -ForegroundColor Yellow
+        Write-Host 'ドラフトなので、GitHub へ出すコマンドは表示しません。' -ForegroundColor Yellow
     } else {
         Write-Host "GitHub へ出すときは、文面を確かめてから次を実行します（$repo にタグ $tag を作り、コミット $head に付けます）:"
         $ghArgs = @(

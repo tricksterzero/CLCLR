@@ -4,7 +4,7 @@
 
 ## ソースからのビルド
 
-Rust（edition 2024 に対応した版。開発では 1.99.1 を使っています）と、MSVC のツールチェーン（Visual Studio の C++ ビルドツールと Windows SDK。exe のリソースのコンパイルに使います）が要ります。
+Rust（edition 2024 に対応したバージョン。開発では 1.99.1 を使っています）と、MSVC のツールチェーン（Visual Studio の C++ ビルドツールと Windows SDK。exe のリソースのコンパイルに使います）が要ります。
 
 ```powershell
 cargo build --release   # target\release\CLCLR.exe ができる
@@ -13,12 +13,12 @@ cargo test              # 自動テスト（ポップアップメニューが一
 
 自動テストは、実際のクリップボードに書き込みます。CLCLR を動かしたまま実行すると、テストのデータが履歴に入るので、先に CLCLR を終了してください（下の `scripts\release.ps1` もテストを実行するので同じです）。
 
-配布用の zip は `scripts\release.ps1` で作ります。テストと release のビルドを通した後、`target\dist\` に zip と、リリースのページの文面（[CHANGELOG.md](CHANGELOG.md) のその版の節と SHA-256）を作ります。GitHub へのリリースは行わず、実行するコマンドを表示するだけです。
+配布用の zip は `scripts\release.ps1` で作ります。テストと release のビルドを通した後、`target\dist\` に zip と、リリースのページの文面（[CHANGELOG.md](CHANGELOG.md) のそのバージョンの節と SHA-256）を作ります。GitHub へのリリースは行わず、実行するコマンドを表示するだけです。
 
-あわせて、ビルドに使う道具の目録（Rust のツールチェーン、Visual Studio と MSVC、Windows SDK、静的にリンクする C ランタイムのライブラリ、道具を探すときに読むレジストリの値、道具の選び方に関わる環境変数と Cargo の設定ファイル）を、テストの前と zip を作った後に取って比べ、違っていれば止まります。目録と exe の SHA-256・Rich ヘッダーは `target\dist\build-tools-<版>.json` に書きます。前に書き出したこのファイルを `-BuildToolsBaseline` に渡すと、テストの前の目録をそれと比べ、違っていれば止まります。配布の zip を作るときは、採用した道具の目録のファイルを必ず渡します（省くと止まります）。試しに作る下書き（`-Draft`）では省けます。
+あわせて、ビルドに使うツールの目録（Rust のツールチェーン、Visual Studio と MSVC、Windows SDK、静的にリンクする C ランタイムのライブラリ、ツールを探すときに読むレジストリの値、ツールの選び方に関わる環境変数と Cargo の設定ファイル）を、テストの前と zip を作った後に取って比べ、違っていれば止まります。目録と exe の SHA-256・Rich ヘッダーは `target\dist\build-tools-<バージョン>.json` に書きます。前に書き出したこのファイルを `-BuildToolsBaseline` に渡すと、テストの前の目録をそれと比べ、違っていれば止まります。配布の zip を作るときは、採用したツールの目録のファイルを必ず渡します（省くと止まります）。試しに作るドラフト（`-Draft`）では省けます。
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -BuildToolsBaseline <採用した目録の build-tools-<版>.json>
+powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -BuildToolsBaseline <採用した目録の build-tools-<バージョン>.json>
 ```
 
 ## 開発言語（Rust）について
@@ -28,6 +28,6 @@ powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -BuildToolsBaseline
 - **メモリの扱いが安全**: Rust では、`unsafe` と書いた部分の外で、解放したメモリを使うことと、スレッドの間で同じデータを同時に書き換えること（データ競合）を、コンパイラが許しません。配列の範囲の外の読み書きは実行のときに確かめられ、当たったときは、処理を続けてメモリを壊すのではなく、その処理を止めます（パニック）。止まった場所は `panic.log` に書き、履歴の操作の途中で止まったときは、おかしくなっているかもしれない状態を書かないように、以後の変更と保存を断ります。CLCLR は、クリップボードの監視・ホットキー・トレイ・ビューアの操作・検索・画像の読み込みを別々のスレッドで動かしているので、この仕組みが役立つ所が多くあります。ただし、Win32 API を呼ぶ所は `unsafe` で書く必要があり（テストを除くと、`unsafe` の語を含む行が約 470 行）、そこの正しさは、コンパイラではなく、作り込んだ確かめの処理と、作る側の点検・テストで守っています
   - 補足（整数の桁あふれ）: 整数の桁あふれは、言語任せにしていません。release のビルドでは、Rust も整数の桁あふれを検査しません（黙って回り込みます）。そのため、ほかのアプリがクリップボードに置いた画像のヘッダーのような外から来る値の計算は、桁あふれを確かめる演算で書いています
 - **ライブラリ（クレート）に任せる所がある**: TOML の読み書き、WebP の圧縮と展開、UUID の生成などは、広く使われている Rust のクレートを使っています（[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)）
-- **自動テスト**: Rust の標準のテストの仕組み（`cargo test`）で、機能ごとに必要な自動テストを書いています。窓・メニュー・クリップボードを実際に使うテストも含みます
+- **自動テスト**: Rust の標準のテストの仕組み（`cargo test`）で、機能ごとに必要な自動テストを書いています。ウィンドウ・メニュー・クリップボードを実際に使うテストも含みます
 
 README の「[実測](README.md#実測)」の差（exe の大きさと常駐のメモリ）には、言語の違いのほかに、64 ビットと 32 ビットの違い、組み込んでいるクレート、機能の違いが混ざっています。言語だけによる差は切り分けていません。
