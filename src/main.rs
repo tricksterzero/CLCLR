@@ -69,7 +69,7 @@ fn acquire_single_instance() -> Option<HANDLE> {
             let _ = CloseHandle(mutex);
             if !viewer::request_show_existing() {
                 report_error(
-                    "CLCLR は起動中ですが、窓を表示できませんでした。しばらく待ってからもう一度起動してください。",
+                    "CLCLR は起動中ですが、ウィンドウを表示できませんでした。しばらく待ってからもう一度起動してください。",
                 );
             }
             None
@@ -293,7 +293,7 @@ fn main() {
     let viewer = match ViewerWindow::create(APP_DISPLAY_NAME, viewer_size, viewer_position, handler) {
         Ok(v) => v,
         Err(e) => {
-            report_error(&format!("ビューアの窓を作れないため、終了します。\n\n{e}"));
+            report_error(&format!("ビューアのウィンドウを作れないため、終了します。\n\n{e}"));
             std::process::exit(1);
         }
     };

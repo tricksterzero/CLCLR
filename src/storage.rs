@@ -84,8 +84,8 @@ impl fmt::Display for StorageError {
             ),
             Self::UnsupportedSchema { file, found } => write!(
                 f,
-                "{file} はこの版より新しい形式で保存されています（形式の版 {found}、この版が読めるのは \
-                 {SCHEMA_VERSION} まで）。新しい版の CLCLR で開いてください"
+                "{file} はこのバージョンより新しい形式で保存されています（形式のバージョン {found}、このバージョンが読めるのは \
+                 {SCHEMA_VERSION} まで）。新しいバージョンの CLCLR で開いてください"
             ),
             Self::MissingFormat { format_name } => {
                 write!(f, "項目のデータ（{format_name}）が見つからないか、壊れています")
@@ -1414,8 +1414,8 @@ size = 4
         assert_eq!(
             StorageError::UnsupportedSchema { file: "history.toml", found: SCHEMA_VERSION + 1 }.to_string(),
             format!(
-                "history.toml はこの版より新しい形式で保存されています（形式の版 {}、この版が読めるのは {} まで）。\
-                 新しい版の CLCLR で開いてください",
+                "history.toml はこのバージョンより新しい形式で保存されています（形式のバージョン {}、このバージョンが読めるのは {} まで）。\
+                 新しいバージョンの CLCLR で開いてください",
                 SCHEMA_VERSION + 1,
                 SCHEMA_VERSION
             )
