@@ -276,7 +276,7 @@ pub fn dib_header_dimensions(dib: &[u8]) -> Result<(u32, u32)> {
 
 /// CF_DIB を `tw` × `th`（元より大きくはしない）へ縮小した RGBA8（トップダウン）にする。原寸の
 /// RGBA を作らず、元のデータの行から直接ボックス平均で縮める（大きな画像のプレビューで、原寸の
-/// 写しを作らないため）。結果は `dib_to_rgba` の後に同じ大きさへ `downscale_box` したものと
+/// コピーを作らないため）。結果は `dib_to_rgba` の後に同じ大きさへ `downscale_box` したものと
 /// 同じ。
 pub fn dib_to_rgba_downscaled(dib: &[u8], tw: u32, th: u32) -> Result<(u32, u32, Vec<u8>)> {
     let layout = parse_layout(dib)?;
@@ -383,7 +383,7 @@ fn open_webp(webp: &[u8]) -> Result<WebPDecoder<Cursor<&[u8]>>> {
 }
 
 /// WebP を展開し、`tw` × `th`（元より大きくはしない）へ縮小した RGBA8（トップダウン）にする。
-/// 展開した画素（RGB または RGBA）から直接縮めるので、原寸の RGBA への写しは作らない。
+/// 展開した画素（RGB または RGBA）から直接縮めるので、原寸の RGBA へのコピーは作らない。
 /// 結果は `webp_to_rgba` の後に同じ大きさへ `downscale_box` したものと同じ。
 pub fn webp_to_rgba_downscaled(webp: &[u8], tw: u32, th: u32) -> Result<(u32, u32, Vec<u8>)> {
     let mut decoder = open_webp(webp)?;
@@ -887,7 +887,7 @@ mod tests {
     }
 
     /// `WEBP_MAX_EDGE` を 16383 にしている理由: `image-webp` 0.2.4 は、辺がちょうど 16384 の画像を書けるが読み戻せない。
-    /// 依存を更新してこれが通らなくなったら（読み戻せるようになったら）、上限を 16384 に戻せる。
+    /// 依存関係を更新してこれが通らなくなったら（読み戻せるようになったら）、上限を 16384 に戻せる。
     #[test]
     fn image_webp_cannot_read_back_16384_edge() {
         let mut out = Vec::new();

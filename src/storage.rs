@@ -35,7 +35,7 @@ pub enum StorageError {
     /// 個別に区別せず、「入力された全ノードがルートから辿って消費されたか」の
     /// 一点で判定する(詳細は`build_tree`のコメント参照)。
     PinnedTreeCorrupt,
-    /// history.toml / pinned.toml のスキーマ版がこのビルドの対応範囲（`SCHEMA_VERSION`）より
+    /// history.toml / pinned.toml のスキーマのバージョンがこのビルドの対応範囲（`SCHEMA_VERSION`）より
     /// 新しい。読み飛ばして次の保存で上書きすると新しい形式のデータを失うため、読まずに
     /// エラーにする（新しいビルドで作ったデータフォルダを古いビルドで開いた場合など）。
     UnsupportedSchema { file: &'static str, found: u32 },
@@ -122,7 +122,7 @@ impl From<io::Error> for StorageError {
 /// `toml` の読み込みの誤りを、画面に出す1行の説明にする。位置が分かれば「3 行目、5 文字目: 」を
 /// 前に付け（`input` の中の文字で数える）、続けて `toml` の説明を付ける。`toml` の説明は英語の
 /// まま（依存クレートの文言は訳さない）。`toml` の `Display` は該当行の抜き出しと `^` の
-/// 印を複数行で出すが、メッセージボックスでは文字幅がそろわず位置がずれるので使わない。
+/// マークを複数行で出すが、メッセージボックスでは文字幅がそろわず位置がずれるので使わない。
 pub(crate) fn toml_error_detail(e: &toml::de::Error, input: &str) -> String {
     let message = e.message().trim();
     match e.span().and_then(|span| input.get(..span.start)) {
@@ -153,12 +153,12 @@ type Result<T> = std::result::Result<T, StorageError>;
 // ここから下のstructはディスク上のTOML表現であり、data.rs/store.rsのメモリ上の
 // 表現（Entry/Node/Folder）とは別物。両者の変換は本ファイルのStorage/tree helperが担う。
 
-/// history.toml / pinned.toml のスキーマ版。ファイル形式を非互換に変えるときに上げる。
-/// 0は版の記録がない形式で、そのまま読める。
-/// 書き込みは常にこの版で行う。
+/// history.toml / pinned.toml のスキーマのバージョン。ファイル形式を非互換に変えるときに上げる。
+/// 0はバージョンの記録がない形式で、そのまま読める。
+/// 書き込みは常にこのバージョンで行う。
 const SCHEMA_VERSION: u32 = 1;
 
-/// 読み込んだ版がこのビルドで扱えるか検査する（`SCHEMA_VERSION`以下なら可）。
+/// 読み込んだバージョンがこのビルドで扱えるか検査する（`SCHEMA_VERSION`以下なら可）。
 fn check_schema_version(file: &'static str, found: u32) -> Result<()> {
     if found > SCHEMA_VERSION {
         return Err(StorageError::UnsupportedSchema { file, found });
@@ -1354,7 +1354,7 @@ size = 4
                 "{name} に schema_version がない:\n{text}"
             );
         }
-        // 書いた版で読み戻せる
+        // 書いたバージョンで読み戻せる
         assert!(storage.load_history_index().unwrap().is_empty());
         assert!(storage.load_pinned().unwrap().is_empty());
         fs::remove_dir_all(dir).unwrap();
@@ -1362,7 +1362,7 @@ size = 4
 
     #[test]
     fn index_files_without_schema_version_load_as_version_zero() {
-        // 版の記録がない形式のファイルはそのまま読め、次の保存で現行の版になる
+        // バージョンの記録がない形式のファイルはそのまま読め、次の保存で現行のバージョンになる
         let (dir, storage) = temp_storage();
         fs::write(
             dir.join("history.toml"),
@@ -1382,7 +1382,7 @@ size = 4
 
     #[test]
     fn index_files_with_newer_schema_version_are_rejected_not_overwritten() {
-        // 新しい版のファイルを読み飛ばして次の保存で上書きするとデータを失う。
+        // 新しいバージョンのファイルを読み飛ばして次の保存で上書きするとデータを失う。
         // 読み込みをエラーにし、ファイルには触れない
         let (dir, storage) = temp_storage();
         let future = SCHEMA_VERSION + 1;
@@ -1425,7 +1425,7 @@ size = 4
     }
 
     /// 書式の誤りは、ファイル名と位置（行・文字。全角も1文字と数える）を日本語で出し、`toml` の説明を
-    /// 続ける（該当行の抜き出しと `^` の印は出さない）。
+    /// 続ける（該当行の抜き出しと `^` のマークは出さない）。
     #[test]
     fn parse_error_names_file_and_position() {
         let (dir, storage) = temp_storage();

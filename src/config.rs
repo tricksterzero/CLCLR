@@ -28,7 +28,7 @@ pub struct Config {
     pub format_filter_default: FilterAction,
     pub format_filters: Vec<FormatFilter>,
     /// 1回のコピーで取り込む形式（形式フィルタで取り込む対象になり、形式ごとの上限も通ったもの）の大きさの
-    /// 合計の上限（バイト）。超えたコピーは何も取り込まず、知らせる。0は無制限。以前の版の設定ファイルには
+    /// 合計の上限（バイト）。超えたコピーは何も取り込まず、知らせる。0は無制限。以前のバージョンの設定ファイルには
     /// 無いので、既定（`DEFAULT_CAPTURE_TOTAL_LIMIT`）が効く
     pub capture_total_limit: u64,
     pub window_filters: Vec<WindowFilter>,
@@ -104,7 +104,7 @@ pub struct GeneralConfig {
     /// 更新し、次回起動で復元する。最小化・最大化中の値は記録しない
     pub viewer_width: u32,
     pub viewer_height: u32,
-    /// ビューアの前回の位置（窓の左上。物理px の画面座標で、主モニターより左・上のモニターでは負になる）。
+    /// ビューアの前回の位置（ウィンドウの左上。物理px の画面座標で、主モニターより左・上のモニターでは負になる）。
     /// 大きさと同じく隠す時・終了時に更新し、次回起動で復元する（最小化・最大化中の位置は記録しない）。
     /// 未保存なら `None`（鍵を書かない）で、位置は Windows に任せる。大きさと単位が違うのは、倍率の違う
     /// モニターが並ぶと、96 DPI 基準の位置では場所が決まらないため
@@ -115,7 +115,7 @@ pub struct GeneralConfig {
     pub settings_height: u32,
 }
 
-/// ビューアのクライアント領域の大きさの下限（論理px）。窓の最小の大きさ（`WM_GETMINMAXINFO`）と、
+/// ビューアのクライアント領域の大きさの下限（論理px）。ウィンドウの最小の大きさ（`WM_GETMINMAXINFO`）と、
 /// 設定ファイルから読んだ保存サイズの補正の両方で使う
 pub const VIEWER_MIN_WIDTH: u32 = 400;
 pub const VIEWER_MIN_HEIGHT: u32 = 300;
@@ -169,7 +169,7 @@ pub struct HotkeyConfig {
 }
 
 /// ポップアップメニュー項目にマウスを置く／キーで選ぶと、全文または先頭部分を
-/// 別窓で表示する機能の設定。C版の`menu_show_tooltip`・`tooltip_show_delay`・
+/// 別のウィンドウで表示する機能の設定。C版の`menu_show_tooltip`・`tooltip_show_delay`・
 /// `menu_tooltip_size`に相当し、行数上限はCLCLR独自。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]

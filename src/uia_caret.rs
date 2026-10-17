@@ -1,7 +1,7 @@
 //! UI Automation でキャレットの位置を取る（Win32 のシステムキャレットを公開しないアプリ向け。
 //! Chromium・Electron・WPF・WinUI など）。
 //!
-//! UI Automation のクライアントは、窓を持たない MTA のスレッドから呼ぶ（Microsoft Learn の
+//! UI Automation のクライアントは、ウィンドウを持たない MTA のスレッドから呼ぶ（Microsoft Learn の
 //! 「Understanding Threading Issues」）。呼び出しは専用のスレッドで行い、メニューを出す側は
 //! 短い時間だけ応答を待って、間に合わなければマウスの位置に出す。専用のスレッドは初めて
 //! 問い合わせるときに作り、`UiaCaret` を捨てるまで残す。
@@ -157,7 +157,7 @@ struct Request {
     reply: Sender<Option<(i32, i32)>>,
 }
 
-/// UI Automation の呼び出しを受け持つスレッド（窓を持たない MTA）。
+/// UI Automation の呼び出しを受け持つスレッド（ウィンドウを持たない MTA）。
 pub struct UiaCaret {
     requests: Option<Sender<Request>>,
     /// 依頼を送ってから、スレッドがそれを片付けるまで立つ（応答しないアプリで止まっている間も立ったまま）。
@@ -273,12 +273,12 @@ mod tests {
 
     #[test]
     fn query_returns_within_wait_and_thread_ends_on_drop() {
-        // UI Automation のクライアントが窓などを作りうるので、GUI リソースのテストと直列にする
+        // UI Automation のクライアントがウィンドウなどを作りうるので、GUI リソースのテストと直列にする
         let _gui = crate::tray::lock_gui_resource_tests();
         let uia = UiaCaret::spawn().expect("UI Automation のスレッドを作れなかった");
         for _ in 0..2 {
             let started = Instant::now();
-            // 前面の窓によって位置が取れるかは変わるので、結果は見ず、待ちが上限で戻ることだけを見る
+            // 前面のウィンドウによって位置が取れるかは変わるので、結果は見ず、待ちが上限で戻ることだけを見る
             let _ = uia.query(QUERY_WAIT);
             assert!(started.elapsed() < QUERY_WAIT + Duration::from_millis(200), "待ちが上限を超えた");
         }
@@ -341,7 +341,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0, "期限を過ぎた依頼を問い合わせた");
     }
 
-    /// 準備に失敗したスレッドへの問い合わせは、待たずに `None` になり続ける（処理中の印が立ったままにならない）。
+    /// 準備に失敗したスレッドへの問い合わせは、待たずに `None` になり続ける（処理中のフラグが立ったままにならない）。
     #[test]
     fn failed_start_answers_none_without_waiting() {
         let uia = UiaCaret::spawn_with(|| None::<fn() -> Option<(i32, i32)>>).unwrap();
@@ -358,7 +358,7 @@ mod tests {
     fn failed_com_init_does_not_uninitialize() {
         use windows::Win32::Foundation::S_FALSE;
         use windows::Win32::System::Com::COINIT_APARTMENTTHREADED;
-        // STA の初期化は COM の隠し窓を作りうるので、GUI リソースのテストと直列にする
+        // STA の初期化は COM の隠しウィンドウを作りうるので、GUI リソースのテストと直列にする
         let _gui = crate::tray::lock_gui_resource_tests();
         thread::spawn(|| unsafe {
             assert!(CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok());

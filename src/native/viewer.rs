@@ -1,12 +1,12 @@
-//! ビューアのトップレベル窓。
+//! ビューアのトップレベルウィンドウ。
 //!
 //! メインスレッドで作り、メインスレッドのメッセージループで動かす。トレイ・ホットキー・クリップボード監視の各スレッドは
-//! `Waker` で `WM_APP_WAKE` を投げてこの窓を起こすだけで、実際の処理は `ViewerHandler`
+//! `Waker` で `WM_APP_WAKE` を投げてこのウィンドウを起こすだけで、実際の処理は `ViewerHandler`
 //! （`native::app::App`）がメインスレッド上で行う。
 //!
 //! 子コントロールは、ツリー（`SysTreeView32`、表示対象の選択）・一覧（`SysListView32`、
 //! OwnerData + OwnerDrawFixed の仮想一覧）・プレビュー（EDIT）。
-//! 一覧は窓が持つ行の写し（`ViewState::rows`）だけを読んで描く（描画中にサービスの
+//! 一覧はウィンドウが持つ行のコピー（`ViewState::rows`）だけを読んで描く（描画中にサービスの
 //! ロックや blob の読み込みをしない）。
 //!
 //! 再入の規則: 一覧やツリーを変えるメッセージ（`LVM_SETITEMCOUNT`・`TVM_INSERTITEMW` など）は、
@@ -120,7 +120,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use uuid::Uuid;
 
 // 【読み上げ】ここから — 一覧の読み上げ用の文字列（要件ではない）。
-// この印の対（開始と終了の行を含む）の範囲をすべて消すと外れる（印はこのファイルの中だけ）
+// このマーカーの対（開始と終了の行を含む）の範囲をすべて消すと外れる（マーカーはこのファイルの中だけ）
 use windows::Win32::UI::Controls::{LVIF_TEXT, LVN_GETDISPINFOW, NMLVDISPINFOW};
 // 【読み上げ】ここまで
 
@@ -181,25 +181,25 @@ enum EditTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditState {
     None,
-    /// `TVM_EDITLABEL` を送る前から、`TVN_BEGINLABELEDIT` が来るまで（取り消しの印は `edit_cancel`）
+    /// `TVM_EDITLABEL` を送る前から、`TVN_BEGINLABELEDIT` が来るまで（取り消しのフラグは `edit_cancel`）
     Starting(EditTarget),
     Editing(EditTarget),
     /// `TVN_ENDLABELEDIT`（または開始の失敗）から、後始末（`WM_APP_EDIT_DONE`）が終わるまで
     Finishing,
 }
 
-/// プレビューの画像を描く子窓のクラス名。
+/// プレビューの画像を描く子ウィンドウのクラス名。
 const IMAGE_CLASS_NAME: PCWSTR = w!("CLCLR_ImagePreview");
 
-/// ビューア窓のクラス名。二重起動時に既存の窓を探すのにも使う（タイトルで探すと、
-/// 同じ名前のフォルダを開いているエクスプローラーの窓に当たるため、クラス名で探す）。
+/// ビューアのウィンドウのクラス名。二重起動時に既存のウィンドウを探すのにも使う（タイトルで探すと、
+/// 同じ名前のフォルダを開いているエクスプローラーのウィンドウに当たるため、クラス名で探す）。
 pub const CLASS_NAME: PCWSTR = w!("CLCLR_Viewer");
 
 const ID_TREE: i32 = 100;
 const ID_LIST: i32 = 101;
 const ID_PREVIEW: i32 = 102;
 const ID_SEARCH: i32 = 103;
-/// プレビューの画像の子窓（画像のときだけ EDIT の代わりに出す）
+/// プレビューの画像の子ウィンドウ（画像のときだけ EDIT の代わりに出す）
 const ID_IMAGE: i32 = 104;
 
 /// メニューバーとアクセラレータのコマンド ID（子コントロールの ID・IDOK・IDCANCEL と重ならない値）。
@@ -222,7 +222,7 @@ const CONFIRM_DELETE: i32 = 1000;
 const FOLDER_CONTINUE: i32 = 1001;
 const FOLDER_STOP_CHECKING: i32 = 1002;
 
-/// ビューア窓のスタイル（大きさの換算 `AdjustWindowRectExForDpi` でも使う）。
+/// ビューアのウィンドウのスタイル（大きさの換算 `AdjustWindowRectExForDpi` でも使う）。
 const VIEWER_STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 | WS_CLIPCHILDREN.0);
 
 /// 検索欄の入力が止まってから絞り込むまでの待ち（打鍵ごとに全件を調べないため）。
@@ -239,19 +239,19 @@ const AGE_REFRESH_MS: u32 = 30_000;
 const CLOSE_RETRY_TIMER_ID: usize = 3;
 const CLOSE_RETRY_MS: u32 = 500;
 
-/// プレビュー欄が広がって、今の画像より大きく出せるようになったときの読み直しの待ち（窓の大きさや
+/// プレビュー欄が広がって、今の画像より大きく出せるようになったときの読み直しの待ち（ウィンドウの大きさや
 /// 境目をドラッグしている間に何度も頼まないため）。
 const PREVIEW_REFIT_TIMER_ID: usize = 4;
 const PREVIEW_REFIT_DELAY_MS: u32 = 200;
 
 /// 種別アイコン・サムネイルの大きさと、行の上下左右の余白（96 DPI 基準。実際の大きさは
-/// 窓の DPI に合わせる。`Metrics`）。
+/// ウィンドウの DPI に合わせる。`Metrics`）。
 const ICON_SIZE: i32 = 32;
 const ROW_PAD: i32 = 4;
 /// ツリーのアイコンの大きさ（96 DPI 基準。32px の素材を縮めて使う）。
 const TREE_ICON_SIZE: i32 = 16;
 
-/// 窓の DPI に合わせたフォントと寸法。作成時と `WM_DPICHANGED` で作り直す（`apply_dpi`）。
+/// ウィンドウの DPI に合わせたフォントと寸法。作成時と `WM_DPICHANGED` で作り直す（`apply_dpi`）。
 struct Metrics {
     font: HFONT,
     bold_font: HFONT,
@@ -264,7 +264,7 @@ struct Metrics {
     /// ツリーのアイコン（履歴・フォルダ・ピン留めの順。`tree_image`）。ツリーはこれを破棄しない
     /// （Microsoft Learn の TVM_SETIMAGELIST の説明）ので、差し替えた後に Drop で破棄する
     tree_images: HIMAGELIST,
-    /// 窓のアイコン（exe のアイコンのリソース。小＝タイトルバー、大＝Alt+Tab）。窓は WM_SETICON で
+    /// ウィンドウのアイコン（exe のアイコンのリソース。小＝タイトルバー、大＝Alt+Tab）。ウィンドウは WM_SETICON で
     /// 渡したアイコンを破棄しないので、差し替えた後に Drop で破棄する（`set_window_icons`）
     window_icons: [HICON; 2],
 }
@@ -328,7 +328,7 @@ fn create_tree_images(size: i32) -> HIMAGELIST {
                 let _ = ImageList_Destroy(Some(images));
                 return HIMAGELIST::default();
             }
-            // イメージリストは写しを持つので、元のアイコンは破棄してよい
+            // イメージリストはコピーを持つので、元のアイコンは破棄してよい
             let _ = DestroyIcon(icon);
         }
         images
@@ -347,7 +347,7 @@ fn load_app_icon(size: i32) -> HICON {
     }
 }
 
-/// `Metrics` の窓のアイコンを窓に付ける（作成時と DPI の変更の後。古いアイコンは呼び出し側が
+/// `Metrics` のウィンドウのアイコンをウィンドウに付ける（作成時と DPI の変更の後。古いアイコンは呼び出し側が
 /// `Metrics` ごと破棄する）。
 fn set_window_icons(hwnd: HWND) {
     let Some(ctx) = (unsafe { ctx_ref(hwnd) }) else {
@@ -378,24 +378,24 @@ fn tree_label(node: &TreeNode, history_count: usize) -> String {
 }
 
 
-/// ビューア窓の出来事を受け取る側（メインスレッドで呼ばれる）。
+/// ビューアのウィンドウの出来事を受け取る側（メインスレッドで呼ばれる）。
 pub trait ViewerHandler {
     /// 他スレッドから `WM_APP_WAKE` が届いた。
     fn on_wake(&self, hwnd: HWND);
-    /// 閉じる操作（×・Alt+F4・`WM_CLOSE`）。窓を隠すか終了するかは受け取った側が決める。
-    /// 窓はここでは破棄しない（`DefWindowProcW` の既定処理は `DestroyWindow` を呼ぶため流さない）。
+    /// 閉じる操作（×・Alt+F4・`WM_CLOSE`）。ウィンドウを隠すか終了するかは受け取った側が決める。
+    /// ウィンドウはここでは破棄しない（`DefWindowProcW` の既定処理は `DestroyWindow` を呼ぶため流さない）。
     fn on_close(&self, hwnd: HWND);
-    /// 窓が表示された（非表示の間に溜まった変更を反映する契機）。
+    /// ウィンドウが表示された（非表示の間に溜まった変更を反映する契機）。
     fn on_shown(&self, hwnd: HWND);
     /// ツリーで表示対象が選ばれた（ユーザーの操作。`set_tree` による再構築中は呼ばない）。
     fn on_source_selected(&self, hwnd: HWND, source: Source);
-    /// 窓が隠れた（プレビューや検索用のキャッシュを捨てる契機）。
+    /// ウィンドウが隠れた（プレビューや検索用のキャッシュを捨てる契機）。
     fn on_hidden(&self, hwnd: HWND);
     /// 一覧の選択が変わった（ユーザーの操作。`set_rows` による変化は戻り値で返し、ここでは呼ばない）。
     fn on_selection_changed(&self, hwnd: HWND, id: Option<Uuid>);
     /// 検索欄の入力が変わった（入力が止まってから `SEARCH_DELAY_MS` 後）。
     fn on_search_changed(&self, hwnd: HWND, text: String);
-    /// 窓の DPI が変わり、フォント・寸法を作り直した（プレビューの画像は捨ててあるので出し直す）。
+    /// ウィンドウの DPI が変わり、フォント・寸法を作り直した（プレビューの画像は捨ててあるので出し直す）。
     fn on_metrics_changed(&self, hwnd: HWND);
     /// Windows のセッションが終わる（サインアウト・再起動・シャットダウン。`WM_ENDSESSION` の
     /// wParam が TRUE）。この通知から戻るとプロセスはいつ終了させられてもおかしくなく、
@@ -408,7 +408,7 @@ pub trait ViewerHandler {
     /// `on_tree_command` で伝える）。
     fn on_delete(&self, hwnd: HWND, target: RowTarget);
     /// 行の右クリックメニューに出す項目。None ならメニューを出さない（項目が見つからないなど）。
-    /// サービスのロックは写しを取る間だけ持つ。
+    /// サービスのロックはコピーを取る間だけ持つ。
     fn row_menu(&self, target: RowTarget) -> Option<RowMenu>;
     /// 右クリックメニューで選ばれた操作（メニューが閉じた後に呼ぶ。対象はメニューを出す前に決めたもの）。
     /// ドラッグで行を落としたとき（`RowCommand::Place`。マウスを放した後）もここへ来る。
@@ -428,13 +428,13 @@ pub trait ViewerHandler {
     /// メニューバーの「ツール」→「設定...」（メニューが閉じた後に呼ぶ）。
     fn on_open_settings(&self, _hwnd: HWND) {}
     /// ピン留めのアイテムの今の名前（名前の変更のダイアログに入れる。外の None はアイテムが無い＝
-    /// ダイアログを出さない、内の None は名前が無い）。サービスのロックは写しを取る間だけ持つ。
+    /// ダイアログを出さない、内の None は名前が無い）。サービスのロックはコピーを取る間だけ持つ。
     fn pinned_title(&self, id: Uuid) -> Option<Option<String>>;
     /// 名前の変更のダイアログで「OK」を押した（空なら自動の名前に戻す。ダイアログが閉じた後に呼ぶ）。
     fn on_rename_pinned(&self, hwnd: HWND, id: Uuid, title: String);
 }
 
-/// 他スレッドからビューア窓を起こすための値。HWND は `Send` でないため整数で持つ。
+/// 他スレッドからビューアのウィンドウを起こすための値。HWND は `Send` でないため整数で持つ。
 #[derive(Clone, Copy)]
 pub struct Waker(isize);
 
@@ -546,9 +546,9 @@ impl ImageLink {
     }
 }
 
-/// 窓が持つ描画用の状態。
+/// ウィンドウが持つ描画用の状態。
 struct ViewState {
-    /// 一覧の写し。描画はここだけを読む
+    /// 一覧のコピー。描画はここだけを読む
     rows: Vec<Row>,
     /// ツリー項目の lParam（添字）→ 表示対象
     tree_tokens: Vec<Source>,
@@ -567,7 +567,7 @@ struct ViewState {
     preview_source_size: Option<(u32, u32)>,
 }
 
-/// `GWLP_USERDATA` に置く窓のコンテキスト。フォント・アイコンは作成時に作り、破棄時に解放する。
+/// `GWLP_USERDATA` に置くウィンドウのコンテキスト。フォント・アイコンは作成時に作り、破棄時に解放する。
 struct WindowCtx {
     handler: Rc<dyn ViewerHandler>,
     view: RefCell<ViewState>,
@@ -577,24 +577,24 @@ struct WindowCtx {
     rows_updating: Cell<bool>,
     /// 選択の変化を伝える `WM_APP_SELECTION` を送ってあり、まだ処理していない
     selection_posted: Cell<bool>,
-    /// 窓が非アクティブになったときにフォーカスがあった子コントロール（Alt+Tab などで戻った
+    /// ウィンドウが非アクティブになったときにフォーカスがあった子コントロール（Alt+Tab などで戻った
     /// ときに戻す。HWND は `Send` でないので整数で持つ。0 は無し）
     last_focus: Cell<isize>,
     images: RefCell<Option<ImageLink>>,
-    /// メニューを表示している（行の右クリックメニューの `TrackPopupMenu`、メニューバー・窓メニューの
+    /// メニューを表示している（行の右クリックメニューの `TrackPopupMenu`、メニューバー・ウィンドウメニューの
     /// モーダルループの中）。この間に隠す・終了の要求が来たら `EndMenu` で閉じる（`cancel_modal`）。
-    /// 窓の破棄はこの間に起こさない
+    /// ウィンドウの破棄はこの間に起こさない
     menu_open: Cell<bool>,
-    /// 表示中のダイアログ（確認・バージョン情報の TaskDialog、名前の変更の入力ダイアログの窓。0 は無し）。
+    /// 表示中のダイアログ（確認・バージョン情報の TaskDialog、名前の変更の入力ダイアログのウィンドウ。0 は無し）。
     /// モーダルループの中なので、隠す・終了の要求が来たら「キャンセル」で閉じる（`cancel_modal`。閉じ方は
-    /// `dialog_kind` で変える）。窓の破棄はこの間に起こさない
+    /// `dialog_kind` で変える）。ウィンドウの破棄はこの間に起こさない
     dialog: Cell<isize>,
     /// 表示中（または開きかけ）のダイアログの種類。開く前に立てる
     dialog_kind: Cell<DialogKind>,
     /// TaskDialog を呼んでから `TDN_CREATED`（`dialog` が立つ）までの間。この間もモーダルの表示中として扱う
     /// （`modal_is_open`。終了の要求の後の閉じるやり直しのタイマーを張らせる）
     dialog_opening: Cell<bool>,
-    /// 開きかけの TaskDialog に閉じる要求が来た印。`TDN_CREATED` で立っていれば、すぐにキャンセルで閉じる
+    /// 開きかけの TaskDialog に閉じる要求が来たフラグ。`TDN_CREATED` で立っていれば、すぐにキャンセルで閉じる
     dialog_cancel: Cell<bool>,
     /// DPI に合わせたフォントと寸法（`WM_DPICHANGED` で差し替える。借用は描画・配置の間だけ）
     metrics: RefCell<Metrics>,
@@ -607,7 +607,7 @@ struct WindowCtx {
     /// 最小化・最大化していないときのクライアント領域の大きさ（96 DPI 基準の px）。隠すとき・終了時に
     /// 設定へ保存する（`normal_size`）
     normal_size: Cell<(u32, u32)>,
-    /// 最小化・最大化していないときの窓の左上（物理 px の画面座標。`GetWindowRect`）。隠すとき・終了時に
+    /// 最小化・最大化していないときのウィンドウの左上（物理 px の画面座標。`GetWindowRect`）。隠すとき・終了時に
     /// 設定へ保存する（`normal_position`）
     normal_position: Cell<(i32, i32)>,
     /// ツリーの「履歴」の項目（件数の表示を書き換える。0 は無し）と、表示している件数
@@ -619,17 +619,17 @@ struct WindowCtx {
     preview_height: Cell<Option<u32>>,
     /// ドラッグ中の境目（マウスを捕まえている間）
     drag: Cell<Option<Drag>>,
-    /// ドラッグ中の一覧の行（マウスを捕まえている間。`begin_row_drag`）。描画は落とす先の目印をここから読む
+    /// ドラッグ中の一覧の行（マウスを捕まえている間。`begin_row_drag`）。描画は落とす先のマークをここから読む
     row_drag: Cell<Option<RowDrag>>,
     /// 行のドラッグを右ボタンで取り消し、右ボタンを離すのを待っている（その間もマウスを捕まえておく。
     /// `cancel_row_drag_by_right_button`）
     row_drag_right_up: Cell<bool>,
-    /// ドラッグ中の行の絵の小窓（`drag_image`。HWND は `Send` でないので整数で持つ。0 は無し）
+    /// ドラッグ中の行の絵の小さいウィンドウ（`drag_image`。HWND は `Send` でないので整数で持つ。0 は無し）
     drag_image: Cell<isize>,
-    /// 窓に付けているメニューバー（ドロップダウンは自前描画。`menu_draw::MenuBar` の説明）。窓の破棄の前に
+    /// ウィンドウに付けているメニューバー（ドロップダウンは自前描画。`menu_draw::MenuBar` の説明）。ウィンドウの破棄の前に
     /// 外す（`ViewerWindow` の `Drop`）。借用はメニューバーを差し替える間だけ
     menu_bar: RefCell<Option<MenuBar>>,
-    /// 窓の DPI が変わったが、メニュー・確認ダイアログの表示中なので、メニューバーの作り直しを保留している
+    /// ウィンドウの DPI が変わったが、メニュー・確認ダイアログの表示中なので、メニューバーの作り直しを保留している
     /// （閉じた後の起床で行う）
     menu_bar_pending: Cell<bool>,
     /// 最前面に表示しているか（メニューバーを作り直すときにチェックを引き継ぐ）
@@ -642,7 +642,7 @@ struct WindowCtx {
     tree_rpress: Cell<Option<Option<Source>>>,
     /// ツリーの名前の編集の状態（`begin_edit`・`finish_edit`・`complete_edit`）
     edit: Cell<EditState>,
-    /// 編集を始めている途中（`Starting`）に隠す・終了の要求が来た印。`begin_edit` の最初に下ろし、
+    /// 編集を始めている途中（`Starting`）に隠す・終了の要求が来たフラグ。`begin_edit` の最初に下ろし、
     /// `begin_edit` から戻るまで保持する（`TVN_BEGINLABELEDIT` も見る）
     edit_cancel: Cell<bool>,
     /// 編集を始めたときに選んでいた表示元（後始末で選び直す候補）
@@ -687,15 +687,15 @@ impl WindowCtx {
     }
 }
 
-/// ビューア窓。Drop で窓を破棄する（メッセージループを抜けた後に破棄すること）。
+/// ビューアのウィンドウ。Drop でウィンドウを破棄する（メッセージループを抜けた後に破棄すること）。
 pub struct ViewerWindow {
     hwnd: HWND,
 }
 
 impl ViewerWindow {
-    /// 非表示のビューア窓と子コントロールを作る。`logical_size` はクライアント領域の大きさ
+    /// 非表示のビューアのウィンドウと子コントロールを作る。`logical_size` はクライアント領域の大きさ
     /// （96 DPI 基準の px。設定の `viewer_width`・`viewer_height` と同じく、枠とメニューバーを除いた大きさ）。
-    /// `position` は窓の左上（物理 px の画面座標。設定の `viewer_position`）。その位置の窓がどのモニターにも
+    /// `position` はウィンドウの左上（物理 px の画面座標。設定の `viewer_position`）。その位置のウィンドウがどのモニターにも
     /// 重ならなければ使わず、`None` と同じく Windows に任せる。重なれば、そのモニターの作業領域に収める
     /// （`fit_to_work_area`）。
     pub fn create(
@@ -731,13 +731,13 @@ impl ViewerWindow {
                 None,
             )
         };
-        // 窓に付かなかったメニューは、`menu` の破棄が破棄する（窓に付いた後は、窓の破棄の前に外す。`Drop`）
+        // ウィンドウに付かなかったメニューは、`menu` の破棄が破棄する（ウィンドウに付いた後は、ウィンドウの破棄の前に外す。`Drop`）
         let hwnd = created?;
         menu.mark_attached();
         // コンテキストは作成中のメッセージ（WM_SIZE など）では使わないため、作成に成功してから渡す。
         // 以降は Drop（DestroyWindow → WM_NCDESTROY）で解放される
         let window = Self { hwnd };
-        // 窓が出るモニターの DPI（PerMonitorV2 では窓ごとに異なりうる）に合わせる
+        // ウィンドウが出るモニターの DPI（PerMonitorV2 ではウィンドウごとに異なりうる）に合わせる
         let metrics = Metrics::new(hwnd, unsafe { GetDpiForWindow(hwnd) });
         let font = metrics.font;
         let ctx = Box::new(WindowCtx {
@@ -800,7 +800,7 @@ impl ViewerWindow {
         set_row_height(hwnd);
         set_tree_images(hwnd);
         set_window_icons(hwnd);
-        // 窓が出るモニターの DPI がシステムの DPI と違えば、メニューバーをその DPI で作り直し、大きさを合わせ直す
+        // ウィンドウが出るモニターの DPI がシステムの DPI と違えば、メニューバーをその DPI で作り直し、大きさを合わせ直す
         if let Some(ctx) = unsafe { ctx_ref(hwnd) } {
             let bar_dpi = ctx.menu_bar.borrow().as_ref().map(MenuBar::dpi);
             if bar_dpi != Some(unsafe { GetDpiForWindow(hwnd) }) {
@@ -839,7 +839,7 @@ impl ViewerWindow {
     }
 }
 
-/// 画像の読み込みスレッドとつなぐ。依頼の送り手は窓が持ち、窓の破棄で手放す
+/// 画像の読み込みスレッドとつなぐ。依頼の送り手はウィンドウが持ち、ウィンドウの破棄で手放す
 /// （読み込みスレッドはそれで終わる）。`wanted` は読み込みスレッドに渡したものと同じもの。
 pub fn attach_image_loader(
     hwnd: HWND,
@@ -854,7 +854,7 @@ pub fn attach_image_loader(
     }
 }
 
-/// プレビューに画像を出す。EDIT を隠して画像の子窓を出し、プレビュー欄の大きさに収めた画像の
+/// プレビューに画像を出す。EDIT を隠して画像の子ウィンドウを出し、プレビュー欄の大きさに収めた画像の
 /// 読み込みを頼む（届くまでは空）。
 pub fn show_preview_image(hwnd: HWND, id: Uuid, source: ImageSource) {
     let Some(ctx) = (unsafe { ctx_ref(hwnd) }) else {
@@ -886,8 +886,8 @@ pub fn show_preview_image(hwnd: HWND, id: Uuid, source: ImageSource) {
 impl Drop for ViewerWindow {
     fn drop(&mut self) {
         unsafe {
-            // メニューバーを外してから破棄し、項目のデータを解放する（窓の破棄とデータの解放の順番に頼らない）。
-            // 外せなかったときは窓がメニューを破棄するので、項目のデータは解放せずに残す
+            // メニューバーを外してから破棄し、項目のデータを解放する（ウィンドウの破棄とデータの解放の順番に頼らない）。
+            // 外せなかったときはウィンドウがメニューを破棄するので、項目のデータは解放せずに残す
             if let Some(ctx) = ctx_ref(self.hwnd) {
                 // 借用は取り出すだけで終える（`SetMenu` がメッセージを送る間に借用を持たない）
                 let bar = ctx.menu_bar.borrow_mut().take();
@@ -904,14 +904,14 @@ impl Drop for ViewerWindow {
     }
 }
 
-/// 窓を表示して前面へ出す（最小化中なら元に戻す）。キーボードのフォーカスは一覧に置く。
+/// ウィンドウを表示して前面へ出す（最小化中なら元に戻す）。キーボードのフォーカスは一覧に置く。
 /// 作業領域からはみ出していれば、起動時と同じく収める（`fit_to_work_area`。動作中にタイトルバーを
 /// タスクバーの下や画面の外へ動かしてつかめなくなっても、出す操作で戻るように）。表示中に呼ばれたとき
 /// （トレイのダブルクリックなど）も同じ。最大化中は動かさない。
 pub fn show(hwnd: HWND) {
     unsafe {
         let iconic = IsIconic(hwnd).as_bool();
-        // 最小化中は、元に戻した後の位置で収める（最小化中の窓の矩形は、元に戻したときの位置ではない）
+        // 最小化中は、元に戻した後の位置で収める（最小化中のウィンドウの矩形は、元に戻したときの位置ではない）
         if !iconic && !IsZoomed(hwnd).as_bool() {
             fit_to_work_area(hwnd);
         }
@@ -924,7 +924,7 @@ pub fn show(hwnd: HWND) {
     focus_list(hwnd);
 }
 
-/// 窓を隠す（閉じる = トレイへ隠す）。メニュー・確認ダイアログを表示していれば先に閉じる。
+/// ウィンドウを隠す（閉じる = トレイへ隠す）。メニュー・確認ダイアログを表示していれば先に閉じる。
 pub fn hide(hwnd: HWND) {
     cancel_modal(hwnd);
     unsafe {
@@ -932,7 +932,7 @@ pub fn hide(hwnd: HWND) {
     }
 }
 
-/// メニュー・確認ダイアログを表示しているか（その間は失敗の通知を出さずに保留する。閉じると窓は
+/// メニュー・確認ダイアログを表示しているか（その間は失敗の通知を出さずに保留する。閉じるとウィンドウは
 /// 自分を起こすので、そのときに出る）。
 pub fn modal_is_open(hwnd: HWND) -> bool {
     unsafe { ctx_ref(hwnd) }.is_some_and(|ctx| ctx.menu_open.get() || dialog_active(ctx))
@@ -961,7 +961,7 @@ pub fn cancel_modal(hwnd: HWND) {
         if dialog != 0 {
             cancel_dialog(HWND(dialog as *mut _), ctx.dialog_kind.get());
         } else if ctx.dialog_opening.get() {
-            // まだ窓が無い（`TDN_CREATED`・`WM_INITDIALOG` の前）。窓ができたらすぐ閉じるよう印を立てる
+            // まだウィンドウが無い（`TDN_CREATED`・`WM_INITDIALOG` の前）。ウィンドウができたらすぐ閉じるようフラグを立てる
             // （`confirm_callback`・`name_dialog_proc`）
             ctx.dialog_cancel.set(true);
         }
@@ -1005,7 +1005,7 @@ pub fn retry_modal_close(hwnd: HWND) {
 
 /// 終了の後片付けに入る（メインのループを抜け、最後の保存をした後。ホットキー・トレイのスレッドを
 /// 止める前に呼ぶ）。以後、送られたメッセージが来ても、アプリの処理（ハンドラ）を呼ばない。`WM_CLOSE` は
-/// 何もしない。窓の破棄（`WM_DESTROY`・`WM_NCDESTROY`）はそのまま。既定の処理（活性化など）と子コントロール
+/// 何もしない。ウィンドウの破棄（`WM_DESTROY`・`WM_NCDESTROY`）はそのまま。既定の処理（活性化など）と子コントロール
 /// の処理は走る。やり直しのタイマーと、プレビューの読み直しのタイマーも止める。
 pub fn begin_teardown(hwnd: HWND) {
     if let Some(ctx) = unsafe { ctx_ref(hwnd) } {
@@ -1035,12 +1035,12 @@ pub fn normal_size(hwnd: HWND) -> Option<(u32, u32)> {
     unsafe { ctx_ref(hwnd) }.map(|ctx| ctx.normal_size.get())
 }
 
-/// 最小化・最大化していないときの窓の左上（物理 px の画面座標）。
+/// 最小化・最大化していないときのウィンドウの左上（物理 px の画面座標）。
 pub fn normal_position(hwnd: HWND) -> Option<(i32, i32)> {
     unsafe { ctx_ref(hwnd) }.map(|ctx| ctx.normal_position.get())
 }
 
-/// ビューア窓（とその子コントロール）宛てのキー操作をアクセラレータ（Ctrl+F）で変換する。
+/// ビューアのウィンドウ（とその子コントロール）宛てのキー操作をアクセラレータ（Ctrl+F）で変換する。
 /// 変換したら true（メインのメッセージループは、そのメッセージをほかへ渡さない）。
 pub fn translate_accelerator(hwnd: HWND, msg: &MSG) -> bool {
     let Some(ctx) = (unsafe { ctx_ref(hwnd) }) else {
@@ -1078,13 +1078,13 @@ pub fn is_visible(hwnd: HWND) -> bool {
     unsafe { IsWindowVisible(hwnd).as_bool() }
 }
 
-/// 二重起動したときに、先に起動したインスタンスの窓を探し続ける上限と間隔。
+/// 二重起動したときに、先に起動したインスタンスのウィンドウを探し続ける上限と間隔。
 const SHOW_REQUEST_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 const SHOW_REQUEST_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// 二重起動したとき、既存のインスタンスのビューア窓へ表示要求を送る。
+/// 二重起動したとき、既存のインスタンスのビューアのウィンドウへ表示要求を送る。
 /// 前面化は既存のプロセス側で行うため、このプロセス（ユーザーが起動した前面のプロセス）が
-/// 前面化の権利を相手に渡しておく。先に起動した側がまだ窓を作っていない（起動の途中）ことが
+/// 前面化の権利を相手に渡しておく。先に起動した側がまだウィンドウを作っていない（起動の途中）ことが
 /// あるので、見つかって投稿できるまで `SHOW_REQUEST_LIMIT` の間やり直す。届けられなければ false。
 /// 先に起動した側が終了の途中なら、投稿しても処理されずに消えることがある（残る制限）。
 pub fn request_show_existing() -> bool {
@@ -1103,7 +1103,7 @@ pub fn request_show_existing() -> bool {
     )
 }
 
-/// `find` で窓が見つかり `post` で投稿できるまで、`limit` の間 `interval` ごとにやり直す。投稿できたら true。
+/// `find` でウィンドウが見つかり `post` で投稿できるまで、`limit` の間 `interval` ごとにやり直す。投稿できたら true。
 fn deliver_show_request(
     mut find: impl FnMut() -> Option<HWND>,
     mut post: impl FnMut(HWND) -> bool,
@@ -1170,7 +1170,7 @@ pub fn set_rows(hwnd: HWND, rows: Vec<Row>, select_first_if_missing: bool) -> Op
 }
 
 /// プレビューの EDIT の中身を差し替える（`model::preview_text` で整えた文字列を渡す）。
-/// 画像を出していたら、画像の子窓を隠して画像を解放する。
+/// 画像を出していたら、画像の子ウィンドウを隠して画像を解放する。
 pub fn set_preview_text(hwnd: HWND, text: &str) {
     set_preview(hwnd, text, false);
 }
@@ -1250,7 +1250,7 @@ fn set_tree_images(hwnd: HWND) {
     }
 }
 
-/// クライアント領域を `logical`（96 DPI 基準の px）にするための窓の大きさ（`dpi` で換算し、
+/// クライアント領域を `logical`（96 DPI 基準の px）にするためのウィンドウの大きさ（`dpi` で換算し、
 /// 枠・タイトルバー・1行のメニューバーを足す）。
 fn window_size_for_client(logical: (u32, u32), dpi: u32) -> (i32, i32) {
     let scale = |v: u32| crate::menu_tooltip::scale_for_dpi(v as i32, dpi);
@@ -1261,14 +1261,14 @@ fn window_size_for_client(logical: (u32, u32), dpi: u32) -> (i32, i32) {
     (rc.right - rc.left, rc.bottom - rc.top)
 }
 
-/// 窓の左上（物理 px の画面座標）。取れなければ `None`。
+/// ウィンドウの左上（物理 px の画面座標）。取れなければ `None`。
 fn window_origin(hwnd: HWND) -> Option<(i32, i32)> {
     let mut rc = RECT::default();
     unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rc) }.ok()?;
     Some((rc.left, rc.top))
 }
 
-/// 窓を、いちばん重なるモニターの作業領域（タスクバーなどを除いた範囲。タスクバーがどの辺にあっても
+/// ウィンドウを、いちばん重なるモニターの作業領域（タスクバーなどを除いた範囲。タスクバーがどの辺にあっても
 /// `rcWork` の4辺で決まる）に収める。起動時に保存した位置へ置いたときと、表示するとき（`show`）に使う。
 /// 中に収まっていれば動かさない。
 fn fit_to_work_area(hwnd: HWND) {
@@ -1289,7 +1289,7 @@ fn fit_to_work_area(hwnd: HWND) {
     }
 }
 
-/// 窓の枠の太さ（左右の1辺と下。`dpi` の px）。
+/// ウィンドウの枠の太さ（左右の1辺と下。`dpi` の px）。
 fn frame_thickness(dpi: u32) -> (i32, i32) {
     let mut rc = RECT::default();
     unsafe {
@@ -1299,7 +1299,7 @@ fn frame_thickness(dpi: u32) -> (i32, i32) {
 }
 
 /// `rc` を `work` に収めたときの左上。左右と下は枠の太さ（`frame_x`・`frame_bottom`）まではみ出してよい
-/// （画面の端に寄せた窓を、枠の分のはみ出しだけで起動のたびにずらさないため）。上ははみ出させない
+/// （画面の端に寄せたウィンドウを、枠の分のはみ出しだけで起動のたびにずらさないため）。上ははみ出させない
 /// （タイトルバーをつかめるように）。作業領域より大きい向きは、左・上をそろえる。
 fn fit_into(rc: RECT, work: RECT, frame_x: i32, frame_bottom: i32) -> (i32, i32) {
     let (width, height) = (rc.right - rc.left, rc.bottom - rc.top);
@@ -1317,7 +1317,7 @@ fn unscale(px: i32, dpi: u32) -> u32 {
 }
 
 /// メニューバー（ツール・ヘルプ）を作る。バーの並びは標準の描画、ドロップダウンの項目は自前で描く
-/// （`dpi` で描く）。1つでも足せなければ Err（作りかけのバーは破棄する。欠けたバーを窓に付けない）。
+/// （`dpi` で描く）。1つでも足せなければ Err（作りかけのバーは破棄する。欠けたバーをウィンドウに付けない）。
 fn create_menu_bar(dpi: u32) -> WinResult<MenuBar> {
     let mut bar = MenuBar::new(dpi)?;
     let tools = bar.add_dropdown(w!("ツール(&T)"))?;
@@ -1333,7 +1333,7 @@ fn create_menu_bar(dpi: u32) -> WinResult<MenuBar> {
     Ok(bar)
 }
 
-/// 窓の DPI（`dpi`）でメニューバーを作り直して付け替える（ドロップダウンの項目の大きさはシステムが初めに
+/// ウィンドウの DPI（`dpi`）でメニューバーを作り直して付け替える（ドロップダウンの項目の大きさはシステムが初めに
 /// 測った値を覚えるため、DPI が変わったら作り直す）。メニュー・確認ダイアログの表示中は保留し、閉じた後の
 /// 起床（`WM_APP_WAKE`）で行う（表示中のメニューを差し替え・解放しない）。作るか付け替えるのに失敗したら
 /// 今のメニューバーを使い続ける。「最前面に表示」のチェックは引き継ぐ。
@@ -1384,9 +1384,9 @@ fn focus_search(hwnd: HWND) {
     }
 }
 
-/// 確認ダイアログ（TaskDialog）の通知。表示中のダイアログの窓を `WindowCtx::dialog` に置く
-/// （`lpCallbackData` は `WindowCtx` を指す。ダイアログの表示中は窓を破棄しないので有効）。開きかけの間に
-/// 閉じる要求が来ていれば（`dialog_cancel`）、窓ができた時点でキャンセルで閉じる。
+/// 確認ダイアログ（TaskDialog）の通知。表示中のダイアログのウィンドウを `WindowCtx::dialog` に置く
+/// （`lpCallbackData` は `WindowCtx` を指す。ダイアログの表示中はウィンドウを破棄しないので有効）。開きかけの間に
+/// 閉じる要求が来ていれば（`dialog_cancel`）、ウィンドウができた時点でキャンセルで閉じる。
 unsafe extern "system" fn confirm_callback(
     dialog: HWND,
     msg: TASKDIALOG_NOTIFICATIONS,
@@ -1418,7 +1418,7 @@ fn can_open_dialog(ctx: &WindowCtx) -> bool {
 }
 
 /// TaskDialog を出す（`pfCallback`・`lpCallbackData` はここで入れる）。呼んでから `TDN_CREATED` までを開きかけとして
-/// 追跡し（`dialog_opening`。その間の閉じる要求は `dialog_cancel` に残り、窓ができたら閉じる）、閉じた後に追跡を解いて
+/// 追跡し（`dialog_opening`。その間の閉じる要求は `dialog_cancel` に残り、ウィンドウができたら閉じる）、閉じた後に追跡を解いて
 /// 自分を起こす（表示中に保留した処理を行わせる）。
 fn run_task_dialog(hwnd: HWND, ctx: &WindowCtx, mut config: TASKDIALOGCONFIG, pressed: Option<&mut i32>) -> WinResult<()> {
     config.pfCallback = Some(confirm_callback);
@@ -1903,7 +1903,7 @@ fn ask_name(hwnd: HWND, ctx: &WindowCtx, initial: &str) -> Option<String> {
     if pressed == IDOK.0 as isize { state.result } else { None }
 }
 
-/// 名前の変更のダイアログのプロシージャ。窓ができたら `WindowCtx::dialog` に置き（開きかけの間に閉じる要求が
+/// 名前の変更のダイアログのプロシージャ。ウィンドウができたら `WindowCtx::dialog` に置き（開きかけの間に閉じる要求が
 /// 来ていれば、すぐキャンセルで閉じる）、破棄で外す。
 unsafe extern "system" fn name_dialog_proc(dialog: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
     unsafe {
@@ -1966,7 +1966,7 @@ fn about_content() -> String {
     )
 }
 
-/// 窓の DPI が変わったとき（別のモニターへの移動、表示倍率の変更）に、フォント・寸法を
+/// ウィンドウの DPI が変わったとき（別のモニターへの移動、表示倍率の変更）に、フォント・寸法を
 /// 作り直して子コントロールへ反映する。サムネイルとプレビューの画像は大きさが変わるので捨てる
 /// （ハンドラの `on_metrics_changed` でプレビューを出し直す）。
 fn apply_dpi(hwnd: HWND, ctx: &WindowCtx, dpi: u32) {
@@ -2029,7 +2029,7 @@ pub fn set_tree(hwnd: HWND, nodes: &[TreeNode], selected: Source) {
     ctx.tree_rebuilding.set(false);
 }
 
-/// ツリーを作り直して `selected` の項目を選ぶ（保留を見ない）。選択の通知を止める印（`tree_rebuilding`）は
+/// ツリーを作り直して `selected` の項目を選ぶ（保留を見ない）。選択の通知を止めるフラグ（`tree_rebuilding`）は
 /// 呼び出し側が立てて下ろす（編集の後始末は、後始末の初めから終わりまで立てておくため）。
 fn rebuild_tree_now(ctx: &WindowCtx, tree: HWND, nodes: &[TreeNode], selected: Source) {
     // 表示対象の表は先に作って差し替える（挿入中に通知が来ても借用と衝突しない）
@@ -2114,7 +2114,7 @@ fn edit_hook(hwnd: HWND, point: &'static str) {
 
 /// ツリーの名前の編集を始める。ほかの編集・メニュー・確認ダイアログの表示中は
 /// 始めない。名前の変更は対象のフォルダの項目、作成は親の項目の子の末尾に仮の項目（`TEMP_TOKEN`）を
-/// 挿入してその項目を編集する。取り消しの印（`edit_cancel`）はここから戻るまで保持し、ツリーへ
+/// 挿入してその項目を編集する。取り消しのフラグ（`edit_cancel`）はここから戻るまで保持し、ツリーへ
 /// フォーカスを移した後・`TVN_BEGINLABELEDIT` で確かめる。後始末の投稿は `finish_edit` だけが行う。
 unsafe fn begin_edit(hwnd: HWND, ctx: &WindowCtx, target: EditTarget) {
     unsafe {
@@ -2174,7 +2174,7 @@ unsafe fn begin_edit(hwnd: HWND, ctx: &WindowCtx, target: EditTarget) {
             // 始まらなかった（TVN_BEGINLABELEDIT が来なかった、または来て断った。断ったときは
             // TVN_ENDLABELEDIT が来ない。実機で確かめた）
             EditState::Starting(_) if edit == 0 => finish_edit(hwnd, ctx, None),
-            // 防御の分岐（今の規則では、印が立っていれば TVN_BEGINLABELEDIT で断るので、ふつうは起きない）
+            // 防御の分岐（今の規則では、フラグが立っていれば TVN_BEGINLABELEDIT で断るので、ふつうは起きない）
             EditState::Editing(_) if ctx.edit_cancel.get() => {
                 SendMessageW(tree, TVM_ENDEDITLABELNOW, Some(WPARAM(1)), None);
             }
@@ -2198,7 +2198,7 @@ fn finish_edit(hwnd: HWND, ctx: &WindowCtx, text: Option<String>) {
     }
 }
 
-/// 隠す・終了の要求で名前の編集を取り消す（`cancel_modal` から）。始めている途中なら印を立て（`begin_edit`・
+/// 隠す・終了の要求で名前の編集を取り消す（`cancel_modal` から）。始めている途中ならフラグを立て（`begin_edit`・
 /// `TVN_BEGINLABELEDIT` が見る）、編集中なら取り消す（後始末は `TVN_ENDLABELEDIT` → `finish_edit`）。
 fn cancel_edit(hwnd: HWND, ctx: &WindowCtx) {
     match ctx.edit.get() {
@@ -2399,7 +2399,7 @@ fn register_class() -> WinResult<()> {
             lpfnWndProc: Some(wndproc),
             hInstance: GetModuleHandleW(None)?.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            // 見えるのは子コントロールの間の境目のすき間だけ（境目が分かるよう、窓の地の色にする）
+            // 見えるのは子コントロールの間の境目のすき間だけ（境目が分かるよう、ウィンドウの地の色にする）
             hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as usize as *mut _),
             lpszClassName: CLASS_NAME,
             ..Default::default()
@@ -2640,7 +2640,7 @@ unsafe extern "system" fn tree_subclass_proc(
             // （渡すと既定の処理が離した位置で WM_CONTEXTMENU を出す）
             WM_RBUTTONUP => {
                 if let Some(ctx) = ctx() {
-                    // 印を先に下ろす（外すと WM_CAPTURECHANGED が来る）
+                    // フラグを先に下ろす（外すと WM_CAPTURECHANGED が来る）
                     let pressed = ctx.tree_rpress.take();
                     if GetCapture() == hwnd {
                         let _ = ReleaseCapture();
@@ -2658,7 +2658,7 @@ unsafe extern "system" fn tree_subclass_proc(
                 }
                 LRESULT(0)
             }
-            // 離す前に捕まえたマウスを失った（Alt+Tab・別の窓がキャプチャした など）: 押下は終わったものとする
+            // 離す前に捕まえたマウスを失った（Alt+Tab・別のウィンドウがキャプチャした など）: 押下は終わったものとする
             WM_CAPTURECHANGED => {
                 if let Some(ctx) = ctx() {
                     ctx.tree_rpress.set(None);
@@ -2721,7 +2721,7 @@ struct PaneLayout {
     horizontal_bar: RECT,
 }
 
-/// `v` を `lo` 以上 `hi` 以下にする。`hi` が `lo` より小さい（窓が狭すぎる）ときは `lo` を優先する。
+/// `v` を `lo` 以上 `hi` 以下にする。`hi` が `lo` より小さい（ウィンドウが狭すぎる）ときは `lo` を優先する。
 fn clamp_low_first(v: i32, lo: i32, hi: i32) -> i32 {
     v.min(hi).max(lo)
 }
@@ -2743,7 +2743,7 @@ fn preview_height_px(h: i32, search_h: i32, dpi: u32, preview_height: Option<u32
     clamp_low_first(desired, s(PANE_MIN_HEIGHT), h - search_h - bar - s(PANE_MIN_HEIGHT))
 }
 
-/// クライアント領域 `w`×`h` での配置。左にツリー（窓の高さいっぱい）、縦の境目、右の一番上に検索欄、
+/// クライアント領域 `w`×`h` での配置。左にツリー（ウィンドウの高さいっぱい）、縦の境目、右の一番上に検索欄、
 /// その下に一覧、横の境目、プレビュー。
 fn compute_layout(w: i32, h: i32, search_h: i32, dpi: u32, tree_width: Option<u32>, preview_height: Option<u32>) -> PaneLayout {
     let bar = crate::menu_tooltip::scale_for_dpi(SPLITTER_SIZE, dpi);
@@ -2781,7 +2781,7 @@ fn splitter_at(layout: &PaneLayout, x: i32, y: i32) -> Option<Splitter> {
     }
 }
 
-/// 今の窓の配置（コンテキストを置く前の WM_SIZE では、検索欄の高さは仮の値で、境目は動かしていない扱い）。
+/// 今のウィンドウの配置（コンテキストを置く前の WM_SIZE では、検索欄の高さは仮の値で、境目は動かしていない扱い）。
 fn current_layout(hwnd: HWND) -> Option<PaneLayout> {
     let mut rc = RECT::default();
     unsafe { GetClientRect(hwnd, &mut rc) }.ok()?;
@@ -2794,7 +2794,7 @@ fn current_layout(hwnd: HWND) -> Option<PaneLayout> {
 }
 
 /// ドラッグ中の境目を、マウスの位置（クライアント座標）に合わせて動かす。動かした境目の大きさは、
-/// 最小値で制限したものを 96 DPI 基準で覚える（窓を狭めて表示の上で縮めた分は覚えない）。
+/// 最小値で制限したものを 96 DPI 基準で覚える（ウィンドウを狭めて表示の上で縮めた分は覚えない）。
 fn drag_to(hwnd: HWND, ctx: &WindowCtx, drag: Drag, x: i32, y: i32) {
     let mut rc = RECT::default();
     if unsafe { GetClientRect(hwnd, &mut rc) }.is_err() {
@@ -2818,7 +2818,7 @@ fn drag_to(hwnd: HWND, ctx: &WindowCtx, drag: Drag, x: i32, y: i32) {
     layout(hwnd);
 }
 
-/// マウスのメッセージの lParam のクライアント座標（符号付き。捕まえている間は窓の外で負になりうる）。
+/// マウスのメッセージの lParam のクライアント座標（符号付き。捕まえている間はウィンドウの外で負になりうる）。
 fn mouse_point(lparam: LPARAM) -> (i32, i32) {
     ((lparam.0 & 0xFFFF) as u16 as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32)
 }
@@ -2836,7 +2836,7 @@ fn set_splitter_cursor(splitter: Splitter) {
     }
 }
 
-/// 子コントロールを `compute_layout` の配置に置く。境目のすき間には窓の背景（`COLOR_BTNFACE`）が見える。
+/// 子コントロールを `compute_layout` の配置に置く。境目のすき間にはウィンドウの背景（`COLOR_BTNFACE`）が見える。
 fn layout(hwnd: HWND) {
     let Some(pane) = current_layout(hwnd) else {
         return;
@@ -2860,7 +2860,7 @@ fn layout(hwnd: HWND) {
             }
         }
     }
-    // プレビュー欄が広がったら、画像を大きく読み直す（窓の大きさ・境目・DPI の変更のどれでも通る）
+    // プレビュー欄が広がったら、画像を大きく読み直す（ウィンドウの大きさ・境目・DPI の変更のどれでも通る）
     schedule_preview_refit(hwnd);
 }
 
@@ -3092,8 +3092,8 @@ fn release_images(ctx: &WindowCtx) {
     }
 }
 
-/// プレビューの画像の子窓。画像は親窓のコンテキスト（`ViewState::preview_image`）にあり、
-/// 子窓より大きければ縦横比を保って縮めて、中央に描く。
+/// プレビューの画像の子ウィンドウ。画像は親ウィンドウのコンテキスト（`ViewState::preview_image`）にあり、
+/// 子ウィンドウより大きければ縦横比を保って縮めて、中央に描く。
 unsafe extern "system" fn image_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
@@ -3275,8 +3275,8 @@ fn reorder_selected_row(hwnd: HWND, ctx: &WindowCtx, direction: Direction) {
 
 // --- 一覧の行のドラッグ（ピン留めの行の移動、履歴の行のピン留め） ---
 
-/// ドラッグで落とす先（目印を出す所）。一覧の行は添字ではなく ID で持つ（ドラッグの間に一覧が作り直されても、
-/// 目印が別の行へずれない）。
+/// ドラッグで落とす先（マークを出す所）。一覧の行は添字ではなく ID で持つ（ドラッグの間に一覧が作り直されても、
+/// マークが別の行へずれない）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DropMark {
     /// 一覧の行の間（`before` の行の上。None は最後の行の下）
@@ -3386,7 +3386,7 @@ unsafe fn tree_item_within(ctx: &WindowCtx, tree: HWND, item: HTREEITEM, folder:
     false
 }
 
-/// 窓のクライアント座標 `point` が `child` の中にあれば、`child` のクライアント座標を返す。
+/// ウィンドウのクライアント座標 `point` が `child` の中にあれば、`child` のクライアント座標を返す。
 unsafe fn point_in_child(hwnd: HWND, child: HWND, point: POINT) -> Option<POINT> {
     let mut points = [point];
     unsafe {
@@ -3398,7 +3398,7 @@ unsafe fn point_in_child(hwnd: HWND, child: HWND, point: POINT) -> Option<POINT>
     (p.x >= rc.left && p.x < rc.right && p.y >= rc.top && p.y < rc.bottom).then_some(p)
 }
 
-/// 窓のクライアント座標 `point` で落とす先（一覧の上なら行の間・フォルダの行、ツリーの上ならピン留めの項目）。
+/// ウィンドウのクライアント座標 `point` で落とす先（一覧の上なら行の間・フォルダの行、ツリーの上ならピン留めの項目）。
 /// 一覧の上は、一覧に落とせるドラッグ（`RowDrag::list_folder`）で、一覧がまだそのフォルダを出しているときだけ
 /// （`list_still_droppable`）。
 unsafe fn drop_mark_at(hwnd: HWND, ctx: &WindowCtx, drag: &RowDrag, point: POINT) -> Option<DropMark> {
@@ -3448,7 +3448,7 @@ unsafe fn list_still_droppable(hwnd: HWND, ctx: &WindowCtx, drag: &RowDrag) -> b
     handler.can_drag_row(drag.target)
 }
 
-/// 落とす先の目印を出し直す（`on` なら出し、そうでなければ消す）。一覧の行は描き直す（描画が `row_drag` の目印を
+/// 落とす先のマークを出し直す（`on` なら出し、そうでなければ消す）。一覧の行は描き直す（描画が `row_drag` のマークを
 /// 読むので、先に `row_drag` を変えておく）。ツリーは項目を強調する（`TVGN_DROPHILITE`）。
 unsafe fn refresh_drop_mark(hwnd: HWND, ctx: &WindowCtx, mark: Option<DropMark>, on: bool) {
     let Some(mark) = mark else {
@@ -3483,7 +3483,7 @@ unsafe fn refresh_drop_mark(hwnd: HWND, ctx: &WindowCtx, mark: Option<DropMark>,
     }
 }
 
-/// ドラッグ中のカーソル（落とせる所は矢印、落とせない所は禁止の印）。マウスを捕まえている間は `WM_SETCURSOR`
+/// ドラッグ中のカーソル（落とせる所は矢印、落とせない所は禁止のマーク）。マウスを捕まえている間は `WM_SETCURSOR`
 /// が来ないので、動くたびに合わせる。
 fn set_drag_cursor(droppable: bool) {
     unsafe {
@@ -3495,7 +3495,7 @@ fn set_drag_cursor(droppable: bool) {
 
 /// 一覧の行のドラッグを始める（`LVN_BEGINDRAG`）。ドラッグできる行（ハンドラが決める）だけで、始めない場合は
 /// `can_begin_drag`。ピン留めの行は、一覧に出しているフォルダ（今いるフォルダ）をツリーで選んでいる項目から
-/// 決める（ピン留めでなければ始めない）。履歴の行は一覧の上には落とせない。始めたら窓がマウスを捕まえる
+/// 決める（ピン留めでなければ始めない）。履歴の行は一覧の上には落とせない。始めたらウィンドウがマウスを捕まえる
 /// （`start_drag`。境目のドラッグと同じ）。
 fn begin_row_drag(hwnd: HWND, ctx: &WindowCtx, index: i32) {
     if !can_begin_drag(ctx) {
@@ -3584,7 +3584,7 @@ fn can_begin_drag(ctx: &WindowCtx) -> bool {
     can_open_dialog(ctx) && ctx.drag.get().is_none() && ctx.row_drag.get().is_none() && !ctx.row_drag_right_up.get()
 }
 
-/// ドラッグを始める: 状態を置いて、窓がマウスを捕まえ（離すまで `WM_MOUSEMOVE`・`WM_LBUTTONUP` を受け取る）、
+/// ドラッグを始める: 状態を置いて、ウィンドウがマウスを捕まえ（離すまで `WM_MOUSEMOVE`・`WM_LBUTTONUP` を受け取る）、
 /// 行の絵を出す。
 fn start_drag(hwnd: HWND, ctx: &WindowCtx, drag: RowDrag, look: &DragLook) {
     ctx.row_drag.set(Some(drag));
@@ -3678,7 +3678,7 @@ fn show_drag_image(hwnd: HWND, ctx: &WindowCtx, look: &DragLook, cursor: POINT) 
     }
 }
 
-/// 行の絵を、カーソル（窓のクライアント座標）に合わせて動かす。
+/// 行の絵を、カーソル（ウィンドウのクライアント座標）に合わせて動かす。
 fn move_drag_image(hwnd: HWND, ctx: &WindowCtx, x: i32, y: i32) {
     let image = ctx.drag_image.get();
     if image == 0 {
@@ -3700,7 +3700,7 @@ fn hide_drag_image(ctx: &WindowCtx) {
     }
 }
 
-/// ドラッグ中にマウスが動いた（窓のクライアント座標）: 落とす先を決め直し、変わったら目印を出し直す。ツリーの
+/// ドラッグ中にマウスが動いた（ウィンドウのクライアント座標）: 落とす先を決め直し、変わったらマークを出し直す。ツリーの
 /// 強調は変わらなくても付け直す（ドラッグの間に起床でツリーが作り直されると消えるため）。
 fn drag_row_to(hwnd: HWND, ctx: &WindowCtx, x: i32, y: i32) {
     let Some(drag) = ctx.row_drag.get() else {
@@ -3720,14 +3720,14 @@ fn drag_row_to(hwnd: HWND, ctx: &WindowCtx, x: i32, y: i32) {
     set_drag_cursor(mark.is_some());
 }
 
-/// ドラッグ中にマウスを離した（窓のクライアント座標）: 目印を消してマウスを放し、落とせる所ならハンドラへ移動・
+/// ドラッグ中にマウスを離した（ウィンドウのクライアント座標）: マークを消してマウスを放し、落とせる所ならハンドラへ移動・
 /// ピン留めを伝える（落とす先は離した位置で決め直す）。
 fn finish_row_drag(hwnd: HWND, ctx: &WindowCtx, x: i32, y: i32) {
     let Some(drag) = ctx.row_drag.get() else {
         return;
     };
     let mark = unsafe { drop_mark_at(hwnd, ctx, &drag, POINT { x, y }) };
-    // 印を先に下ろす（放すと WM_CAPTURECHANGED が来る）。行の絵はハンドラへ伝える前に消す
+    // フラグを先に下ろす（放すと WM_CAPTURECHANGED が来る）。行の絵はハンドラへ伝える前に消す
     ctx.row_drag.set(None);
     hide_drag_image(ctx);
     unsafe {
@@ -3742,7 +3742,7 @@ fn finish_row_drag(hwnd: HWND, ctx: &WindowCtx, x: i32, y: i32) {
     }
 }
 
-/// ドラッグを取り消す（Esc・マウスを失った・隠す・終了）。目印と行の絵を消し、まだ捕まえていればマウスを放す（右
+/// ドラッグを取り消す（Esc・マウスを失った・隠す・終了）。マークと行の絵を消し、まだ捕まえていればマウスを放す（右
 /// ボタンでの取り消しの後、右ボタンを離すのを待っている間も放す）。どちらでもなければ何もしない。
 fn cancel_row_drag(hwnd: HWND, ctx: &WindowCtx) {
     let drag = ctx.row_drag.take();
@@ -3761,8 +3761,8 @@ fn cancel_row_drag(hwnd: HWND, ctx: &WindowCtx) {
     }
 }
 
-/// ドラッグ中に右ボタンを押した: ドラッグを取り消して目印と行の絵を消す。マウスは右ボタンを離すまで捕まえたままに
-/// し、離す操作は窓が受け取って捨てる（`WM_RBUTTONUP`）。すぐに放すと、離す操作が下の一覧・ツリーへ届き、右クリック
+/// ドラッグ中に右ボタンを押した: ドラッグを取り消してマークと行の絵を消す。マウスは右ボタンを離すまで捕まえたままに
+/// し、離す操作はウィンドウが受け取って捨てる（`WM_RBUTTONUP`）。すぐに放すと、離す操作が下の一覧・ツリーへ届き、右クリック
 /// のメニューが出うるため。ドラッグしていなければ何もしない（false）。
 fn cancel_row_drag_by_right_button(hwnd: HWND, ctx: &WindowCtx) -> bool {
     let Some(drag) = ctx.row_drag.take() else {
@@ -3860,7 +3860,7 @@ fn build_row_menu(spec: &RowMenu, dpi: u32) -> WinResult<PopupMenu> {
     }
     if spec.has_image {
         menu.append_command(root, MENU_OPEN_IMAGE, "画像を関連付けで開く", MF_STRING, None);
-        // 一時フォルダに書き出した写しを選んだ状態でフォルダを開く
+        // 一時フォルダに書き出したコピーを選んだ状態でフォルダを開く
         menu.append_command(root, MENU_OPEN_IMAGE_LOCATION, "画像を書き出してフォルダで表示", MF_STRING, None);
     }
     if spec.has_text {
@@ -3919,7 +3919,7 @@ impl Drop for BusyGuard<'_> {
 /// 出さない。キーボード（座標が -1, -1）なら選んでいる先頭の行の位置に出す。
 /// 選ばれた操作は、メニューが閉じた後にハンドラへ伝える（`TPM_RETURNCMD`）。メニューの
 /// モーダルループの間は `menu_open` を立て、`ViewState` の借用を持たない（モーダルの間は
-/// 窓のプロシージャが再入するため）。
+/// ウィンドウのプロシージャが再入するため）。
 unsafe fn show_row_menu(hwnd: HWND, ctx: &WindowCtx, list: HWND, lparam: LPARAM) {
     unsafe {
         // ツリーの名前の編集の後始末が済むまでは出さない（一覧の右クリックでフォーカスが移って
@@ -3960,7 +3960,7 @@ unsafe fn show_row_menu(hwnd: HWND, ctx: &WindowCtx, list: HWND, lparam: LPARAM)
         let Some(spec) = handler.row_menu(target) else {
             return;
         };
-        // メニュー全体を、出す位置のモニターの DPI で描く（窓の DPI とは違うことがある）
+        // メニュー全体を、出す位置のモニターの DPI で描く（ウィンドウの DPI とは違うことがある）
         let Ok(menu) = build_row_menu(&spec, crate::menu_tooltip::dpi_at_point(point.x, point.y)) else {
             return;
         };
@@ -4118,7 +4118,7 @@ unsafe fn ctx_ref<'a>(hwnd: HWND) -> Option<&'a WindowCtx> {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         // 終了の後片付け中（`begin_teardown`）は、アプリの処理を呼ばない。`WM_CLOSE` は既定の処理が
-        // `DestroyWindow` を呼ぶので流さない。窓の破棄は下の今の処理へ通す
+        // `DestroyWindow` を呼ぶので流さない。ウィンドウの破棄は下の今の処理へ通す
         if ctx_ref(hwnd).is_some_and(|ctx| ctx.teardown.get()) {
             match msg {
                 WM_CLOSE => return LRESULT(0),
@@ -4150,7 +4150,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
-            // 境目（子コントロールの間のすき間。窓自身のクライアント領域）の上なら矢印のカーソルにする
+            // 境目（子コントロールの間のすき間。ウィンドウ自身のクライアント領域）の上なら矢印のカーソルにする
             WM_SETCURSOR if HWND(wparam.0 as *mut _) == hwnd && (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
                 let mut pt = POINT::default();
                 if GetCursorPos(&mut pt).is_ok() && ScreenToClient(hwnd, &mut pt).as_bool() {
@@ -4196,7 +4196,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
-            // 離したらマウスを放す（行のドラッグなら、その位置へ落とす）。捕まえが外れたら（放した・ほかの窓が
+            // 離したらマウスを放す（行のドラッグなら、その位置へ落とす）。捕まえが外れたら（放した・ほかのウィンドウが
             // 捕まえた・隠れた）ドラッグを終える（行のドラッグは落とさずに取り消す）
             WM_LBUTTONUP => {
                 if let Some(ctx) = ctx_ref(hwnd) {
@@ -4235,7 +4235,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
-            // 最小の大きさ（クライアント領域で 400×300、窓の DPI で換算）
+            // 最小の大きさ（クライアント領域で 400×300、ウィンドウの DPI で換算）
             WM_GETMINMAXINFO => {
                 let info = &mut *(lparam.0 as *mut MINMAXINFO);
                 let (w, h) = window_size_for_client(
@@ -4245,7 +4245,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 info.ptMinTrackSize = POINT { x: w, y: h };
                 LRESULT(0)
             }
-            // メニューバー・窓メニュー（Alt+Space）のモーダルループ（wParam が FALSE。TrackPopupMenu の
+            // メニューバー・ウィンドウメニュー（Alt+Space）のモーダルループ（wParam が FALSE。TrackPopupMenu の
             // ときは TRUE で、その間は `show_row_menu` が `menu_open` を立てている。Microsoft Learn の
             // WM_ENTERMENULOOP の説明）。この間も隠す・終了の要求で閉じられるようにする
             WM_ENTERMENULOOP if wparam.0 == 0 => {
@@ -4347,13 +4347,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         LRESULT(0)
                     }
-                    // 左ボタンでの行のドラッグ（ピン留めの行の移動、履歴の行のピン留め）。マウスは窓が捕まえる
+                    // 左ボタンでの行のドラッグ（ピン留めの行の移動、履歴の行のピン留め）。マウスはウィンドウが捕まえる
                     (ID_LIST, LVN_BEGINDRAG) => {
                         let nm = &*(lparam.0 as *const NMLISTVIEW);
                         begin_row_drag(hwnd, ctx, nm.iItem);
                         LRESULT(0)
                     }
-                    // 左ボタンでのツリーの項目のドラッグ（ピン留めのフォルダの移動）。マウスは窓が捕まえる
+                    // 左ボタンでのツリーの項目のドラッグ（ピン留めのフォルダの移動）。マウスはウィンドウが捕まえる
                     (ID_TREE, TVN_BEGINDRAGW) => {
                         let nm = &*(lparam.0 as *const NMTREEVIEWW);
                         begin_tree_drag(hwnd, ctx, nm.itemNew.hItem);
@@ -4393,7 +4393,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                         LRESULT(0)
                     }
-                    // 名前の編集を始めてよいのは、begin_edit が始めた（Starting）ときだけ。取り消しの印が立って
+                    // 名前の編集を始めてよいのは、begin_edit が始めた（Starting）ときだけ。取り消しのフラグが立って
                     // いれば断る（このとき TVN_ENDLABELEDIT は来ない）。文字のクリックで始まる編集も断る
                     (ID_TREE, TVN_BEGINLABELEDITW) => {
                         let allowed = match ctx.edit.get() {
@@ -4435,7 +4435,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     _ => DefWindowProcW(hwnd, msg, wparam, lparam),
                 }
             }
-            // lParam が 0 のときだけが ShowWindow による表示・非表示（0 以外は所有者の窓の
+            // lParam が 0 のときだけが ShowWindow による表示・非表示（0 以外は所有者のウィンドウの
             // 最小化・復元などによるもの）。なお ShowWindow に SW_SHOWNORMAL を渡すとこの
             // メッセージは送られないため、show() は SW_SHOW・SW_RESTORE を使う
             WM_SHOWWINDOW if lparam.0 == 0 => {
@@ -4628,7 +4628,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 LRESULT(0)
             }
             WM_APP_WAKE => {
-                // ハンドラの Rc を複製してから呼ぶ（呼び出し中に窓が破棄されても解放されない）
+                // ハンドラの Rc を複製してから呼ぶ（呼び出し中にウィンドウが破棄されても解放されない）
                 if let Some(ctx) = ctx_ref(hwnd) {
                     // メニュー・確認ダイアログを閉じた後の起床で、保留していたメニューバーの作り直しを行う
                     if ctx.menu_bar_pending.get() {
@@ -4663,7 +4663,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
-            // メニューのモーダルループの中で窓を破棄しない（ビューア窓の破棄はメッセージループを抜けた後の
+            // メニューのモーダルループの中でウィンドウを破棄しない（ビューアのウィンドウの破棄はメッセージループを抜けた後の
             // `main` だけ）。デバッグ時の検出で、
             // 安全を保つのは破棄の経路のほう
             WM_DESTROY => {
@@ -4768,7 +4768,7 @@ mod tests {
         menu: RefCell<Option<RowMenu>>,
         commands: RefCell<Vec<(Uuid, RowCommand)>>,
         tools: RefCell<Vec<ToolCommand>>,
-        /// 閉じる操作で窓を隠す（アプリのトレイがあるときと同じ）
+        /// 閉じる操作でウィンドウを隠す（アプリのトレイがあるときと同じ）
         hide_on_close: Cell<bool>,
         /// ツリーの右クリックメニューを求められた項目
         tree_menu_requests: RefCell<Vec<Source>>,
@@ -4844,7 +4844,7 @@ mod tests {
         }
     }
 
-    /// 指定の時間だけ、この窓宛てのメッセージ（タイマーを含む）を処理する。
+    /// 指定の時間だけ、このウィンドウ宛てのメッセージ（タイマーを含む）を処理する。
     fn pump(hwnd: HWND, ms: u64) {
         let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
         while std::time::Instant::now() < until {
@@ -4897,7 +4897,7 @@ mod tests {
     }
     // 【読み上げ】ここまで
 
-    /// 窓は非表示で作られ、一覧・ツリー・プレビューの子コントロールを持つ。
+    /// ウィンドウは非表示で作られ、一覧・ツリー・プレビューの子コントロールを持つ。
     #[test]
     fn create_makes_hidden_window_with_child_controls() {
         let _gui = crate::tray::lock_gui_resource_tests();
@@ -4908,7 +4908,7 @@ mod tests {
         }
     }
 
-    /// 閉じる操作はハンドラへ渡すだけで、窓を破棄しない（DefWindowProcW へ流さない）。
+    /// 閉じる操作はハンドラへ渡すだけで、ウィンドウを破棄しない（DefWindowProcW へ流さない）。
     #[test]
     fn wm_close_calls_handler_and_keeps_window() {
         let _gui = crate::tray::lock_gui_resource_tests();
@@ -4921,7 +4921,7 @@ mod tests {
     }
 
     /// セッションの終了（wParam = TRUE）だけをハンドラへ伝え、取りやめ（FALSE）は伝えない。
-    /// 窓は破棄しない。
+    /// ウィンドウは破棄しない。
     #[test]
     fn end_session_is_reported_only_when_session_really_ends() {
         let _gui = crate::tray::lock_gui_resource_tests();
@@ -4951,7 +4951,7 @@ mod tests {
         assert_eq!(recorder.wakes.get(), 1);
     }
 
-    /// 窓を破棄するとハンドラの参照が解放される（WM_NCDESTROY）。
+    /// ウィンドウを破棄するとハンドラの参照が解放される（WM_NCDESTROY）。
     #[test]
     fn destroying_window_releases_handler() {
         let _gui = crate::tray::lock_gui_resource_tests();
@@ -5088,7 +5088,7 @@ mod tests {
             let _ = SetFocus(Some(search));
             assert_eq!(GetFocus(), search, "前提: 検索欄にフォーカスを置けない");
             SendMessageW(hwnd, WM_ACTIVATE, Some(WPARAM(WA_INACTIVE as usize)), Some(LPARAM(0)));
-            // よそへ移ったことにする（窓そのものにフォーカス）
+            // よそへ移ったことにする（ウィンドウそのものにフォーカス）
             let _ = SetFocus(Some(hwnd));
             assert_eq!(GetFocus(), hwnd);
             const WA_ACTIVE: usize = 1;
@@ -5130,7 +5130,7 @@ mod tests {
         (req_rx, res_tx, wanted)
     }
 
-    /// 窓をアクティブにせずに表示し、一覧を今すぐ描かせる（`WM_DRAWITEM` を通す）。
+    /// ウィンドウをアクティブにせずに表示し、一覧を今すぐ描かせる（`WM_DRAWITEM` を通す）。
     fn show_and_paint(window: &ViewerWindow) {
         use windows::Win32::Graphics::Gdi::UpdateWindow;
         use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE;
@@ -5218,8 +5218,8 @@ mod tests {
         assert!(wanted.lock().unwrap().contains(&a.id), "古い世代の結果で、新しい依頼を外した");
     }
 
-    /// TaskDialog を呼んでから窓ができる（`TDN_CREATED`）までの開きかけも、モーダルの表示中として扱う。その間の
-    /// 閉じる要求は印に残る（窓ができたら閉じる）。
+    /// TaskDialog を呼んでからウィンドウができる（`TDN_CREATED`）までの開きかけも、モーダルの表示中として扱う。その間の
+    /// 閉じる要求はフラグに残る（ウィンドウができたら閉じる）。
     #[test]
     fn opening_dialog_counts_as_modal_and_keeps_cancel_request() {
         let _gui = crate::tray::lock_gui_resource_tests();
@@ -5283,8 +5283,8 @@ mod tests {
         assert_eq!(view.generation, before + 1);
     }
 
-    /// 画像のプレビューは EDIT の代わりに画像の子窓を出し、その大きさに収めた読み込みを頼む。
-    /// テキストのプレビューに戻すと画像の子窓を隠す。
+    /// 画像のプレビューは EDIT の代わりに画像の子ウィンドウを出し、その大きさに収めた読み込みを頼む。
+    /// テキストのプレビューに戻すと画像の子ウィンドウを隠す。
     #[test]
     fn preview_image_swaps_edit_for_image_window_and_requests_fitting_size() {
         let _gui = crate::tray::lock_gui_resource_tests();
@@ -5352,7 +5352,7 @@ mod tests {
         assert!(req_rx.try_recv().is_err(), "欄に収まる最大の大きさなのに頼み直した");
     }
 
-    /// 大きすぎて展開しなかったプレビューの画像は、画像の子窓の代わりに省略の注記を出す。
+    /// 大きすぎて展開しなかったプレビューの画像は、画像の子ウィンドウの代わりに省略の注記を出す。
     /// 待っていない項目の結果なら何もしない。
     #[test]
     fn too_large_preview_image_shows_note_instead() {
@@ -5391,7 +5391,7 @@ mod tests {
         assert_eq!(text(edit), crate::native::model::image_too_large_note(20000, 15000));
     }
 
-    /// 読めなかったプレビューの画像は、画像の子窓の代わりに「（プレビューなし）」を薄い文字で出す。
+    /// 読めなかったプレビューの画像は、画像の子ウィンドウの代わりに「（プレビューなし）」を薄い文字で出す。
     /// 同じ項目を頼み直した後に届いた古い依頼の結果では切り替えない。
     /// ほかの文字に替えると、文字の色を既定に戻す。
     #[test]
@@ -5500,7 +5500,7 @@ mod tests {
         assert_eq!(recorder.metrics_changes.get(), 1);
     }
 
-    /// 窓のアイコンの一辺（px）。`GetIconInfo` の色のビットマップ（無ければマスク）の幅。
+    /// ウィンドウのアイコンの一辺（px）。`GetIconInfo` の色のビットマップ（無ければマスク）の幅。
     fn icon_width(icon: HICON) -> i32 {
         use windows::Win32::Graphics::Gdi::{GetObjectW, BITMAP};
         use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, ICONINFO};
@@ -5519,7 +5519,7 @@ mod tests {
         bm.bmWidth
     }
 
-    /// 窓に exe のアイコン（小・大）が付き、その大きさは窓の DPI のシステムの寸法に合う。DPI が
+    /// ウィンドウに exe のアイコン（小・大）が付き、その大きさはウィンドウの DPI のシステムの寸法に合う。DPI が
     /// 変わると、新しい大きさのアイコンへ差し替わる。
     #[test]
     fn window_icons_are_app_icon_sized_for_dpi() {
@@ -5549,7 +5549,7 @@ mod tests {
     }
 
     /// DPI の変更を繰り返しても、フォント・イメージリストの GDI オブジェクトが増え続けない
-    /// （差し替えた古いフォントと、外したイメージリストを解放している）。窓のアイコン（USER
+    /// （差し替えた古いフォントと、外したイメージリストを解放している）。ウィンドウのアイコン（USER
     /// オブジェクト）も増え続けない。
     #[test]
     fn repeated_dpi_changes_do_not_leak_gdi_objects() {
@@ -5617,7 +5617,7 @@ mod tests {
 
     // --- 一覧の操作 ---
 
-    /// 行を入れ、`index` の行を選んで、窓を（前面にせずに）表示する。
+    /// 行を入れ、`index` の行を選んで、ウィンドウを（前面にせずに）表示する。
     fn window_with_rows(labels: &[&str], index: usize) -> (ViewerWindow, Rc<Recorder>, Vec<Uuid>) {
         let (window, recorder) = create_test_window();
         let rows: Vec<Row> = labels.iter().map(|l| row(l)).collect();
@@ -5995,10 +5995,10 @@ mod tests {
         assert_eq!(recorder.menu_requests.borrow().len(), 1, "行の無い所でメニューを出した");
     }
 
-    // --- 窓とメニューバー ---
+    // --- ウィンドウとメニューバー ---
 
     /// メニューバーは「ツール」「ヘルプ」。どの項目も選べる。最前面に表示の
-    /// 切り替えは、窓の最前面の属性とメニューのチェックを合わせる。
+    /// 切り替えは、ウィンドウの最前面の属性とメニューのチェックを合わせる。
     #[test]
     fn menu_bar_and_topmost() {
         use windows::Win32::UI::WindowsAndMessaging::{
@@ -6047,8 +6047,8 @@ mod tests {
         assert_eq!(ask('t'), LRESULT((2 << 16) | 6));
         assert_eq!(ask('s'), LRESULT((2 << 16) | 0), "「設定」を候補にしていない");
 
-        // ドロップダウンのメニューを持ち主（ビューア窓）の下で出し、項目が自前描画の経路を通ることを見る
-        // （テストの窓はアクティブにしないので、メニューバーからは開かず、ドロップダウンを直接出す）
+        // ドロップダウンのメニューをオーナー（ビューアのウィンドウ）の下で出し、項目が自前描画の経路を通ることを見る
+        // （テストのウィンドウはアクティブにしないので、メニューバーからは開かず、ドロップダウンを直接出す）
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
@@ -6065,7 +6065,7 @@ mod tests {
     }
 
     /// DPI が変わるとメニューバーを作り直して付け替え、古いメニューバーは破棄する。「最前面に表示」の
-    /// チェックは引き継ぐ。メニューの表示中は作り直さずに保留し、閉じた後の起床で行う。窓の破棄では、
+    /// チェックは引き継ぐ。メニューの表示中は作り直さずに保留し、閉じた後の起床で行う。ウィンドウの破棄では、
     /// メニューバーを外してから破棄する。
     #[test]
     fn menu_bar_is_rebuilt_on_dpi_change_and_released_with_window() {
@@ -6135,7 +6135,7 @@ mod tests {
         assert_ne!(unsafe { GetMenu(hwnd) }, before);
     }
 
-    /// 窓の大きさ: クライアント領域が指定の大きさ（96 DPI 基準）になり、最小の大きさは
+    /// ウィンドウの大きさ: クライアント領域が指定の大きさ（96 DPI 基準）になり、最小の大きさは
     /// クライアント領域で 400×300。最大化・最小化の大きさは覚えない。
     #[test]
     fn client_size_minimum_and_normal_size() {
@@ -6197,7 +6197,7 @@ mod tests {
                 (work.right + frame_x - 800, work.bottom + frame_bottom - 600)
             );
         }
-        // 枠の分だけ外に出ている窓は動かさない
+        // 枠の分だけ外に出ているウィンドウは動かさない
         assert_eq!(fit_into(rect(-8, 0, 800, 1040), bottom, frame_x, frame_bottom), (-8, 0));
         // 作業領域より大きい向きは左・上をそろえる
         assert_eq!(fit_into(rect(100, 100, 3000, 2000), top, frame_x, frame_bottom), (-frame_x, 48));
@@ -6222,7 +6222,7 @@ mod tests {
         rc
     }
 
-    /// 保存した位置に窓を作り、その位置を覚える。動かすと覚え直し、最大化・最小化中の位置は覚えない。
+    /// 保存した位置にウィンドウを作り、その位置を覚える。動かすと覚え直し、最大化・最小化中の位置は覚えない。
     #[test]
     fn create_at_saved_position_and_remember_normal_position() {
         use windows::Win32::UI::WindowsAndMessaging::{GWL_STYLE, WS_MAXIMIZE};
@@ -6287,7 +6287,7 @@ mod tests {
         hide(hwnd);
     }
 
-    /// 保存した位置の窓がどのモニターにも重ならなければ（モニターを外したときなど）、その位置を使わない。
+    /// 保存した位置のウィンドウがどのモニターにも重ならなければ（モニターを外したときなど）、その位置を使わない。
     #[test]
     fn create_ignores_position_off_every_monitor() {
         let _gui = crate::tray::lock_gui_resource_tests();
@@ -6300,12 +6300,12 @@ mod tests {
         assert_eq!(normal_position(hwnd), Some((rc.left, rc.top)));
     }
 
-    /// 保存した位置の窓が作業領域から一部はみ出していれば、いちばん重なるモニターの作業領域に収める。
+    /// 保存した位置のウィンドウが作業領域から一部はみ出していれば、いちばん重なるモニターの作業領域に収める。
     #[test]
     fn create_fits_partly_outside_position_into_work_area() {
         let _gui = crate::tray::lock_gui_resource_tests();
         let work = primary_work_area();
-        // 主モニターの作業領域の右下の角に、窓の大部分がはみ出す位置
+        // 主モニターの作業領域の右下の角に、ウィンドウの大部分がはみ出す位置
         let saved = (work.right - 100, work.bottom - 50);
         let recorder = Rc::new(Recorder::default());
         let handler: Rc<dyn ViewerHandler> = recorder.clone();
@@ -6378,7 +6378,7 @@ mod tests {
     }
 
     thread_local! {
-        /// 確認ダイアログのテストの予備のタイマーが閉じる窓（ビューア）
+        /// 確認ダイアログのテストの予備のタイマーが閉じるウィンドウ（ビューア）
         static DIALOG_OWNER: Cell<isize> = const { Cell::new(0) };
     }
 
@@ -6854,7 +6854,7 @@ mod tests {
     }
 
     /// ビューアの TaskDialog（バージョン情報）の表示中に設定画面を閉じても、閉じる要求はそのモーダルループの中か後で
-    /// 1回だけ処理され、窓は壊れない。
+    /// 1回だけ処理され、ウィンドウは壊れない。
     #[test]
     fn settings_closed_during_viewer_dialog_is_destroyed_once() {
         use crate::native::settings::{OnClosed, OnOk, SettingsWindow};
@@ -6902,7 +6902,7 @@ mod tests {
 
     // --- ツリーの右クリックメニュー ---
 
-    /// 「履歴」「ピン留め」（子にフォルダ f）のツリーを作り、`selected` を選んで、窓を（前面にせずに）
+    /// 「履歴」「ピン留め」（子にフォルダ f）のツリーを作り、`selected` を選んで、ウィンドウを（前面にせずに）
     /// 表示する。戻り値のハンドルは 履歴・ピン留め・f の順。
     fn window_with_tree(selected: Source, folder: Uuid) -> (ViewerWindow, Rc<Recorder>, HWND, [HTREEITEM; 3]) {
         use windows::Win32::UI::Controls::{TVGN_CHILD, TVGN_NEXT, TVGN_ROOT};
@@ -7392,7 +7392,7 @@ mod tests {
         let _gui = crate::tray::lock_gui_resource_tests();
         let (window, recorder, [folder, item, _]) = window_with_folder_row();
         let hwnd = window.hwnd();
-        // lParam の 29 ビット目は Alt を押している印（WM_SYSKEYDOWN の説明）
+        // lParam の 29 ビット目は Alt を押していることを示すフラグ（WM_SYSKEYDOWN の説明）
         let key = |vk: u16| MSG { hwnd: list(&window), message: WM_SYSKEYDOWN, wParam: WPARAM(vk as usize), lParam: LPARAM(0x2148_0001), ..Default::default() };
         let mut saved = [0u8; 256];
         unsafe {
@@ -7471,7 +7471,7 @@ mod tests {
         assert_eq!(history.command(DropMark::Into(folder.id)), None);
     }
 
-    /// `LVN_BEGINDRAG` を窓へ送る（一覧の `index` の行のドラッグの始まり）。
+    /// `LVN_BEGINDRAG` をウィンドウへ送る（一覧の `index` の行のドラッグの始まり）。
     fn begin_drag(window: &ViewerWindow, index: i32) {
         let mut nm = NMLISTVIEW {
             hdr: NMHDR { hwndFrom: list(window), idFrom: ID_LIST as usize, code: LVN_BEGINDRAG },
@@ -7483,7 +7483,7 @@ mod tests {
         }
     }
 
-    /// 窓のクライアント座標で、一覧の `index` の行の、上端から `fraction`（0〜1）の高さの点。
+    /// ウィンドウのクライアント座標で、一覧の `index` の行の、上端から `fraction`（0〜1）の高さの点。
     fn list_row_point(window: &ViewerWindow, index: usize, fraction: f32) -> POINT {
         let list = list(window);
         let mut rc = RECT { left: LVIR_BOUNDS as i32, ..Default::default() };
@@ -7497,7 +7497,7 @@ mod tests {
         points[0]
     }
 
-    /// 窓のクライアント座標で、ツリーの項目の文字の中央。
+    /// ウィンドウのクライアント座標で、ツリーの項目の文字の中央。
     fn tree_item_point(window: &ViewerWindow, tree: HWND, item: HTREEITEM) -> POINT {
         let rc = unsafe { tree_item_rect(tree, item) }.expect("項目の矩形が取れない");
         let mut points = [POINT { x: (rc.left + rc.right) / 2, y: (rc.top + rc.bottom) / 2 }];
@@ -7507,7 +7507,7 @@ mod tests {
         points[0]
     }
 
-    /// 窓へマウスのメッセージ（`WM_MOUSEMOVE`・`WM_LBUTTONUP`）を送る。
+    /// ウィンドウへマウスのメッセージ（`WM_MOUSEMOVE`・`WM_LBUTTONUP`）を送る。
     fn mouse(hwnd: HWND, msg: u32, point: POINT) {
         let lparam = ((point.y as u16 as u32) << 16 | (point.x as u16 as u32)) as isize;
         unsafe {
@@ -7519,7 +7519,7 @@ mod tests {
         unsafe { ctx_ref(hwnd) }.unwrap().row_drag.get().and_then(|drag| drag.mark)
     }
 
-    /// ドラッグ中の行の絵の小窓（出ていて見えていること）。
+    /// ドラッグ中の行の絵の小さいウィンドウ（出ていて見えていること）。
     fn shown_drag_image(hwnd: HWND) -> HWND {
         let image = unsafe { ctx_ref(hwnd) }.unwrap().drag_image.get();
         assert_ne!(image, 0, "行の絵を出していない");
@@ -7528,7 +7528,7 @@ mod tests {
         image
     }
 
-    /// 行の絵が、カーソル（窓のクライアント座標 `to`）の右下にある。
+    /// 行の絵が、カーソル（ウィンドウのクライアント座標 `to`）の右下にある。
     fn assert_drag_image_at(hwnd: HWND, image: HWND, to: POINT) {
         use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
         let mut screen = to;
@@ -7541,13 +7541,13 @@ mod tests {
         assert_eq!((rc.left, rc.top), expected, "行の絵がカーソルに付いて動かない");
     }
 
-    /// 行の絵が消えている（小窓を破棄した）。
+    /// 行の絵が消えている（小さいウィンドウを破棄した）。
     fn assert_drag_image_gone(hwnd: HWND, image: HWND) {
         assert!(!unsafe { IsWindow(Some(image)) }.as_bool(), "行の絵が残っている");
         assert_eq!(unsafe { ctx_ref(hwnd) }.unwrap().drag_image.get(), 0);
     }
 
-    /// ピン留めの行のドラッグ: 窓がマウスを捕まえ、動かすと落とす先の目印が変わり、離すとマウスを放して、その位置への
+    /// ピン留めの行のドラッグ: ウィンドウがマウスを捕まえ、動かすと落とす先のマークが変わり、離すとマウスを放して、その位置への
     /// 移動を伝える（フォルダの行の中央 → そのフォルダの末尾、フォルダの行の上端 → 一覧のフォルダのその前、
     /// ツリーのフォルダ → その末尾）。ツリーの強調は離すと消える。フォルダを自分のツリーの項目へは落とせない。
     #[test]
@@ -7587,7 +7587,7 @@ mod tests {
         );
     }
 
-    /// ドラッグの取り消し: Esc（検索欄は消さない）・マウスを失う・隠す・終了の要求（`cancel_modal`）で、目印を消して
+    /// ドラッグの取り消し: Esc（検索欄は消さない）・マウスを失う・隠す・終了の要求（`cancel_modal`）で、マークを消して
     /// マウスを放し、移動を伝えない。ハンドラがドラッグできないとした行（検索中のピン留めの行）、名前の編集中は
     /// ドラッグを始めない。
     #[test]
@@ -7720,7 +7720,7 @@ mod tests {
         (window, recorder, tree, ids, items)
     }
 
-    /// `TVN_BEGINDRAG` を窓へ送る（ツリーの `item` のドラッグの始まり）。
+    /// `TVN_BEGINDRAG` をウィンドウへ送る（ツリーの `item` のドラッグの始まり）。
     fn begin_tree_drag_message(hwnd: HWND, tree: HWND, item: HTREEITEM) {
         let mut nm = NMTREEVIEWW {
             hdr: NMHDR { hwndFrom: tree, idFrom: ID_TREE as usize, code: TVN_BEGINDRAGW },
@@ -7732,7 +7732,7 @@ mod tests {
         }
     }
 
-    /// ツリーの `from` をドラッグし、`to`（窓のクライアント座標）へ動かして離す。動かした後の落とす先を返す。離した
+    /// ツリーの `from` をドラッグし、`to`（ウィンドウのクライアント座標）へ動かして離す。動かした後の落とす先を返す。離した
     /// 後はマウスを放し、ツリーの強調が消えている。
     fn drag_tree_item(window: &ViewerWindow, tree: HWND, from: HTREEITEM, to: POINT) -> Option<DropMark> {
         let hwnd = window.hwnd();
@@ -7824,7 +7824,7 @@ mod tests {
         );
     }
 
-    /// 右ボタンでの取り消し: 押すとドラッグを取り消して目印を消すが、右ボタンを離すまでマウスを捕まえたままにし、
+    /// 右ボタンでの取り消し: 押すとドラッグを取り消してマークを消すが、右ボタンを離すまでマウスを捕まえたままにし、
     /// その間に左ボタンを離しても落とさない。右ボタンを離すとマウスを放す。待っている間に隠す・終了の要求
     /// （`cancel_modal`）が来ても放す。ドラッグしていないときの右ボタンは扱わない。
     #[test]
@@ -7932,7 +7932,7 @@ mod tests {
     }
 
     /// ドラッグの間にツリーの選択が変わる（一覧が別のフォルダを出す）・検索を始める（ハンドラがドラッグを許さなく
-    /// なる）と、一覧の上には落とせない（目印を出さず、離しても伝えない）。元に戻れば、また一覧の上に落とせる。
+    /// なる）と、一覧の上には落とせない（マークを出さず、離しても伝えない）。元に戻れば、また一覧の上に落とせる。
     /// 起床による作り直しでも、同じ表示元のままなら落とせ、表示中のフォルダが消えて「履歴」へ切り替わると落とせない。
     #[test]
     fn row_drag_does_not_drop_on_list_after_list_changes() {
@@ -7990,10 +7990,10 @@ mod tests {
         assert!(recorder.commands.borrow().is_empty(), "一覧が変わった後に一覧の上へ落とした");
     }
 
-    /// 実際のマウスの入力で、`from` を押して `over` まで動かす（どちらも窓のクライアント座標。`from` の下は子の窓
+    /// 実際のマウスの入力で、`from` を押して `over` まで動かす（どちらもウィンドウのクライアント座標。`from` の下は子のウィンドウ
     /// `press_on` のはず）。押して動かす・離すのは別のスレッドから行い（一覧・ツリーはドラッグを検知するまで押下の
-    /// 処理から戻らない）、このスレッドはメッセージを処理し続ける。動かし終えたときに、窓がマウスを捕まえているかと
-    /// 落とす先の目印を記録して返す。その後、`right_cancel` なら右ボタンを押して離してから、左ボタンを離す（そうで
+    /// 処理から戻らない）、このスレッドはメッセージを処理し続ける。動かし終えたときに、ウィンドウがマウスを捕まえているかと
+    /// 落とす先のマークを記録して返す。その後、`right_cancel` なら右ボタンを押して離してから、左ボタンを離す（そうで
     /// なければ左ボタンを離すだけ）。カーソルは最後に元へ戻す。
     fn real_mouse_drag(
         window: &ViewerWindow,
@@ -8077,7 +8077,7 @@ mod tests {
         during
     }
 
-    /// 実際のマウスの入力で、ピン留めの行を押して動かすと一覧がドラッグを検知し（`LVN_BEGINDRAG`）、窓がマウスを
+    /// 実際のマウスの入力で、ピン留めの行を押して動かすと一覧がドラッグを検知し（`LVN_BEGINDRAG`）、ウィンドウがマウスを
     /// 捕まえて、フォルダの行の上で離すとそのフォルダへの移動を伝える。
     /// マウスのカーソルを動かす（終わったら戻す）ので、通常の実行では動かさない。
     #[test]
@@ -8092,7 +8092,7 @@ mod tests {
     }
 
     /// 実際のマウスの入力で、ツリーのピン留めのフォルダを押して動かすとツリーがドラッグを検知し（`TVN_BEGINDRAG`）、
-    /// 窓がマウスを捕まえる。押してもツリーの選択（一覧に出しているフォルダ）は変わらないので、一覧の上にも落とせる。
+    /// ウィンドウがマウスを捕まえる。押してもツリーの選択（一覧に出しているフォルダ）は変わらないので、一覧の上にも落とせる。
     /// ツリーのほかのフォルダの上で離すとその中へ、一覧の最後の行の下端で離すと一覧のフォルダの末尾へ移す。
     /// マウスのカーソルを動かす（終わったら戻す）ので、通常の実行では動かさない。
     #[test]
@@ -8478,7 +8478,7 @@ mod tests {
     }
 
     /// 後片付け中は、送られた `WM_CLOSE`・`WM_ENDSESSION`・`WM_ACTIVATE` や起床でアプリの処理を呼ばず、
-    /// `WM_CLOSE` で窓を壊さない。そのまま `ViewerWindow` を破棄しても、窓の破棄の処理は通る。
+    /// `WM_CLOSE` でウィンドウを壊さない。そのまま `ViewerWindow` を破棄しても、ウィンドウの破棄の処理は通る。
     #[test]
     fn teardown_ignores_handlers_but_lets_window_be_destroyed() {
         use windows::Win32::UI::WindowsAndMessaging::WA_ACTIVE;
@@ -8551,7 +8551,7 @@ mod tests {
         assert_eq!(CLOSE_RETRIES.with(Cell::get), 0);
     }
 
-    /// 二重起動の表示要求: 窓が遅れて見つかっても届く。投稿に失敗したら続けてやり直す。上限まで
+    /// 二重起動の表示要求: ウィンドウが遅れて見つかっても届く。投稿に失敗したら続けてやり直す。上限まで
     /// 届けられなければ false。
     #[test]
     fn show_request_waits_for_window_until_limit() {
@@ -8579,7 +8579,7 @@ mod tests {
     }
 
     /// Ctrl+F はアクセラレータで検索欄へのコマンドになる（Ctrl を押していなければ変換しない）。
-    /// ほかの窓宛てのキー操作は変換しない。Ctrl の状態は、このスレッドのキーの状態を書き換えて作る。
+    /// ほかのウィンドウ宛てのキー操作は変換しない。Ctrl の状態は、このスレッドのキーの状態を書き換えて作る。
     #[test]
     fn ctrl_f_is_translated_only_for_viewer() {
         use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState, VK_CONTROL};
@@ -8636,8 +8636,8 @@ mod tests {
         assert_eq!(splitter_at(&l, 100, 421), None);
     }
 
-    /// ドラッグで決めた大きさは 96 DPI 基準で、窓の DPI で換算する。最小値（ツリーの幅 80・右側 200・
-    /// 一覧とプレビューの高さ 60）で制限し、窓が狭すぎるときはツリー・プレビューの最小を優先する。
+    /// ドラッグで決めた大きさは 96 DPI 基準で、ウィンドウの DPI で換算する。最小値（ツリーの幅 80・右側 200・
+    /// 一覧とプレビューの高さ 60）で制限し、ウィンドウが狭すぎるときはツリー・プレビューの最小を優先する。
     #[test]
     fn dragged_sizes_are_scaled_and_clamped() {
         let l = compute_layout(900, 700, 24, 144, Some(150), Some(180));
@@ -8651,7 +8651,7 @@ mod tests {
         assert_eq!(l.search.right - l.search.left, 200, "右側の最小の幅を残していない");
         assert_eq!(l.list.bottom - l.list.top, 60, "一覧の最小の高さを残していない");
 
-        // 窓の最小（クライアント領域 400×300）でも最小値は収まる
+        // ウィンドウの最小（クライアント領域 400×300）でも最小値は収まる
         let l = compute_layout(400, 300, 24, 96, None, None);
         assert!(l.tree.right >= 80 && l.search.right - l.search.left >= 200);
         assert!(l.list.bottom - l.list.top >= 60 && l.preview.bottom - l.preview.top >= 60);

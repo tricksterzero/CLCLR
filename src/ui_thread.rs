@@ -1,7 +1,7 @@
-//! UI スレッド（自分の窓とメッセージループを持つスレッド。ホットキー・トレイ）の止め方。
+//! UI スレッド（自分のウィンドウとメッセージループを持つスレッド。ホットキー・トレイ）の止め方。
 //!
-//! 止める側（メインスレッド。ビューア窓の持ち主）が `join` でただ待つと、止めようとしている
-//! スレッドがメインスレッドの窓へメッセージを送った（`SendMessage` の類）ときに、互いに待って
+//! 止める側（メインスレッド。ビューアのウィンドウの所有者）が `join` でただ待つと、止めようとしている
+//! スレッドがメインスレッドのウィンドウへメッセージを送った（`SendMessage` の類）ときに、互いに待って
 //! 止まる（ホットキースレッドの前面化は、前面のスレッドへ
 //! `AttachThreadInput` して `SetForegroundWindow` を呼ぶので、ビューアが前面ならメインスレッドへ
 //! 活性化のメッセージが送られる）。ここでは、送られたメッセージに応じながら、スレッドが終わるまで
@@ -21,14 +21,14 @@ pub(crate) const REPOST_INTERVAL: Duration = Duration::from_millis(500);
 
 /// `hwnd` へ `shutdown_msg` を投げ、`thread` が終わるまで待って join する（上限なし）。
 ///
-/// 待つ間、このスレッドの窓へ送られたメッセージとシステムの内部の事象は処理する
+/// 待つ間、このスレッドのウィンドウへ送られたメッセージとシステムの内部の事象は処理する
 /// （`PeekMessage(PM_NOREMOVE)`。投稿されたメッセージは取り除かず、配送もしない。Microsoft Learn の
-/// PeekMessageW・MsgWaitForMultipleObjects）。ビューア窓は呼ぶ前に後片付け中にしておく
+/// PeekMessageW・MsgWaitForMultipleObjects）。ビューアのウィンドウは呼ぶ前に後片付け中にしておく
 /// （`viewer::begin_teardown`。送られたメッセージでアプリの処理を呼ばない）。
 ///
 /// `repost_interval` ごとに `shutdown_msg` を投げ直す。止めようとしているスレッドがメニューの
 /// モーダルループの中なら、そのたびに `EndMenu` をやり直すことになる（できれば、の扱い。`EndMenu` の
-/// 失敗からの回復は保証しない）。投げ直しの失敗（窓がもう無い）は無視して待ち続ける。
+/// 失敗からの回復は保証しない）。投げ直しの失敗（ウィンドウがもう無い）は無視して待ち続ける。
 ///
 /// 待つ処理そのものが失敗したら（`WAIT_FAILED`）、ログを書いて `join` で待つ。この経路では送られた
 /// メッセージに応じられないので、#10 の相互待ちは解けない（失敗のときだけの縮退）。
@@ -40,9 +40,9 @@ pub(crate) fn stop_ui_thread(hwnd: HWND, shutdown_msg: u32, thread: JoinHandle<(
     join_answering_sent_messages(thread, repost_interval, post);
 }
 
-/// `thread` が終わるまで、このスレッドの窓へ送られたメッセージに応じながら待って join する（上限なし）。
-/// `interval` ごとに `on_interval` を呼ぶ。窓を持たないスレッド（監視のワーカー）の終わりを待つときも使う: 待たれる
-/// スレッドが、待つ側の窓（ビューア）のタイトルを `GetWindowText` で読むと、自分のプロセスの窓なので `WM_GETTEXT` が
+/// `thread` が終わるまで、このスレッドのウィンドウへ送られたメッセージに応じながら待って join する（上限なし）。
+/// `interval` ごとに `on_interval` を呼ぶ。ウィンドウを持たないスレッド（監視のワーカー）の終わりを待つときも使う: 待たれる
+/// スレッドが、待つ側のウィンドウ（ビューア）のタイトルを `GetWindowText` で読むと、自分のプロセスのウィンドウなので `WM_GETTEXT` が
 /// 送られる（Microsoft Learn の GetWindowTextW）。ただ join で待つと互いに待って止まる。応じ方と縮退は
 /// `stop_ui_thread` と同じ。
 pub(crate) fn join_answering_sent_messages(thread: JoinHandle<()>, interval: Duration, mut on_interval: impl FnMut()) {
@@ -94,7 +94,7 @@ mod tests {
     const WM_TEST_POSTED: u32 = WM_APP + 51;
 
     thread_local! {
-        /// このスレッドの窓が受けた WM_TEST_PING・WM_TEST_POSTED の数
+        /// このスレッドのウィンドウが受けた WM_TEST_PING・WM_TEST_POSTED の数
         static PINGS: Cell<usize> = const { Cell::new(0) };
         static POSTED: Cell<usize> = const { Cell::new(0) };
     }
@@ -123,7 +123,7 @@ mod tests {
         unsafe { RegisterClassW(&wc) };
     }
 
-    /// このスレッドの窓（メッセージ専用）。
+    /// このスレッドのウィンドウ（メッセージ専用）。
     fn own_window() -> HWND {
         register();
         unsafe {
@@ -149,7 +149,7 @@ mod tests {
     unsafe impl Send for SendHwnd {}
 
     /// 止める依頼（WM_TEST_SHUTDOWN）を受けたら `on_shutdown` を行い、`quit_after` 回目で抜ける UI スレッド。
-    /// 窓と、受けた止める依頼の数を返す。
+    /// ウィンドウと、受けた止める依頼の数を返す。
     fn spawn_ui(
         quit_after: usize,
         on_shutdown: impl Fn(usize) + Send + 'static,
@@ -189,8 +189,8 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
-    /// 止める依頼を受けたスレッドが、終わる前に止める側の窓へ `SendMessage` しても、止める側がそれに
-    /// 応じるので止まらない（ただ join で待つと、互いに待って止まる。#10 の仕組み）。止める側の窓へ
+    /// 止める依頼を受けたスレッドが、終わる前に止める側のウィンドウへ `SendMessage` しても、止める側がそれに
+    /// 応じるので止まらない（ただ join で待つと、互いに待って止まる。#10 の仕組み）。止める側のウィンドウへ
     /// 投稿されたメッセージは、待つ間は配送されずに列に残る。見張りの別スレッドで、止まったときに
     /// テストを失敗させる。
     #[test]

@@ -44,7 +44,7 @@ pub enum ClipboardError {
     /// `set_clipboard`に非空の`formats`を渡したのに1形式も書き込めなかった
     /// （`formats`が最初から空の場合はこれに含めない。意図的な空クリップボード化と区別するため）
     AllFormatsFailed,
-    /// 空にした後の `SetClipboardData` がすべて失敗した（元の中身は消えている。写しを取って戻すことは
+    /// 空にした後の `SetClipboardData` がすべて失敗した（元の中身は消えている。コピーを取って戻すことは
     /// しない）
     AllFormatsFailedAfterEmpty,
 }
@@ -128,7 +128,7 @@ fn format_name(id: u32) -> String {
 
 /// プロセスの中でクリップボードを開く区間を1つずつに並べるロック（ビューアの送出・ホットキーの
 /// 送出・起動時の同期・監視の取り込みが重なっても、形式が混ざらないようにする）。どれも同じ
-/// 監視の窓を渡して開くので、プロセス内の並びは OS の排他ではなくこのロックで保証する（同じ窓を
+/// 監視のウィンドウを渡して開くので、プロセス内の並びは OS の排他ではなくこのロックで保証する（同じウィンドウを
 /// 渡した別スレッドの `OpenClipboard` が失敗するかは確かめていない）。書く側は、閉じて変更番号を
 /// 記録するまでこのロックを持つ（`ClipboardGuard::close`）。このロックを持ったまま `Core` の
 /// 操作を呼ばない。
@@ -150,7 +150,7 @@ const OPEN_ATTEMPTS: u32 = 10;
 const OPEN_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 impl ClipboardGuard {
-    /// `owner` を渡して開く。窓を渡さない `OpenClipboard(None)` では、開いている間もほかの
+    /// `owner` を渡して開く。ウィンドウを渡さない `OpenClipboard(None)` では、開いている間もほかの
     /// プロセスが開いて書けてしまう（実測）。
     fn open(owner: HWND) -> Result<Self> {
         let lock = CLIPBOARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -194,7 +194,7 @@ impl Drop for ClipboardGuard {
     }
 }
 
-/// クリップボードを開くときに渡す窓（監視の窓）と、抑止する変更番号。監視が作り
+/// クリップボードを開くときに渡すウィンドウ（監視のウィンドウ）と、抑止する変更番号。監視が作り
 /// （`ClipboardWatcher::port`）、書く側（ホットキー・ビューアの操作・起動時の同期）と監視の
 /// 取り込みが共有する。クリップボードを開く処理は、すべてこれを通す。
 ///
@@ -219,7 +219,7 @@ impl ClipboardPort {
         Self { owner, suppressed: AtomicU32::new(0) }
     }
 
-    /// テスト用: 窓を持たない port（クリップボードを開かないテストへ渡す。開くとデバッグビルドで
+    /// テスト用: ウィンドウを持たない port（クリップボードを開かないテストへ渡す。開くとデバッグビルドで
     /// 止まる）。
     #[cfg(test)]
     pub(crate) fn unopenable() -> Self {
@@ -318,7 +318,7 @@ pub enum WatchProblem {
 }
 
 /// 監視の取り込み: 開いてから変更番号を読み、抑止する番号と同じなら中身を読まない。開いている
-/// 間はほかのプロセスが書けない（監視の窓を渡して開くため）ので、読んだ番号と中身は同じ状態の
+/// 間はほかのプロセスが書けない（監視のウィンドウを渡して開くため）ので、読んだ番号と中身は同じ状態の
 /// もの。
 fn capture_clipboard(config: &Config, port: &ClipboardPort) -> Result<Capture> {
     let guard = port.open()?;
@@ -340,7 +340,7 @@ fn exceeds_total(total: u64, limit: u64) -> bool {
 /// 開いているクリップボード（`guard`）の中身を読む（`capture_clipboard` の本体）。先に取り込む形式と大きさを
 /// 数え、合計が上限を超えたら中身を写さずに `Err` を返す（大きな確保そのものをしない）。
 ///
-/// 数えるときに取ったハンドルは、写すときには使わない。遅延描画では、後の形式を描くときに持ち主が前の形式を
+/// 数えるときに取ったハンドルは、写すときには使わない。遅延描画では、後の形式を描くときにオーナーが前の形式を
 /// 設定し直すことがあり、そのとき前に取ったハンドルは使えない（GetClipboardData の文書は、取ったらすぐ写すことと、
 /// 同じ形式の SetClipboardData の後はハンドルを使わないことを求める）。写すときに形式ごとにハンドルを取り直し、
 /// 大きさを読み直して上限を確かめ直してから、すぐ写す（どの形式も数えるときに描き終えているので、取り直しでは
@@ -523,7 +523,7 @@ pub(crate) fn with_open_port(
 }
 
 /// クリップボードが空のときだけ書き込む（起動時の同期で、空のクリップボードへ最新の履歴を戻す。
-/// 常に抑止する）。空の確認と書き込みを、クリップボードを開いたまま続けて行う（監視の窓を渡して
+/// 常に抑止する）。空の確認と書き込みを、クリップボードを開いたまま続けて行う（監視のウィンドウを渡して
 /// 開くので、開いている間はほかのアプリが中身を変えられない。確認と書き込みの間に入った新しい
 /// コピーを消さないため）。空でなければ書かずに `Ok(false)` を返し、記録も変えない。
 pub fn set_clipboard_if_empty_suppressed(port: &ClipboardPort, formats: &[Format]) -> Result<bool> {
@@ -582,7 +582,7 @@ fn is_window_handle_ignored(hwnd: HWND, config: &Config) -> bool {
 /// 判定しうる。
 /// `GetClipboardOwner`（コピー元によりデータを設定したウィンドウ）への単純な置き換えは
 /// 採らない: Chromium系アプリ（Chrome/Edge/Electron等）はクリップボード書き込み時に
-/// 専用の非表示メッセージ窓（タイトルなし、クラス名`Chrome_MessageWindow`）を使うため、
+/// 専用の非表示メッセージウィンドウ（タイトルなし、クラス名`Chrome_MessageWindow`）を使うため、
 /// オーナー単独判定だと既存のブラウザ向けフィルタ設定（タイトル/クラス名指定）が
 /// 一致しなくなり、除外漏れが起きる（Chromium
 /// `clipboard_win.cc`/`message_window.cc`で確認）。両者のOR判定なら、既存の
@@ -603,7 +603,7 @@ fn is_clipboard_source_ignored(config: &Config) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Outcome {
-    /// 前面の窓・持ち主の窓がフィルタに一致した（開いていない）
+    /// 前面のウィンドウ・オーナーのウィンドウがフィルタに一致した（開いていない）
     Ignored,
     /// 抑止する番号と同じだった（中身は読んでいない）
     Suppressed { seq: u32 },
@@ -657,15 +657,15 @@ impl WatchSwitch {
     }
 }
 
-/// 監視の窓からワーカーへの知らせ（クリップボードが変わった。`capture_now` の頼みも同じ形で送る）。
+/// 監視のウィンドウからワーカーへの通知（クリップボードが変わった。`capture_now` の頼みも同じ形で送る）。
 #[derive(Clone, Copy, Debug)]
 struct Changed {
-    /// 変更の通知を受けた瞬間の前面の窓（ハンドルの値。ほとんどはコピー元）。0 は無い（`capture_now`）
+    /// 変更の通知を受けた瞬間の前面のウィンドウ（ハンドルの値。ほとんどはコピー元）。0 は無い（`capture_now`）
     foreground: isize,
 }
 
 impl Changed {
-    /// 通知を受けた瞬間の前面の窓がウィンドウフィルタに当たるか（ワーカーが受け取ってすぐに読む）。
+    /// 通知を受けた瞬間の前面のウィンドウがウィンドウフィルタに当たるか（ワーカーが受け取ってすぐに読む）。
     fn source_ignored(self, config: &Config) -> bool {
         !config.window_filters.is_empty()
             && is_window_handle_ignored(HWND(self.foreground as *mut core::ffi::c_void), config)
@@ -688,10 +688,10 @@ fn worker_loop(
         let config = config.read().unwrap_or_else(|p| p.into_inner()).clone();
         let interval = Duration::from_millis(config.history.add_interval_ms.max(1));
 
-        // ウィンドウフィルタは、変更の通知を受けた瞬間の前面の窓（ほとんどはコピー元。通知を受ける前に切り替えられると
-        // 別の窓になり、その場合は漏れうる）でも判定する。まとめ待ちの後の前面の窓だけだと、コピーしてすぐ別の窓へ
-        // 切り替えたときに当たらない。知らせを受け取ったらすぐに読む（ワーカーは
-        // 知らせを待って止まっているので、通知の直後）。まとめた知らせのどれかで当たれば、まとめた1回を取り込まない
+        // ウィンドウフィルタは、変更の通知を受けた瞬間の前面のウィンドウ（ほとんどはコピー元。通知を受ける前に切り替えられると
+        // 別のウィンドウになり、その場合は漏れうる）でも判定する。まとめ待ちの後の前面のウィンドウだけだと、コピーしてすぐ別のウィンドウへ
+        // 切り替えたときに当たらない。通知を受け取ったらすぐに読む（ワーカーは
+        // 通知を待って止まっているので、通知の直後）。まとめた通知のどれかで当たれば、まとめた1回を取り込まない
         let mut ignored_at_change = first.source_ignored(&config);
 
         // デバウンス: interval 内に届いた後続イベントは1回にまとめる
@@ -766,7 +766,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_CLIPBOARDUPDATE => {
                 let ctx = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowContext;
                 if let Some(ctx) = ctx.as_ref() {
-                    // 前面の窓のハンドルを取るだけ（タイトル・クラス名はワーカーが読む）
+                    // 前面のウィンドウのハンドルを取るだけ（タイトル・クラス名はワーカーが読む）
                     let foreground = GetForegroundWindow().0 as isize;
                     let _ = ctx.changed_tx.send(Changed { foreground });
                 }
@@ -856,7 +856,7 @@ fn shutdown_window_thread(hwnd: HWND, thread: JoinHandle<()>) {
 /// Drop時にウィンドウ・スレッドを後片付けする。
 pub struct ClipboardWatcher {
     hwnd: HWND,
-    /// クリップボードを開くときに渡す窓（この監視の窓）と、抑止する変更番号
+    /// クリップボードを開くときに渡すウィンドウ（この監視のウィンドウ）と、抑止する変更番号
     port: Arc<ClipboardPort>,
     /// 変更通知チャネルの送信側の複製（`capture_now`用。主経路は監視ウィンドウ）。
     /// `Option`にしているのは`Drop::drop`内で`worker_thread.join()`より前に
@@ -864,7 +864,7 @@ pub struct ClipboardWatcher {
     changed_tx: Option<mpsc::Sender<Changed>>,
     window_thread: Option<JoinHandle<()>>,
     worker_thread: Option<JoinHandle<()>>,
-    /// 監視の窓を今クリップボードの変更の通知に登録しているか（実際の状態）と、その切り替え。
+    /// 監視のウィンドウを今クリップボードの変更の通知に登録しているか（実際の状態）と、その切り替え。
     /// トレイのアイコン・メニューのチェックもこれで決める（設定の値と食い違いうるため）
     switch: Arc<WatchSwitch>,
 }
@@ -922,7 +922,7 @@ impl ClipboardWatcher {
         let watch = config.read().unwrap_or_else(|p| p.into_inner()).general.clipboard_watch;
         if watch {
             if let Err(e) = unsafe { AddClipboardFormatListener(hwnd) } {
-                // 失敗時はここまでに作った窓・スレッドを片付けてから返す（残すとリークする）
+                // 失敗時はここまでに作ったウィンドウ・スレッドを片付けてから返す（残すとリークする）
                 shutdown_window_thread(hwnd, window_thread);
                 return Err(e.into());
             }
@@ -948,16 +948,16 @@ impl ClipboardWatcher {
 
     /// 現在のクリップボード内容を（変更を待たず）取り込む。起動時同期用。
     /// 変更通知と同じワーカー経路に乗せるため、フィルタ・重複チェック等の
-    /// ポリシーは通常のキャプチャと同一に適用される（変更の瞬間の前面の窓は無いので、ウィンドウフィルタは
-    /// 判定の時点の前面の窓と持ち主の窓だけで見る）。
+    /// ポリシーは通常のキャプチャと同一に適用される（変更の瞬間の前面のウィンドウは無いので、ウィンドウフィルタは
+    /// 判定の時点の前面のウィンドウとオーナーのウィンドウだけで見る）。
     pub fn capture_now(&self) {
         if let Some(tx) = &self.changed_tx {
             let _ = tx.send(Changed { foreground: 0 });
         }
     }
 
-    /// クリップボードを開くときに渡す窓（この監視の窓）と、抑止する変更番号（`ClipboardPort`）。
-    /// クリップボードへ書く側（ホットキー・ビューアの操作・起動時の同期）へ渡す。窓はこの監視を
+    /// クリップボードを開くときに渡すウィンドウ（この監視のウィンドウ）と、抑止する変更番号（`ClipboardPort`）。
+    /// クリップボードへ書く側（ホットキー・ビューアの操作・起動時の同期）へ渡す。ウィンドウはこの監視を
     /// 破棄するまで生きている（`main` は、受け付けを閉じて書く側が書かなくなった後に破棄する）。
     pub fn port(&self) -> Arc<ClipboardPort> {
         Arc::clone(&self.port)
@@ -995,7 +995,7 @@ impl Drop for ClipboardWatcher {
         // 既にWM_DESTROY処理によりdrop済みなので、残る送信側はこれだけ）
         self.changed_tx = None;
         if let Some(t) = self.worker_thread.take() {
-            // ワーカーは前面の窓・持ち主の窓のタイトルを読む。それがこのスレッドの窓（ビューア）だと `WM_GETTEXT` が
+            // ワーカーは前面のウィンドウ・オーナーのウィンドウのタイトルを読む。それがこのスレッドのウィンドウ（ビューア）だと `WM_GETTEXT` が
             // 送られてくるので、応じながら待つ（ただ join すると互いに待って止まる）
             crate::ui_thread::join_answering_sent_messages(t, crate::ui_thread::REPOST_INTERVAL, || {});
         }
@@ -1011,15 +1011,15 @@ pub(crate) mod test_support {
     use crate::config::Config;
 
     /// 実クリップボードを読み書きするテスト同士が並列に動くと、互いの書き込みや
-    /// `EmptyClipboard`が混ざるため、このMutexで直列化する（別々のテストが別々の監視の窓で
+    /// `EmptyClipboard`が混ざるため、このMutexで直列化する（別々のテストが別々の監視のウィンドウで
     /// 開くので、実行時の `CLIPBOARD_LOCK` だけでは書き込みから検証までをまとめて守れない）。
     /// 実行時の `CLIPBOARD_LOCK` とは別のロックで、取る順はいつもこちら → `CLIPBOARD_LOCK`
     /// （テストがこれを持ったまま本体の関数を呼ぶ）。
     static CLIPBOARD_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    /// テスト用の監視（監視は切ってある。クリップボードを開く窓 `port()` を得るためのもの）。
-    /// 窓とスレッドを作るので、呼ぶ前にクリップボード用 → GUI 用（`tray::lock_gui_resource_tests`）
-    /// の順にロックを取り、破棄（窓・スレッドの終わりの待ち）が済むまで持つ。
+    /// テスト用の監視（監視は切ってある。クリップボードを開くウィンドウ `port()` を得るためのもの）。
+    /// ウィンドウとスレッドを作るので、呼ぶ前にクリップボード用 → GUI 用（`tray::lock_gui_resource_tests`）
+    /// の順にロックを取り、破棄（ウィンドウ・スレッドの終わりの待ち）が済むまで持つ。
     pub(crate) fn test_watcher() -> ClipboardWatcher {
         let mut config = Config::default();
         config.general.clipboard_watch = false;
@@ -1074,7 +1074,7 @@ mod tests {
     /// dropを別スレッドで実行し、タイムアウト付きで完了を待つことで検証する。
     #[test]
     fn watcher_drop_does_not_deadlock() {
-        // 監視の窓とスレッドを作り、監視はオン（ほかのテストの書き込みを取り込みに行きうる）ので、
+        // 監視のウィンドウとスレッドを作り、監視はオン（ほかのテストの書き込みを取り込みに行きうる）ので、
         // クリップボード用 → GUI 用の順にロックを取り、破棄の完了（下の待ち）まで持つ
         let _clipboard = lock_clipboard_tests();
         let _gui = crate::tray::lock_gui_resource_tests();
@@ -1120,7 +1120,7 @@ mod tests {
     /// 後片付け）が実際のウィンドウ・スレッドに対してハングせず完了する。
     #[test]
     fn shutdown_window_thread_does_not_hang() {
-        // 監視の窓とスレッドを作るので、クリップボード用 → GUI 用の順にロックを取る
+        // 監視のウィンドウとスレッドを作るので、クリップボード用 → GUI 用の順にロックを取る
         let _clipboard = lock_clipboard_tests();
         let _gui = crate::tray::lock_gui_resource_tests();
         let (changed_tx, _changed_rx) = mpsc::channel::<Changed>();
@@ -1157,8 +1157,8 @@ mod tests {
         assert!(!is_window_handle_ignored(HWND::default(), &config));
     }
 
-    /// メッセージを処理し続ける別のスレッドに作った、タイトル付きの窓（ほかのアプリの窓の代わり。ワーカーがタイトルを
-    /// 読むと、そのスレッドへ `WM_GETTEXT` が送られるので、処理し続ける）。破棄で窓を閉じ、スレッドを終える。
+    /// メッセージを処理し続ける別のスレッドに作った、タイトル付きのウィンドウ（ほかのアプリのウィンドウの代わり。ワーカーがタイトルを
+    /// 読むと、そのスレッドへ `WM_GETTEXT` が送られるので、処理し続ける）。破棄でウィンドウを閉じ、スレッドを終える。
     struct TitledWindow {
         hwnd: isize,
         thread_id: u32,
@@ -1210,7 +1210,7 @@ mod tests {
         crate::config::WindowFilter { title: title.to_string(), class_name: String::new(), ignore: true }
     }
 
-    /// 変更の知らせに付けた前面の窓（通知を受けた瞬間の窓）で、ウィンドウフィルタを判定する。前面の窓が無い知らせ
+    /// 変更の通知に付けた前面のウィンドウ（通知を受けた瞬間のウィンドウ）で、ウィンドウフィルタを判定する。前面のウィンドウが無い通知
     /// （`capture_now`）とフィルタが無いときは当たらない。
     #[test]
     fn change_notice_judges_window_filter_by_foreground_at_change() {
@@ -1226,8 +1226,8 @@ mod tests {
         assert!(!changed.source_ignored(&config));
     }
 
-    /// ワーカーは、まとめ待ちの後の前面の窓が当たらなくても、変更の知らせに付いた前面の窓（コピーした瞬間の窓）が
-    /// 当たれば取り込まない（コピーしてすぐ別の窓へ切り替えた場合）。当たらない知らせだけなら取り込む。
+    /// ワーカーは、まとめ待ちの後の前面のウィンドウが当たらなくても、変更の通知に付いた前面のウィンドウ（コピーした瞬間のウィンドウ）が
+    /// 当たれば取り込まない（コピーしてすぐ別のウィンドウへ切り替えた場合）。当たらない通知だけなら取り込む。
     #[test]
     fn worker_ignores_copy_when_window_at_change_matches_filter() {
         let _clipboard = lock_clipboard_tests();
@@ -1266,7 +1266,7 @@ mod tests {
         assert_eq!(outcomes.recv_timeout(Duration::from_secs(5)).unwrap(), Outcome::Ignored);
         assert!(entries.try_recv().is_err(), "除外した窓のコピーを取り込んだ");
 
-        // まとめた知らせのどれかが当たれば、まとめた1回を取り込まない
+        // まとめた通知のどれかが当たれば、まとめた1回を取り込まない
         worker.send(Changed { foreground: 0 });
         worker.send(Changed { foreground: window.hwnd });
         assert_eq!(outcomes.recv_timeout(Duration::from_secs(5)).unwrap(), Outcome::Ignored);
@@ -1278,7 +1278,7 @@ mod tests {
         worker.finish();
     }
 
-    /// テストで起こした監視のワーカーのスレッド。破棄で知らせの送り手を落とし、ワーカーが終わるまで待つ（テストが
+    /// テストで起こした監視のワーカーのスレッド。破棄で通知の送り手を落とし、ワーカーが終わるまで待つ（テストが
     /// 途中で失敗しても、ロックを放す前にワーカーを終える。ロックより後に作ること）。
     struct WorkerThread {
         tx: Option<Sender<Changed>>,
@@ -1310,7 +1310,7 @@ mod tests {
         }
     }
 
-    /// 監視のワーカーの終わりを待つ側（`ClipboardWatcher` の `Drop`）は、ワーカーが待つ側のスレッドの窓（ビューアの
+    /// 監視のワーカーの終わりを待つ側（`ClipboardWatcher` の `Drop`）は、ワーカーが待つ側のスレッドのウィンドウ（ビューアの
     /// 代わり）のタイトルを読む間も、送られてくる `WM_GETTEXT` に応じながら待つ（ただ join すると互いに待って止まる）。
     /// 止まったときは、見張りのスレッドが知らせる（テストは戻らない）。
     #[test]
@@ -1380,7 +1380,7 @@ mod tests {
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
 
-        // 窓を作って壊すので GUI 用のロックを取る（クリップボードには触れない）
+        // ウィンドウを作って壊すので GUI 用のロックを取る（クリップボードには触れない）
         let _gui = crate::tray::lock_gui_resource_tests();
         unsafe {
             let hinstance = GetModuleHandleW(None).unwrap().into();
@@ -1433,7 +1433,7 @@ mod tests {
     }
 
     /// クリップボードへ書くテストの準備: クリップボード用 → GUI 用の順にロックを取り、テスト用の
-    /// 監視（窓・スレッド）を作る。フィールドは宣言の順に破棄されるので、監視（窓・スレッドの
+    /// 監視（ウィンドウ・スレッド）を作る。フィールドは宣言の順に破棄されるので、監視（ウィンドウ・スレッドの
     /// 終わりの待ち）→ GUI 用 → クリップボード用の順に放す。
     struct Fixture {
         watcher: ClipboardWatcher,
@@ -1471,7 +1471,7 @@ mod tests {
         entry_text(&read_entry(&guard, &Config::default()).unwrap().unwrap())
     }
 
-    /// 別のスレッドで自分の窓（ほかのアプリの代わり）を作り、`f` に渡す。窓は `f` の後に壊す。
+    /// 別のスレッドで自分のウィンドウ（ほかのアプリの代わり）を作り、`f` に渡す。ウィンドウは `f` の後に壊す。
     fn with_other_window<T: Send + 'static>(f: impl FnOnce(HWND) -> T + Send + 'static) -> T {
         thread::spawn(move || unsafe {
             let hwnd = CreateWindowExW(
@@ -1500,7 +1500,7 @@ mod tests {
     /// 遅延描画で置いたテキストの中身（最初に描くもの）と、ファイルの一覧を描くときに設定し直す中身。
     const DELAYED_FIRST_TEXT: &str = "最初";
     const DELAYED_RESET_TEXT: &str = "ファイルの一覧を描くときに設定し直した、最初より長いテキスト";
-    /// 遅延描画の持ち主が、ファイルの一覧を描くときにテキストを設定し直せたか。
+    /// 遅延描画のオーナーが、ファイルの一覧を描くときにテキストを設定し直せたか。
     static DELAYED_RESET_OK: AtomicBool = AtomicBool::new(false);
 
     /// 遅延描画で置くファイルの一覧（無いファイルを1つ指す、正しい形の DROPFILES。wide）。実際のクリップボードに
@@ -1514,9 +1514,9 @@ mod tests {
         data
     }
 
-    /// 遅延描画のコピー元（ほかのアプリの代わり）。別のスレッドの窓が持ち主になり、テキストとファイルの一覧を
+    /// 遅延描画のコピー元（ほかのアプリの代わり）。別のスレッドのウィンドウがオーナーになり、テキストとファイルの一覧を
     /// 遅延描画で置く。ファイルの一覧を描くときに、テキストも別の中身で設定し直す（GetClipboardData の文書が、
-    /// 同じ形式の SetClipboardData の後は前に返したハンドルを使わないよう求める場面）。破棄で持ち主のスレッドを
+    /// 同じ形式の SetClipboardData の後は前に返したハンドルを使わないよう求める場面）。破棄でオーナーのスレッドを
     /// 終えて join する（テストが途中で失敗しても、ロックを放す前に終える）。
     struct DelayedOwner {
         thread_id: u32,
@@ -1565,7 +1565,7 @@ mod tests {
             let (tx, rx) = mpsc::channel();
             let thread = thread::spawn(move || unsafe {
                 let class_name = w!("CLCLR_TestDelayedOwner");
-                // 2回目の登録は失敗するが、同じ窓プロシージャのクラスが残っているので使える
+                // 2回目の登録は失敗するが、同じウィンドウプロシージャのクラスが残っているので使える
                 RegisterClassW(&WNDCLASSW {
                     lpfnWndProc: Some(owner_proc),
                     hInstance: GetModuleHandleW(None).unwrap().into(),
@@ -1610,7 +1610,7 @@ mod tests {
         }
     }
 
-    /// 取り込みは、形式ごとにハンドルを取ってすぐ写す: 後の形式（ファイルの一覧）を描くときに持ち主が前の形式
+    /// 取り込みは、形式ごとにハンドルを取ってすぐ写す: 後の形式（ファイルの一覧）を描くときにオーナーが前の形式
     /// （テキスト）を設定し直しても、前に取ったハンドルを使わず、設定し直した中身を写す。
     #[test]
     fn delayed_render_that_resets_earlier_format_is_read_from_new_handle() {
@@ -1749,9 +1749,9 @@ mod tests {
         assert!(set_clipboard(&f.watcher.port(), &[unresolvable(), text("ok")]).is_ok());
     }
 
-    /// 回帰: 他の窓がクリップボードを開いている間の`OpenClipboard`は即座に失敗するため、
+    /// 回帰: 他のウィンドウがクリップボードを開いている間の`OpenClipboard`は即座に失敗するため、
     /// `ClipboardGuard::open`が再試行して書き込みを成功させる。他プロセスの代わりに、
-    /// 別スレッドの窓で30ms開いたままにする。
+    /// 別スレッドのウィンドウで30ms開いたままにする。
     #[test]
     fn set_clipboard_retries_while_clipboard_is_held_elsewhere() {
         let f = fixture();
@@ -1770,8 +1770,8 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
     }
 
-    /// 監視の窓を渡して開いている間は、ほかのプロセス（clip.exe）が書けない（窓を渡さない
-    /// `OpenClipboard(None)` では書けた）。同じプロセスの別の窓は、窓を渡さずに開いて
+    /// 監視のウィンドウを渡して開いている間は、ほかのプロセス（clip.exe）が書けない（ウィンドウを渡さない
+    /// `OpenClipboard(None)` では書けた）。同じプロセスの別のウィンドウは、ウィンドウを渡さずに開いて
     /// いても開けなかった（変異の確認）ので、ほかのプロセスで確かめる。閉じた後に同じコマンドで
     /// 書けることも確かめる（コマンドが動かない環境で、失敗を排他と取り違えて合格しないため）。
     #[test]
@@ -1794,7 +1794,7 @@ mod tests {
         assert_ne!(seq(), before, "閉じた後のほかのプロセスの書き込みで番号が変わらない");
     }
 
-    /// 書いた内容は、持ち主（監視の窓）が壊れた後もクリップボードに残る（遅延描画ではないため。
+    /// 書いた内容は、オーナー（監視のウィンドウ）が壊れた後もクリップボードに残る（遅延描画ではないため。
     /// 終了で監視を破棄した後に貼り付けられるか）。
     #[test]
     fn written_content_survives_watcher_drop() {
@@ -1838,7 +1838,7 @@ mod tests {
         watcher: ClipboardWatcher,
         entries: mpsc::Receiver<Entry>,
         outcomes: mpsc::Receiver<Outcome>,
-        /// `on_problem` に渡された知らせ
+        /// `on_problem` に渡された通知
         problems: mpsc::Receiver<WatchProblem>,
         _gui: MutexGuard<'static, ()>,
         _clipboard: MutexGuard<'static, ()>,
@@ -1899,7 +1899,7 @@ mod tests {
     }
 
     /// 抑止つきの送出の直後（取り込みの間隔のうち）に変換の結果を書くと、まとめた1回で変換の結果を
-    /// 取り込む（目印で一緒に飛ばす「漏れ」の回帰）。
+    /// 取り込む（フラグで一緒に飛ばす「漏れ」の回帰）。
     #[test]
     fn watcher_captures_conversion_right_after_suppressed_send() {
         let o = observed(500, true);
@@ -1912,7 +1912,7 @@ mod tests {
         assert_eq!(entry_text(&o.entries.try_recv().unwrap()), "変換の結果");
     }
 
-    /// 抑止つきの送出の直後に、ほかの窓（ほかのアプリの代わり）が書いた内容も取り込む。
+    /// 抑止つきの送出の直後に、ほかのウィンドウ（ほかのアプリの代わり）が書いた内容も取り込む。
     #[test]
     fn watcher_captures_other_write_right_after_suppressed_send() {
         let o = observed(500, true);
@@ -1925,7 +1925,7 @@ mod tests {
     }
 
     /// 書く側がロックの中にいる間は、監視は判定しない（待つ）。書き終えて記録した後に判定するので、
-    /// 交差しても自分の書き込みを取り込まない（開く前に目印を見ると起きる「二重」の回帰）。
+    /// 交差しても自分の書き込みを取り込まない（開く前にフラグを見ると起きる「二重」の回帰）。
     #[test]
     fn watcher_waits_for_writer_and_skips_its_write() {
         let o = observed(50, true);
@@ -1956,7 +1956,7 @@ mod tests {
     }
 
     /// 監視を切っている間の抑止つきの送出の記録は、監視を入れた後のコピーを飲み込まない（今までは
-    /// 監視を切っている間に目印を立てないことで防いでいた）。
+    /// 監視を切っている間にフラグを立てないことで防いでいた）。
     #[test]
     fn record_while_watch_is_off_does_not_swallow_later_copy() {
         let o = observed(50, false);

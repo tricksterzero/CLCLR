@@ -139,12 +139,12 @@ impl ActionKind {
         )
     }
 
-    /// 監視からの取り込みの知らせか（ビューアを隠していれば出す。`App::reveal_for_warnings`）。
+    /// 監視からの取り込みの通知か（ビューアを隠していれば出す。`App::reveal_for_warnings`）。
     pub fn is_capture(self) -> bool {
         matches!(self, Self::Capture | Self::CapturePanic | Self::CaptureIndex)
     }
 
-    /// 失敗の知らせの見出し（「{見出し}: {理由}」の前半。「{操作の名前}に失敗しました」の形にしないのは、
+    /// 失敗の通知の見出し（「{見出し}: {理由}」の前半。「{操作の名前}に失敗しました」の形にしないのは、
     /// 操作の名前をつなぐと「クリップボードへ送るに失敗しました」のような文になるため）。
     fn failure_headline(self) -> &'static str {
         match self {
@@ -194,7 +194,7 @@ impl Action {
     }
 }
 
-/// 操作スレッドからビューアへの知らせ（失敗と、データのチェックの結果）。届いた順に1つのキューに並べ、その順に
+/// 操作スレッドからビューアへの通知（失敗と、データのチェックの結果）。届いた順に1つのキューに並べ、その順に
 /// 出す。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Notice {
@@ -248,8 +248,8 @@ impl fmt::Display for ActionFailure {
 /// 失敗の通知先。操作スレッド・Shell スレッドが積み、メインスレッドが取り出す。閉じた後
 /// （終了の要求の後）に届いた失敗はログに書くだけで、ビューアを起こさない。
 ///
-/// 積むことと起床の投稿（`notify`）を、閉じることと同じロックの中で行う。閉じるのはビューア窓を
-/// 破棄する前なので、破棄した窓へ起床を投稿しない。ロックの区間は短く、Shell の呼び出しや
+/// 積むことと起床の投稿（`notify`）を、閉じることと同じロックの中で行う。閉じるのはビューアのウィンドウを
+/// 破棄する前なので、破棄したウィンドウへ起床を投稿しない。ロックの区間は短く、Shell の呼び出しや
 /// 通知の表示の間は持たない。
 #[derive(Clone)]
 pub struct FailureSink {
@@ -271,7 +271,7 @@ impl FailureSink {
         self.post(Notice::Failure(failure));
     }
 
-    /// 知らせを積んでビューアを起こす（閉じた後はログに書くだけ）。
+    /// 通知を積んでビューアを起こす（閉じた後はログに書くだけ）。
     pub fn post(&self, notice: Notice) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.open {
@@ -282,13 +282,13 @@ impl FailureSink {
         }
     }
 
-    /// 積まれた知らせを届いた順に取り出す（メインスレッドの起床で呼ぶ）。
+    /// 積まれた通知を届いた順に取り出す（メインスレッドの起床で呼ぶ）。
     pub fn drain(&self) -> Vec<Notice> {
         std::mem::take(&mut self.state.lock().unwrap_or_else(|p| p.into_inner()).queue)
     }
 
     /// ビューアを起こすだけ（ピン留め・削除が成功したとき、一覧を作り直させる）。閉じた後は
-    /// 何もしない（破棄した窓へ起床を投稿しない。`report` と同じロックの中で判定する）。
+    /// 何もしない（破棄したウィンドウへ起床を投稿しない。`report` と同じロックの中で判定する）。
     pub fn wake(&self) {
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.open {
@@ -296,7 +296,7 @@ impl FailureSink {
         }
     }
 
-    /// 閉じる。まだ取り出されていない知らせを返す（呼び出し側がログに書く）。
+    /// 閉じる。まだ取り出されていない通知を返す（呼び出し側がログに書く）。
     pub fn close(&self) -> Vec<Notice> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.open = false;
@@ -312,7 +312,7 @@ impl FailureSink {
 ///   なかったと分かる必要がある）
 /// - `Core::capture` の失敗（`failed`）: 種類（`OpError::Poisoned`、取り込んだが履歴のファイルを書けなかった
 ///   `OpError::CapturedIndexNotSaved`、それ以外）ごとに、1回の起動で最初の1回だけ知らせ、2回目からはログに書くだけ
-///   （ディスクが満杯などでコピーのたびに失敗しても、知らせを積み続けない）。終了処理の後の締め切り
+///   （ディスクが満杯などでコピーのたびに失敗しても、通知を積み続けない）。終了処理の後の締め切り
 ///   （`OpError::Closing`）は失敗ではないので知らせない
 pub struct CaptureReporter {
     sink: FailureSink,
@@ -363,7 +363,7 @@ impl CaptureReporter {
     }
 }
 
-/// 合計の上限を超えたコピーの知らせの本文（見出しの後ろ）。
+/// 合計の上限を超えたコピーの通知の本文（見出しの後ろ）。
 fn too_large_message(TooLarge { total, limit }: TooLarge) -> String {
     use crate::native::settings::readable_bytes;
     format!(
@@ -374,7 +374,7 @@ fn too_large_message(TooLarge { total, limit }: TooLarge) -> String {
     )
 }
 
-/// 取り込みのパニックの知らせの本文（見出しの後ろ）。
+/// 取り込みのパニックの通知の本文（見出しの後ろ）。
 fn capture_panic_message(stopped: &windows::core::Result<()>, log: &Path) -> String {
     let watch = match stopped {
         Ok(()) => "クリップボードの監視を止めました。トレイのメニューか設定画面の「OK」でオンに戻せます（次の起動では設定どおりに監視します）。"
@@ -521,8 +521,8 @@ impl Drop for ComApartment {
     }
 }
 
-/// `ShellExecuteExW` に渡す内容。窓は渡さない（join しない Shell スレッドが、終了で破棄された
-/// ビューア窓を使わないため）。メッセージループのない、すぐ終わるスレッドから呼ぶので
+/// `ShellExecuteExW` に渡す内容。ウィンドウは渡さない（join しない Shell スレッドが、終了で破棄された
+/// ビューアのウィンドウを使わないため）。メッセージループのない、すぐ終わるスレッドから呼ぶので
 /// `SEE_MASK_NOASYNC` が必須（Microsoft Learn の SHELLEXECUTEINFOW の説明）。Shell 自身の
 /// エラー画面は出さず（`SEE_MASK_FLAG_NO_UI`。セキュリティの確認は対象外）、失敗はアプリの
 /// 通知に集める。ユーザーの操作による起動なので `SEE_MASK_FLAG_LOG_USAGE`。
@@ -650,7 +650,7 @@ impl From<OpError> for Stop {
 struct Worker<E: Effects> {
     core: Core,
     config: Arc<RwLock<Config>>,
-    /// クリップボードを開く窓と、抑止する変更番号（`ClipboardWatcher::port`）
+    /// クリップボードを開くウィンドウと、抑止する変更番号（`ClipboardWatcher::port`）
     port: Arc<ClipboardPort>,
     sink: FailureSink,
     effects: E,
@@ -1044,7 +1044,7 @@ mod tests {
         sink: FailureSink,
         /// 通知先がビューアを起こした回数
         wakes: Arc<std::sync::atomic::AtomicUsize>,
-        /// クリップボードを開く窓（既定は開けない port。本物の排他を通すテストは `with_port` で渡す）
+        /// クリップボードを開くウィンドウ（既定は開けない port。本物の排他を通すテストは `with_port` で渡す）
         port: Arc<ClipboardPort>,
         temp: PathBuf,
     }
@@ -1088,7 +1088,7 @@ mod tests {
             self.worker().handle(action);
         }
 
-        /// 積まれた失敗（失敗以外の知らせは捨てる。見るテストは `notices`）。
+        /// 積まれた失敗（失敗以外の通知は捨てる。見るテストは `notices`）。
         fn failures(&self) -> Vec<ActionFailure> {
             failures_of(self.sink.drain())
         }
@@ -1371,8 +1371,8 @@ mod tests {
     /// 書き込みが終わるまで最後の保存へ進まない。
     #[test]
     fn shutdown_waits_for_send_in_progress() {
-        // 監視の窓（クリップボードを開く窓）を作るので、クリップボード用 → GUI 用の順にロックを取る。
-        // ローカル変数は逆の順に破棄されるので、監視（窓・スレッドの終わりの待ち）はロックより先
+        // 監視のウィンドウ（クリップボードを開くウィンドウ）を作るので、クリップボード用 → GUI 用の順にロックを取る。
+        // ローカル変数は逆の順に破棄されるので、監視（ウィンドウ・スレッドの終わりの待ち）はロックより先
         let _clipboard = crate::clipboard::test_support::lock_clipboard_tests();
         let _gui = crate::tray::lock_gui_resource_tests();
         let watcher = crate::clipboard::test_support::test_watcher();
@@ -1565,7 +1565,7 @@ mod tests {
         h.handle(Action::MovePinned { id: Uuid::new_v4(), to: None, before: None });
         let kinds: Vec<ActionKind> = h.failures().iter().map(|f| f.kind).collect();
         assert_eq!(kinds, [ActionKind::Pin, ActionKind::MovePinned, ActionKind::MovePinned]);
-        // 失敗の知らせも起こす（`FailureSink::report`）ので、成功の 2 回と失敗の 3 回
+        // 失敗の通知も起こす（`FailureSink::report`）ので、成功の 2 回と失敗の 3 回
         assert_eq!(h.wakes(), 5);
     }
 
@@ -1609,7 +1609,7 @@ mod tests {
         assert_eq!(kinds, [ActionKind::CreateFolder, ActionKind::CreateFolder, ActionKind::RenameFolder]);
     }
 
-    /// データのチェックと削除: 結果は知らせのキューに届いた順に積まれ、ビューアを起こす。失敗（何も
+    /// データのチェックと削除: 結果は通知のキューに届いた順に積まれ、ビューアを起こす。失敗（何も
     /// 消さなかった）も知らせる。終了の後は何もしない。
     #[test]
     fn check_and_clean_post_results_in_order() {
@@ -1684,7 +1684,7 @@ mod tests {
         assert!(h.failures().is_empty(), "終了中は知らせない");
     }
 
-    /// 閉じた通知先は、成功の起床もしない（破棄した窓へ投稿しない）。
+    /// 閉じた通知先は、成功の起床もしない（破棄したウィンドウへ投稿しない）。
     #[test]
     fn closed_sink_does_not_wake_after_success() {
         let h = Harness::new(Fake::default());

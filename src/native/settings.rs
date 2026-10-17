@@ -1,13 +1,13 @@
 //! 設定画面。設定を反映するときに「何をその場で反映するか」の判定（`effects`）と、設定画面の
-//! 窓（DIALOGEX のリソース `res/settings.rc` とタブ、モードレス）。反映そのものは `App::apply_settings`。
+//! ウィンドウ（DIALOGEX のリソース `res/settings.rc` とタブ、モードレス）。反映そのものは `App::apply_settings`。
 //!
-//! 窓の寿命: `App` が
+//! ウィンドウの寿命: `App` が
 //! `SettingsWindow` を持つ。閉じる（OK の成功・キャンセル・×・Esc）ときはその場で破棄せず、自分へ
 //! `WM_APP_SETTINGS_CLOSE` を投稿し、その処理で `on_closed`（`App` が `SettingsWindow` を捨てる）を呼ぶ。OK の
 //! 処理（中で `apply_settings` がメッセージを処理しながら待ち、ハンドラが再入しうる）の間は閉じる要求を記録する
 //! だけにし、戻ってから1回だけ閉じる。終了の要求の後（`end`）は隠すだけで、`main` がメッセージループを抜けた後に
-//! 破棄する。破棄の入口はこの2つ（とビューアの破棄に伴う持たれた窓の破棄）だけで、どれも OK の処理の途中では
-//! 起きない。設定画面自身はモーダル（メッセージボックスなど）を出さない（誤りは窓の中の文字）。
+//! 破棄する。破棄の入口はこの2つ（とビューアの破棄に伴う持たれたウィンドウの破棄）だけで、どれも OK の処理の途中では
+//! 起きない。設定画面自身はモーダル（メッセージボックスなど）を出さない（誤りはウィンドウの中の文字）。
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -70,7 +70,7 @@ pub fn effects(before: &Config, after: &Config) -> Effects {
     }
 }
 
-// --- 設定画面の窓 ---
+// --- 設定画面のウィンドウ ---
 
 /// OK で呼ぶ反映（開いたときの設定・画面で編集した設定。`App::apply_settings` を包む）。
 pub type OnOk = Rc<dyn Fn(&Config, &Config) -> Result<(), ApplyError>>;
@@ -193,7 +193,7 @@ const ACTIONS: [(FilterAction, &str); 2] = [(FilterAction::Add, "取り込む"),
 //
 // 行の値の正は `Ctx` の Vec で、一覧（ListView）は表示だけ。開いたときに `base` から作り、利用者が触ったときだけ
 // 書き換える（一覧の文字から値を戻すと、触っていない行が「変えた」に見え、`merge_edit` で今の値を上書きしうる）。
-// Vec の借用は、同期の知らせ（`WM_NOTIFY`・`WM_COMMAND`）を起こしうる UI の呼び出しの前に必ず手放す。
+// Vec の借用は、同期の通知（`WM_NOTIFY`・`WM_COMMAND`）を起こしうる UI の呼び出しの前に必ず手放す。
 
 /// 形式フィルタの1行。上限は入力のままの文字で持つ（選び替えても読めない入力を失わず、OK のときに行ごとに読む）。
 #[derive(Clone, Debug, PartialEq)]
@@ -294,16 +294,16 @@ fn row_list(page: usize) -> Option<&'static RowList> {
 }
 
 thread_local! {
-    /// 今の設定画面の窓（メッセージループが `IsDialogMessageW` に通す。無ければ 0）。`WM_NCDESTROY` で消す
+    /// 今の設定画面のウィンドウ（メッセージループが `IsDialogMessageW` に通す。無ければ 0）。`WM_NCDESTROY` で消す
     static ACTIVE: Cell<isize> = const { Cell::new(0) };
-    /// `WM_INITDIALOG` で窓に結び付けたコンテキスト（作成に失敗したときに、解放の担い手を見分ける）
+    /// `WM_INITDIALOG` でウィンドウに結び付けたコンテキスト（作成に失敗したときに、解放の担い手を見分ける）
     static ATTACHED: Cell<isize> = const { Cell::new(0) };
     /// テストだけ: 閉じる要求の投稿を失敗させる
     #[cfg(test)]
     static FAIL_CLOSE_POST: Cell<bool> = const { Cell::new(false) };
 }
 
-/// 設定画面の窓のコンテキスト（`DWLP_USER`。`WM_NCDESTROY` で解放）。
+/// 設定画面のウィンドウのコンテキスト（`DWLP_USER`。`WM_NCDESTROY` で解放）。
 struct Ctx {
     base: Config,
     pages: Vec<HWND>,
@@ -322,7 +322,7 @@ struct Ctx {
     windows: RefCell<Vec<WindowFilter>>,
     /// 選んだ行の値を入力欄へ入れている間（入力欄の変化を行へ書き戻さない。無いと前の行へ書き込まれる）
     syncing: Cell<bool>,
-    /// 行の追加・削除・誤りの行の選択の間（選択の知らせを処理しない。終わった後に入力欄を1回だけ埋める）
+    /// 行の追加・削除・誤りの行の選択の間（選択の通知を処理しない。終わった後に入力欄を1回だけ埋める）
     suppress: Cell<bool>,
 }
 
@@ -344,18 +344,18 @@ impl Ctx {
     }
 }
 
-/// 窓の `Ctx` を共有参照で取り出す（まだ・もう無ければ None）。
+/// ウィンドウの `Ctx` を共有参照で取り出す（まだ・もう無ければ None）。
 unsafe fn ctx_ref<'a>(hwnd: HWND) -> Option<&'a Ctx> {
     unsafe { (GetWindowLongPtrW(hwnd, DWLP_USER) as *const Ctx).as_ref() }
 }
 
-/// 設定画面の窓。`Drop` で窓を破棄する（まだあれば）。
+/// 設定画面のウィンドウ。`Drop` でウィンドウを破棄する（まだあれば）。
 pub struct SettingsWindow {
     hwnd: HWND,
 }
 
 impl SettingsWindow {
-    /// 設定画面を作って表示する。`owner` はビューアの窓（持ち主。ビューアより前に出る）。`base` は開いたときの設定で、
+    /// 設定画面を作って表示する。`owner` はビューアのウィンドウ（オーナー。ビューアより前に出る）。`base` は開いたときの設定で、
     /// 画面へ入れ、OK で `on_ok(&base, &draft)` を呼ぶ。
     pub fn create(owner: Option<HWND>, base: Config, on_ok: OnOk, on_closed: OnClosed) -> windows::core::Result<Self> {
         let icc = INITCOMMONCONTROLSEX {
@@ -395,8 +395,8 @@ impl SettingsWindow {
         let hwnd = match created {
             Ok(hwnd) => hwnd,
             Err(e) => {
-                // WM_INITDIALOG に届く前に作れなかったなら、コンテキストは窓に結び付いていないのでここで解放する
-                // （届いていれば、窓の破棄の WM_NCDESTROY が解放する）
+                // WM_INITDIALOG に届く前に作れなかったなら、コンテキストはウィンドウに結び付いていないのでここで解放する
+                // （届いていれば、ウィンドウの破棄の WM_NCDESTROY が解放する）
                 if ATTACHED.with(Cell::get) != raw as isize {
                     drop(unsafe { Box::from_raw(raw) });
                 }
@@ -405,7 +405,7 @@ impl SettingsWindow {
         };
         let window = Self { hwnd };
         if unsafe { ctx_ref(hwnd) }.is_none_or(|ctx| ctx.pages.len() != PAGES.len()) {
-            // ページを作れなかった（窓は `window` の破棄で壊れ、コンテキストは WM_NCDESTROY で解放される）
+            // ページを作れなかった（ウィンドウは `window` の破棄で壊れ、コンテキストは WM_NCDESTROY で解放される）
             return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
         }
         unsafe {
@@ -419,7 +419,7 @@ impl SettingsWindow {
         self.hwnd
     }
 
-    /// テスト用: ページの窓（`PAGES` の順）。
+    /// テスト用: ページのウィンドウ（`PAGES` の順）。
     #[cfg(test)]
     pub fn pages(&self) -> Vec<HWND> {
         unsafe { ctx_ref(self.hwnd) }.map(|ctx| ctx.pages.clone()).unwrap_or_default()
@@ -471,7 +471,7 @@ impl Drop for SettingsWindow {
     }
 }
 
-/// 今の設定画面の窓（無ければ None）。
+/// 今の設定画面のウィンドウ（無ければ None）。
 pub fn active_dialog() -> Option<HWND> {
     let raw = ACTIVE.with(Cell::get);
     (raw != 0).then(|| HWND(raw as *mut _))
@@ -792,7 +792,7 @@ fn fill_editor(ctx: &Ctx, rl: &RowList) {
         return;
     };
     let selected = selected_row(list).filter(|&i| i < ctx.row_count(rl.page));
-    // 値を写してから UI を呼ぶ（入力欄への書き込みは同期の知らせを起こす）
+    // 値を写してから UI を呼ぶ（入力欄への書き込みは同期の通知を起こす）
     let format = (rl.page == PAGE_FORMAT).then(|| selected.and_then(|i| ctx.formats.borrow().get(i).cloned()));
     let window = (rl.page == PAGE_WINDOW).then(|| selected.and_then(|i| ctx.windows.borrow().get(i).cloned()));
     ctx.syncing.set(true);
@@ -836,7 +836,7 @@ fn store_field(ctx: &Ctx, rl: &RowList, id: i32) {
     let Some(index) = selected_row(list) else {
         return;
     };
-    // 入力欄を読んでから借用する（読むのは同期の知らせを起こさないが、借用の間は UI を呼ばない）
+    // 入力欄を読んでから借用する（読むのは同期の通知を起こさないが、借用の間は UI を呼ばない）
     let cells = match rl.page {
         PAGE_FORMAT => {
             let (name, action) = (get_text(page, IDC_FMT_NAME), ACTIONS[combo_index(page, IDC_FMT_ACTION).min(ACTIONS.len() - 1)].0);
@@ -877,8 +877,8 @@ fn store_field(ctx: &Ctx, rl: &RowList, id: i32) {
     }
 }
 
-/// 行を選び直す操作（追加・削除・誤りの行）の間は選択の知らせを処理せず、終わってから入力欄を1回だけ埋める
-/// （途中の知らせで、確定する前の行や「選択なし」を入力欄に出さない）。
+/// 行を選び直す操作（追加・削除・誤りの行）の間は選択の通知を処理せず、終わってから入力欄を1回だけ埋める
+/// （途中の通知で、確定する前の行や「選択なし」を入力欄に出さない）。
 fn with_rows_changing(ctx: &Ctx, rl: &RowList, change: impl FnOnce()) {
     {
         ctx.suppress.set(true);
@@ -975,9 +975,9 @@ fn read_num(pages: &[HWND], num: &NumField, issues: &mut Vec<ConfigIssue>) -> u6
     }
 }
 
-/// 画面からドラフトを作る（`base` の写しから、設定画面にある項目だけを書き換える）。数値として読めない入力は
+/// 画面からドラフトを作る（`base` のコピーから、設定画面にある項目だけを書き換える）。数値として読めない入力は
 /// その項目の誤りとして返す（範囲は返さない。`Config::validate` が確かめる）。フィルタは `formats`・`windows`
-/// （コンテキストの行の写し）から作る。触っていなければ `base` と同じになる（上限は `to_string` から読み戻す）。
+/// （コンテキストの行のコピー）から作る。触っていなければ `base` と同じになる（上限は `to_string` から読み戻す）。
 fn read_draft(pages: &[HWND], base: &Config, formats: &[FormatRow], windows: &[WindowFilter]) -> Result<Config, Vec<ConfigIssue>> {
     let [general, history, hotkey, text] = [pages[PAGE_GENERAL], pages[PAGE_HISTORY], pages[PAGE_HOTKEY], pages[PAGE_TEXT]];
     let mut c = base.clone();
@@ -1179,7 +1179,7 @@ fn show_issues(dialog: HWND, pages: &[HWND], issues: &[ConfigIssue]) {
     }
 }
 
-/// 閉じる要求を1回だけ投稿する（投稿できなければ印を戻し、もう一度閉じられるようにする）。
+/// 閉じる要求を1回だけ投稿する（投稿できなければフラグを戻し、もう一度閉じられるようにする）。
 fn post_close(dialog: HWND, ctx: &Ctx) {
     if ctx.closing.get() || ctx.ended.get() {
         return;
@@ -1220,7 +1220,7 @@ impl Drop for FlagReset<'_> {
     }
 }
 
-/// OK: ドラフトを作り、`on_ok` を呼ぶ。成功（または処理中の閉じる要求）で閉じ、誤りは窓の中に出して開いたまま。
+/// OK: ドラフトを作り、`on_ok` を呼ぶ。成功（または処理中の閉じる要求）で閉じ、誤りはウィンドウの中に出して開いたまま。
 fn press_ok(dialog: HWND) {
     let Some(ctx) = (unsafe { ctx_ref(dialog) }) else {
         return;
@@ -1265,13 +1265,13 @@ fn press_ok(dialog: HWND) {
     }
 }
 
-/// 閉じる要求の処理: `on_closed` を呼ぶ（`App` が `SettingsWindow` を捨て、この窓は破棄される）。その後は
+/// 閉じる要求の処理: `on_closed` を呼ぶ（`App` が `SettingsWindow` を捨て、このウィンドウは破棄される）。その後は
 /// コンテキストに触らない。
 ///
 /// OK の処理中は破棄しない: `press_ok` はコンテキストの `ok_running` を借りたまま `on_ok` を呼び、`on_ok` の中では
 /// 送られたメッセージが処理されうる（トレイの停止を待つ間など）。ほかのプロセスがこのメッセージを送ってくると、ここで
-/// 窓を破棄すると、戻った `press_ok` が解放したコンテキストに書く。OK の処理中に届いたら閉じる要求を記録だけし
-/// （`request_close` と同じ）、投稿済みの印を下ろす（OK が戻った後の `post_close` が投稿し直せるように）。
+/// ウィンドウを破棄すると、戻った `press_ok` が解放したコンテキストに書く。OK の処理中に届いたら閉じる要求を記録だけし
+/// （`request_close` と同じ）、投稿済みのフラグを下ろす（OK が戻った後の `post_close` が投稿し直せるように）。
 fn handle_close(dialog: HWND) {
     let on_closed = {
         let Some(ctx) = (unsafe { ctx_ref(dialog) }) else {
@@ -1310,7 +1310,7 @@ unsafe extern "system" fn settings_proc(dialog: HWND, msg: u32, wparam: WPARAM, 
                     match CreateDialogParamW(hinst, PCWSTR(*id as usize as *const u16), Some(dialog), Some(page_proc), LPARAM(i as isize)) {
                         Ok(page) => pages.push(page),
                         Err(e) => {
-                            // 足りないページのまま返す（`SettingsWindow::create` が数を確かめて窓を破棄する）
+                            // 足りないページのまま返す（`SettingsWindow::create` が数を確かめてウィンドウを破棄する）
                             eprintln!("設定画面のページを作れません: {e}");
                             break;
                         }
@@ -1441,7 +1441,7 @@ unsafe extern "system" fn page_proc(page: HWND, msg: u32, wparam: WPARAM, lparam
                         let nm = &*(lparam.0 as *const NMLISTVIEW);
                         let selection_changed = (nm.uChanged.0 & LVIF_STATE.0) != 0
                             && ((nm.uNewState ^ nm.uOldState) & LVIS_SELECTED.0) != 0;
-                        // 行番号は知らせのものを使わず、確定した選択を読む（fill_editor）
+                        // 行番号は通知のものを使わず、確定した選択を読む（fill_editor）
                         if selection_changed && !ctx.suppress.get() {
                             fill_editor(ctx, rl);
                         }
@@ -1502,7 +1502,7 @@ mod tests {
         assert_eq!(effects(&base, &c), Effects::default());
     }
 
-    // --- 設定画面の窓 ---
+    // --- 設定画面のウィンドウ ---
 
     use std::cell::RefCell;
     use std::time::{Duration, Instant};
@@ -1512,7 +1512,7 @@ mod tests {
         PM_REMOVE, WS_TABSTOP, WS_VISIBLE,
     };
 
-    /// 設定画面の試験台。閉じたとき（`on_closed`）は、`slot` の窓を捨てて数える（`App` と同じ）。
+    /// 設定画面の試験台。閉じたとき（`on_closed`）は、`slot` のウィンドウを捨てて数える（`App` と同じ）。
     struct Harness {
         slot: Rc<RefCell<Option<SettingsWindow>>>,
         closed: Rc<Cell<usize>>,
@@ -1724,7 +1724,7 @@ mod tests {
 
     /// マニフェストの中身が実際に効いている: プロセスは PerMonitorV2 で、読み込まれる Common Controls は v6。
     /// テストの exe にも同じマニフェスト（ID 1）が入り、起動時に適用される。スレッドの DPI の設定を
-    /// 変える処理は無いので、プロセスの値を見る。Common Controls の依存を外すと、このテストより前に exe の起動が
+    /// 変える処理は無いので、プロセスの値を見る。Common Controls の依存関係を外すと、このテストより前に exe の起動が
     /// `STATUS_ENTRYPOINT_NOT_FOUND` で失敗した（v6 が要る関数 `TaskDialogIndirect` を読み込むためと見ているが、
     /// 見つからなかった関数の名前は確かめていない）。v6 の確認は、起動で落ちなくなったときのため。
     #[test]
@@ -1877,7 +1877,7 @@ mod tests {
         assert!(active_dialog().is_none(), "閉じた後も今の設定画面として残っている");
     }
 
-    /// 反映の誤り: 保存できない・今は反映できない・入力の誤りは、窓の中に出して開いたまま。
+    /// 反映の誤り: 保存できない・今は反映できない・入力の誤りは、ウィンドウの中に出して開いたまま。
     #[test]
     fn ok_errors_are_shown_and_window_stays_open() {
         let _gui = crate::tray::lock_gui_resource_tests();
@@ -1996,7 +1996,7 @@ mod tests {
     }
 
     /// OK の処理中に、閉じる要求のメッセージ（`WM_APP_SETTINGS_CLOSE`）を直接送られても（ほかのプロセスからの送信）、
-    /// 窓とコンテキストを破棄しない。OK が戻ってから（成功でも失敗でも）1回だけ閉じる。
+    /// ウィンドウとコンテキストを破棄しない。OK が戻ってから（成功でも失敗でも）1回だけ閉じる。
     #[test]
     fn close_message_sent_during_ok_does_not_destroy_window() {
         let _gui = crate::tray::lock_gui_resource_tests();
@@ -2023,7 +2023,7 @@ mod tests {
         }
     }
 
-    /// 閉じる要求の投稿に失敗したら印を戻し、もう一度閉じられる。
+    /// 閉じる要求の投稿に失敗したらフラグを戻し、もう一度閉じられる。
     #[test]
     fn failed_close_post_can_be_retried() {
         let _gui = crate::tray::lock_gui_resource_tests();
@@ -2039,7 +2039,7 @@ mod tests {
         assert_eq!(h.closed.get(), 1);
     }
 
-    /// 終了の要求の後（`end`）: 隠れ、表示の要求・OK・閉じる要求では何もしない。破棄は持ち主が捨てたとき。
+    /// 終了の要求の後（`end`）: 隠れ、表示の要求・OK・閉じる要求では何もしない。破棄は所有者が捨てたとき。
     #[test]
     fn ended_window_stays_hidden_and_ignores_requests() {
         let _gui = crate::tray::lock_gui_resource_tests();
@@ -2097,7 +2097,7 @@ mod tests {
     }
 
     /// はみ出し: 全ページと親のダイアログで、文字の幅（`&` を除く。チェックボックスは箱の分を引く）が枠の幅を超えず、
-    /// 各コントロールの枠が親のクライアント領域の中にある。ページはタブの表示領域の中にある（テストで作る窓は
+    /// 各コントロールの枠が親のクライアント領域の中にある。ページはタブの表示領域の中にある（テストで作るウィンドウは
     /// そのときのモニターの DPI。ほかの倍率は実機で確かめる）。
     #[test]
     fn every_control_fits_without_overflow() {
@@ -2351,7 +2351,7 @@ mod tests {
         assert_eq!(cell(wlist, 3, 2), "する");
     }
 
-    /// 行を選び替えると、入力欄に新しい行の値が入り、前の行も新しい行も書き換わらない（選択の知らせの中で入力欄へ
+    /// 行を選び替えると、入力欄に新しい行の値が入り、前の行も新しい行も書き換わらない（選択の通知の中で入力欄へ
     /// 書く間の変化を行へ戻さない）。
     #[test]
     fn switching_rows_does_not_write_into_other_rows() {
@@ -2508,7 +2508,7 @@ mod tests {
         assert_eq!(h.closed.get(), 1);
     }
 
-    /// 灰色の欄を指す見出しのアクセスキーを押しても、OK にならず（窓が閉じない）、チェックも変わらない（ユーザーの
+    /// 灰色の欄を指す見出しのアクセスキーを押しても、OK にならず（ウィンドウが閉じない）、チェックも変わらない（ユーザーの
     /// 実機の報告: 行を選んでいないときの Alt+N で設定画面が閉じた）。全ページで、次の欄が灰色の見出しをすべて試す。
     #[test]
     fn access_key_of_label_before_disabled_field_does_nothing() {

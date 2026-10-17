@@ -1,13 +1,13 @@
-//! トレイ・ホットキーからのイベントを受けて、ビューア窓とコアを操作する結線。
+//! トレイ・ホットキーからのイベントを受けて、ビューアのウィンドウとコアを操作する結線。
 //! トレイ・ホットキーのイベントの処理、監視の切り替え、
 //! 一覧の作り直し、検索、プレビューを受け持つ。
 //!
-//! メインスレッドだけで使う（`ViewerHandler` としてビューア窓の wndproc から呼ばれる）。
+//! メインスレッドだけで使う（`ViewerHandler` としてビューアのウィンドウの wndproc から呼ばれる）。
 //! 起動時にスレッド群を作り終えるまでは `parts` が空で、終了時に `take_parts` で取り出して
-//! 順に止める。`RefCell` の借用はイベント1件の処理の間だけで、ビューア窓へメッセージを
+//! 順に止める。`RefCell` の借用はイベント1件の処理の間だけで、ビューアのウィンドウへメッセージを
 //! 送る（`viewer::set_rows` など、再入を起こす）前に手放す。
 //!
-//! サービスのロックは `Core::read` で、読み込み元（メタデータと resident の `Arc` の写し）を
+//! サービスのロックは `Core::read` で、読み込み元（メタデータと resident の `Arc` のコピー）を
 //! 取り出す間だけ持ち、先頭の切り出し・blob の読み込み（プレビュー）はロックの外で行う。検索は
 //! 検索スレッド（`search.rs`）に頼み、結果は起床（`on_wake`）のときに受け取る。
 //!
@@ -54,7 +54,7 @@ const PREVIEW_HDROP_BYTES: usize = 64 * 1024;
 /// セッション終了（サインアウト・再起動）のとき、受け付け済みの操作が終わるのを待つ上限
 /// （Windows はセッション終了の応答を5秒前後で打ち切ることがある）。
 const END_SESSION_WAIT: Duration = Duration::from_secs(4);
-/// ホットキーの登録し直し（設定の反映）が失敗したときの知らせに添える文。設定は戻さないので、
+/// ホットキーの登録し直し（設定の反映）が失敗したときの通知に添える文。設定は戻さないので、
 /// 有効のまま残っていることと次の起動で試すことを伝える。
 const REREGISTER_RETRY_NOTE: &str = "設定は保存しました。次の起動でもう一度試します。";
 
@@ -85,7 +85,7 @@ pub struct App {
     search: RefCell<Option<SearchLink>>,
     /// 最後に頼んだ検索の世代
     search_generation: Cell<u64>,
-    /// 結果を待っている検索（届いたらこの写しから行を作る）
+    /// 結果を待っている検索（届いたらこのコピーから行を作る）
     pending_search: RefCell<Option<PendingSearch>>,
     /// 前に一覧を作ったときのサービスの変更番号
     last_revision: Cell<Option<u64>>,
@@ -93,7 +93,7 @@ pub struct App {
     preview_id: Cell<Option<Uuid>>,
     /// 操作スレッドとのつなぎ（`attach_actions`。無ければ操作しない）
     actions: RefCell<Option<ActionLink>>,
-    /// 失敗・知らせの通知先（`attach_failures`）。操作スレッドのほか、監視のワーカー・権限の確認も積むので、
+    /// 失敗・通知の送り先（`attach_failures`）。操作スレッドのほか、監視のワーカー・権限の確認も積むので、
     /// 操作スレッドを作れなかったときも受け取り、終了の要求で閉じる
     failures: RefCell<Option<FailureSink>>,
     /// 知らせる前の操作の失敗と、表示中か
@@ -108,8 +108,8 @@ pub struct App {
     show_folder: RefCell<Rc<dyn Fn(HWND, &FolderReport) -> viewer::FolderChoice>>,
     /// 警告を出すために隠したビューアを出す方法（`viewer::show`。テストでは差し替える）
     reveal_viewer: RefCell<Rc<dyn Fn(HWND)>>,
-    /// ビューアを隠している（`on_hidden` から `on_shown` まで）。この間は知らせを出さずに残し、表示したときに
-    /// 出す（隠す操作で閉じた結果の後に、残りの結果が隠れた窓の上に続けて出ないように）
+    /// ビューアを隠している（`on_hidden` から `on_shown` まで）。この間は通知を出さずに残し、表示したときに
+    /// 出す（隠す操作で閉じた結果の後に、残りの結果が隠れたウィンドウの上に続けて出ないように）
     viewer_hidden: Cell<bool>,
     /// 終了の要求を受けた（トレイの「終了」・トレイなしで閉じる・セッション終了）。以後は操作を
     /// 依頼せず、失敗を知らせない
@@ -171,7 +171,7 @@ struct SearchLink {
     results: Receiver<SearchResult>,
 }
 
-/// 一覧の1行を作るための写し（ロック中に写す）。
+/// 一覧の1行を作るためのコピー（ロック中に写す）。
 struct RowSource {
     meta: EntryMeta,
     /// ディスクに書かない形式の名前（一覧の2行目用）
@@ -185,26 +185,26 @@ struct PendingSearch {
     generation: u64,
     /// 結果を出すときに先頭の行を選ぶか（表示対象や検索文字列が変わった）
     source_changed: bool,
-    /// 候補の行の写し（候補の順）
+    /// 候補の行のコピー（候補の順）
     rows: Vec<RowSource>,
 }
 
 /// 一覧の中身（ロック中に作る）。
 enum Listing {
     Rows(Vec<Row>),
-    /// 検索の候補（検索スレッドへの依頼と、結果から行を作るための写し）
+    /// 検索の候補（検索スレッドへの依頼と、結果から行を作るためのコピー）
     Search(Vec<search::Candidate>, Vec<RowSource>),
 }
 
 /// プレビューの読み込み元（ロック中に写す）。ディスクに書かない形式（resident）は `Arc` の
-/// 写しだけを持ち、先頭の切り出し・上限の判定はロックの外（`build_preview`）で行う。
+/// コピーだけを持ち、先頭の切り出し・上限の判定はロックの外（`build_preview`）で行う。
 struct PreviewSource {
     meta: EntryMeta,
     resident: Arc<Vec<Format>>,
     storage: Storage,
 }
 
-/// ディスクに書かない形式の先頭の写し。
+/// ディスクに書かない形式の先頭のコピー。
 struct ResidentHead {
     data: Vec<u8>,
     /// 写す前の大きさ（バイト）
@@ -301,7 +301,7 @@ impl App {
         }
     }
 
-    /// 設定画面が閉じた（設定画面の閉じる要求の処理から呼ばれる）。欄を先に空にしてから捨てる（窓を破棄する）。
+    /// 設定画面が閉じた（設定画面の閉じる要求の処理から呼ばれる）。欄を先に空にしてから捨てる（ウィンドウを破棄する）。
     fn on_settings_closed(&self) {
         let window = self.settings.borrow_mut().take();
         drop(window);
@@ -333,7 +333,7 @@ impl App {
         self.attach_failures(failures);
     }
 
-    /// 失敗・知らせの通知先をつなぐ（操作スレッドの成否と関係なく。監視のワーカー・権限の確認も積む）。
+    /// 失敗・通知の送り先をつなぐ（操作スレッドの成否と関係なく。監視のワーカー・権限の確認も積む）。
     pub fn attach_failures(&self, failures: FailureSink) {
         *self.failures.borrow_mut() = Some(failures);
     }
@@ -353,7 +353,7 @@ impl App {
 
     /// 終了の要求を受けた。以後は操作を依頼せず、失敗を知らせない。失敗の通知先を閉じ、まだ
     /// 知らせていない失敗はログに書く（閉じた後に届く失敗は、操作スレッドの側でログに書かれる）。
-    /// ビューア窓を破棄する前に呼ぶ（破棄した窓へ起床を投稿させない）。行の右クリックメニューを
+    /// ビューアのウィンドウを破棄する前に呼ぶ（破棄したウィンドウへ起床を投稿させない）。行の右クリックメニューを
     /// 表示していれば閉じる（閉じたメニューの操作は依頼しない）。一度で閉じなければ、ビューアが
     /// タイマーで閉じる要求をやり直す（`viewer::retry_modal_close`）。
     fn begin_exit(&self, hwnd: Option<HWND>) {
@@ -443,14 +443,14 @@ impl App {
         }
     }
 
-    /// 積まれた知らせを届いた順に出す（続いた失敗は1つのメッセージボックスにまとめ、データのチェックの結果は
+    /// 積まれた通知を届いた順に出す（続いた失敗は1つのメッセージボックスにまとめ、データのチェックの結果は
     /// 1つずつダイアログで出す）。表示中（再入）なら何もしない（外側のループが拾う）。表示から戻るたびに終了の
     /// 要求とビューアを隠したか（隠していれば残りは表示したときに出す）を確かめ、表示中に積まれた分は、外からの
     /// 起床を待たずに続けて出す。表示の前に `RefCell` の借用・
     /// 設定・サービスのガードを持たない。
     fn show_pending_failures(&self, hwnd: HWND) {
         // 表示中（再入）と、メニュー・確認ダイアログの表示中・ツリーの名前の編集中は出さない（閉じる・
-        // 終わると窓が自分を起こすので、そのときに出る。編集中に出すとフォーカスが外れて編集が確定するため）
+        // 終わるとウィンドウが自分を起こすので、そのときに出る。編集中に出すとフォーカスが外れて編集が確定するため）
         if self.notifier.borrow().notifying || viewer::notice_blocked(hwnd) {
             return;
         }
@@ -468,7 +468,7 @@ impl App {
             if self.viewer_hidden.get() {
                 break;
             }
-            // 先頭から続く失敗はまとめて取り出す（知らせの順は保つ）
+            // 先頭から続く失敗はまとめて取り出す（通知の順は保つ）
             let (failures, next) = {
                 let mut notifier = self.notifier.borrow_mut();
                 let mut failures = Vec::new();
@@ -528,8 +528,8 @@ impl App {
         }
     }
 
-    /// 保存先のフォルダの権限の警告か、監視からの取り込みの失敗の知らせがまだ出ていないのにビューアを隠していれば
-    /// （非表示で起動した・トレイへ隠したなど）、ビューアを出す（知らせは表示したときにしか出ず、隠したままだと
+    /// 保存先のフォルダの権限の警告か、監視からの取り込みの失敗の通知がまだ出ていないのにビューアを隠していれば
+    /// （非表示で起動した・トレイへ隠したなど）、ビューアを出す（通知は表示したときにしか出ず、隠したままだと
     /// 気づけないため。終了の要求の後は出さない）。
     fn reveal_for_warnings(&self, hwnd: HWND) {
         let waiting = self.notifier.borrow().pending.iter().any(|n| match n {
@@ -560,8 +560,8 @@ impl App {
         }
     }
 
-    /// ビューアを表示せずに起動した（`start_hidden`）ことを伝える。表示するまで知らせを残す（`on_hidden` の後と同じ。
-    /// 表示していない窓には `WM_SHOWWINDOW` が来ないため、起動の処理から呼ぶ）。
+    /// ビューアを表示せずに起動した（`start_hidden`）ことを伝える。表示するまで通知を残す（`on_hidden` の後と同じ。
+    /// 表示していないウィンドウには `WM_SHOWWINDOW` が来ないため、起動の処理から呼ぶ）。
     pub fn mark_viewer_hidden(&self) {
         self.viewer_hidden.set(true);
     }
@@ -648,7 +648,7 @@ impl App {
     }
 
     /// ビューアの大きさ（最小化・最大化していないときのクライアント領域、96 DPI 基準）と位置（そのときの
-    /// 窓の左上、物理 px の画面座標）を、どちらかが変わっていれば設定ファイルへ書く（隠すとき・終了時）。
+    /// ウィンドウの左上、物理 px の画面座標）を、どちらかが変わっていれば設定ファイルへ書く（隠すとき・終了時）。
     /// 下限より小さい大きさは下限にする。共有の設定へは書けてから反映する（書けなかったときは、次に
     /// 隠す・終了するときに書き直す）。
     fn save_viewer_placement(&self, hwnd: HWND) {
@@ -681,7 +681,7 @@ impl App {
     /// 断る（`Busy`）: 反映の途中・終了の要求の後・メニューや TaskDialog の表示中・失敗の通知の表示中（設定画面は
     /// モードレスなので、ほかのモーダルの中でも OK を押しうる）。入力の誤りは `Invalid`、保存の失敗は `Save`
     /// で、どれも何もしない。保存できた後にその場で反映できなかったものは、保存を戻さずに**この関数が知らせる**
-    /// （次の起床で。呼び出し側は知らせない）。戻り値の説明は、その内容の写し。
+    /// （次の起床で。呼び出し側は知らせない）。戻り値の説明は、その内容のコピー。
     ///
     /// 順序: 今の値を読む → 合わせる → 保存 → 共有の設定を置き換え（この区間はメッセージを処理する呼び出しを
     /// しないので、ほかの設定の保存（すべてメインスレッド）が割り込まない）→ 監視 → ホットキー（投稿で依頼して
@@ -711,7 +711,7 @@ impl App {
         // 終了の要求・セッションの終了が来ていれば、残りを反映せずに止める
         let stopped = || self.exiting.get() || self.session_ended.get();
         {
-            // この借用の中では、別のスレッドの窓へ同期で送る呼び出しをしない（監視の登録は Win32 の API、アイコンと
+            // この借用の中では、別のスレッドのウィンドウへ同期で送る呼び出しをしない（監視の登録は Win32 の API、アイコンと
             // ホットキーは投稿）。トレイを作る・一覧を作り直す・トレイを消す前に手放す
             let parts = self.parts.borrow();
             if let Some(parts) = parts.as_ref() {
@@ -816,7 +816,7 @@ impl App {
         Tray::spawn(watch_state, events, move || waker.wake()).map_err(|e| e.to_string())
     }
 
-    /// ツリーと一覧を作り直す。非表示の間は印だけ付けて、表示したときに行う
+    /// ツリーと一覧を作り直す。非表示の間はフラグだけ立てて、表示したときに行う
     /// （見えない一覧のために行を作らない）。`source_changed` なら先頭の行を選ぶ。
     fn refresh(&self, hwnd: HWND, source_changed: bool) {
         if !viewer::is_visible(hwnd) {
@@ -984,7 +984,7 @@ fn rows_from_matches(rows: Vec<RowSource>, matched: &[Uuid]) -> Vec<Row> {
         .collect()
 }
 
-/// プレビューの読み込み元を写す（ロック中に呼ぶ。I/O はせず、resident は `Arc` の写しだけ）。
+/// プレビューの読み込み元を写す（ロック中に呼ぶ。I/O はせず、resident は `Arc` のコピーだけ）。
 fn preview_source(service: &HistoryService, id: Uuid) -> Option<PreviewSource> {
     let (meta, resident) = match service.history.get_by_id(id) {
         Some(item) => (&item.meta, Arc::clone(&item.resident)),
@@ -1003,7 +1003,7 @@ fn build_preview(s: PreviewSource) -> PreviewContent {
     // 縮小は読み込みスレッドが行う）
     let resident_dib = s.resident.iter().any(|f| f.format_name == "CF_DIB");
     let format = |name: &str| s.meta.formats.iter().find(|f| f.format_name == name);
-    // 先頭の写しと、全体の大きさ（ディスクに書かない形式なら写す前の大きさ、ディスクにある形式なら
+    // 先頭のコピーと、全体の大きさ（ディスクに書かない形式なら写す前の大きさ、ディスクにある形式なら
     // メタデータの大きさ）
     let head = |resident: Option<ResidentHead>, name: &str, cap: usize| -> Option<(Vec<u8>, u64)> {
         match resident {
@@ -1049,12 +1049,12 @@ impl Drop for NotifyingReset<'_> {
     }
 }
 
-/// 失敗の知らせの本文（1件1行）。
+/// 失敗の通知の本文（1件1行）。
 fn failure_text(failures: &[ActionFailure]) -> String {
     failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
 }
 
-/// 失敗をメッセージボックスで知らせる（持ち主はビューア窓。メインスレッドで呼ぶ）。
+/// 失敗をメッセージボックスで知らせる（オーナーはビューアのウィンドウ。メインスレッドで呼ぶ）。
 fn show_failure_box(hwnd: HWND, text: &str) {
     show_message_box(Some(hwnd), crate::APP_DISPLAY_NAME, text);
 }
@@ -1068,7 +1068,7 @@ fn show_message_box(owner: Option<HWND>, caption: &str, text: &str) {
 impl ViewerHandler for App {
     fn on_wake(&self, hwnd: HWND) {
         let hotkey_events: Vec<HotkeyEvent> = self.hotkey_events.try_iter().collect();
-        // 終了の要求の後に届いたトレイ・ホットキーのイベントは捨てる（窓を出す・監視と設定ファイルを変えるなどを
+        // 終了の要求の後に届いたトレイ・ホットキーのイベントは捨てる（ウィンドウを出す・監視と設定ファイルを変えるなどを
         // しない）。登録し直しの結果はログへ書く（下）
         for event in hotkey_events {
             match event {
@@ -1139,7 +1139,7 @@ impl ViewerHandler for App {
     }
 
     /// 閉じる = トレイへ隠す。トレイのアイコンが無い（設定で無効・作成失敗・通知領域に付けられない）ときは
-    /// 窓へ戻る手段がなくなるため終了する。
+    /// ウィンドウへ戻る手段がなくなるため終了する。
     fn on_close(&self, hwnd: HWND) {
         if self.tray_icon_shown() {
             viewer::hide(hwnd);
@@ -1154,7 +1154,7 @@ impl ViewerHandler for App {
         if self.dirty.get() {
             self.rebuild(hwnd, true);
         }
-        // 隠している間に残した知らせを出す（ここは `WM_SHOWWINDOW` の中なので、モーダルは起きた後に出す）
+        // 隠している間に残した通知を出す（ここは `WM_SHOWWINDOW` の中なので、モーダルは起きた後に出す）
         if !self.notifier.borrow().pending.is_empty() {
             unsafe {
                 let _ = PostMessageW(Some(hwnd), viewer::WM_APP_WAKE, WPARAM(0), LPARAM(0));
@@ -1176,7 +1176,7 @@ impl ViewerHandler for App {
     }
 
     /// 隠したら、プレビューの中身と検索用の全文を捨てる（非表示の常駐メモリを増やさないため）。
-    /// 一覧の写しと検索文字列は残す（表示したときに作り直す）。
+    /// 一覧のコピーと検索文字列は残す（表示したときに作り直す）。
     fn on_hidden(&self, hwnd: HWND) {
         self.viewer_hidden.set(true);
         // 設定画面もビューアと一緒に隠す（編集中の内容はそのまま）
@@ -1323,7 +1323,7 @@ impl ViewerHandler for App {
         match command {
             ToolCommand::ClearHistory => self.request(Action::ClearHistory),
             ToolCommand::ClearClipboard => self.request(Action::ClearClipboard),
-            // 走査は操作スレッドで行い、結果は知らせ（`Notice::CheckReport`）で届く
+            // 走査は操作スレッドで行い、結果は通知（`Notice::CheckReport`）で届く
             ToolCommand::CheckData => self.request(Action::CheckData),
             ToolCommand::ToggleTopmost => self.toggle_topmost(hwnd),
         }
@@ -1387,7 +1387,7 @@ mod tests {
     }
 
     /// 最前面の切り替えは設定ファイルに書く。ビューアの大きさ（最小化・最大化していないときの
-    /// クライアント領域、96 DPI 基準）と位置（そのときの窓の左上）は、隠すときにどちらかが変わっていれば
+    /// クライアント領域、96 DPI 基準）と位置（そのときのウィンドウの左上）は、隠すときにどちらかが変わっていれば
     /// 書き、どちらも変わっていなければ書かない。
     #[test]
     fn topmost_and_viewer_placement_are_saved_to_config_file() {
@@ -2173,7 +2173,7 @@ mod tests {
             ["reveal", "F:クリップボードへ送れませんでした: 送る\nクリップボードの内容を履歴に取り込めませんでした: 取り込み"]
         );
 
-        // 操作の失敗を知らせない設定でも、パニックの知らせは出す（parts が無い = トレイのアイコンは直さない）
+        // 操作の失敗を知らせない設定でも、パニックの通知は出す（parts が無い = トレイのアイコンは直さない）
         app.config.write().unwrap().general.notify_action_errors = false;
         app.mark_viewer_hidden();
         sink.report(ActionFailure { kind: ActionKind::CapturePanic, message: "止めた".into() });
@@ -2239,7 +2239,7 @@ mod tests {
                 },
                 move |hwnd| {
                     log_r.borrow_mut().push("reveal".to_string());
-                    // `viewer::show` は窓を表示し、`WM_SHOWWINDOW` で `on_shown` が呼ばれる
+                    // `viewer::show` はウィンドウを表示し、`WM_SHOWWINDOW` で `on_shown` が呼ばれる
                     weak.upgrade().unwrap().on_shown(hwnd);
                 },
             );
@@ -2382,8 +2382,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// ビューアを隠している間は知らせを出さずに残し、表示したときに出す。結果の表示中に隠すと、その結果は閉じ、
-    /// 残りの結果・失敗は隠れた窓の上に続けて出ない。
+    /// ビューアを隠している間は通知を出さずに残し、表示したときに出す。結果の表示中に隠すと、その結果は閉じ、
+    /// 残りの結果・失敗は隠れたウィンドウの上に続けて出ない。
     #[test]
     fn notices_are_held_while_viewer_is_hidden() {
         use crate::datacheck::FileEntry;
@@ -2402,7 +2402,7 @@ mod tests {
             app.set_check_display(
                 move |_hwnd, report| {
                     log_c.borrow_mut().push(format!("C:{}", report.orphans.len()));
-                    // 1つ目の表示中に隠す（`viewer::hide` は表示中のダイアログを閉じてから窓を隠す）
+                    // 1つ目の表示中に隠す（`viewer::hide` は表示中のダイアログを閉じてからウィンドウを隠す）
                     if report.orphans.len() == 1 {
                         weak.upgrade().unwrap().on_hidden(HWND::default());
                     }
@@ -2931,7 +2931,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 設定画面の OK（トレイを消す設定）で反映している途中、トレイの破棄の待ちに当たる位置で再入が起きても、窓は
+    /// 設定画面の OK（トレイを消す設定）で反映している途中、トレイの破棄の待ちに当たる位置で再入が起きても、ウィンドウは
     /// 壊れない:
     /// - 設定画面の閉じる要求（2回）: OK の後に1回だけ閉じる
     /// - ビューアの閉じる要求（トレイ無し → 終了）・セッションの終了: 設定画面は隠れて残り、閉じる要求は投稿されず、

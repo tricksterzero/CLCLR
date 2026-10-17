@@ -45,11 +45,11 @@ pub const APP_DISPLAY_NAME: &str = "CLCLR";
 
 const SINGLE_INSTANCE_MUTEX_NAME: PCWSTR = w!("CLCLR_SingleInstanceMutex");
 
-/// 多重起動防止。既に起動中なら既存のビューア窓へ表示要求を送ってNoneを返す
+/// 多重起動防止。既に起動中なら既存のビューアのウィンドウへ表示要求を送ってNoneを返す
 /// （呼び出し元はプロセスを終了する）。起動してよい場合はMutexハンドルを返すので、
 /// `main`のローカル変数として保持し、プロセス終了までスコープを維持すること
 /// （ドロップするとハンドルが閉じられ二重起動防止の意味がなくなる）。
-/// 表示要求は、先に起動した側が窓を作るまで待ってから送る（起動の途中の二重起動）。届けられな
+/// 表示要求は、先に起動した側がウィンドウを作るまで待ってから送る（起動の途中の二重起動）。届けられな
 /// ければ、その旨を知らせる。
 fn acquire_single_instance() -> Option<HANDLE> {
     use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
@@ -146,7 +146,7 @@ fn report_error(message: &str) {
     }
 }
 
-/// 設定ファイルを読めないときに起動をやめる知らせの文。誤りの位置は書式の誤りのときだけ `e` に入る
+/// 設定ファイルを読めないときに起動をやめる通知の文。誤りの位置は書式の誤りのときだけ `e` に入る
 /// （読み取りの誤りでは入らないので、位置を前提にしない）。
 fn config_load_failure_message(path: &std::path::Path, e: &config::ConfigError) -> String {
     format!(
@@ -217,7 +217,7 @@ fn restore_latest_entry(core: &Core, port: &ClipboardPort) -> bool {
 }
 
 /// メインスレッドのメッセージループ。`PostQuitMessage`（トレイの「終了」など）で抜ける。
-/// ビューア窓のキー操作（Tab での移動、Esc）は `IsDialogMessageW` に任せる。これが処理した
+/// ビューアのウィンドウのキー操作（Tab での移動、Esc）は `IsDialogMessageW` に任せる。これが処理した
 /// メッセージは `TranslateMessage` に通さない（二重に変換すると IME の入力が壊れるため）。
 fn run_message_loop(viewer: windows::Win32::Foundation::HWND) {
     let mut msg = MSG::default();
@@ -279,7 +279,7 @@ fn main() {
         }
     };
 
-    // ビューア窓を先に（非表示で）作り、他スレッドからの起床先を用意してから各スレッドを起動する
+    // ビューアのウィンドウを先に（非表示で）作り、他スレッドからの起床先を用意してから各スレッドを起動する
     let (tray_tx, tray_rx) = mpsc::channel();
     let (hotkey_tx, hotkey_rx) = mpsc::channel();
     let app = Rc::new(App::new(Arc::clone(&config), core.clone(), tray_rx, hotkey_rx));
@@ -300,8 +300,8 @@ fn main() {
     let waker = viewer.waker();
     viewer::set_topmost(viewer.hwnd(), config.read().unwrap().general.viewer_always_on_top);
 
-    // 画像（一覧のサムネイル・プレビュー）の読み込みスレッド。依頼の送り手はビューア窓が持ち、
-    // 窓の破棄で手放すので、スレッドはその後に終わる
+    // 画像（一覧のサムネイル・プレビュー）の読み込みスレッド。依頼の送り手はビューアのウィンドウが持ち、
+    // ウィンドウの破棄で手放すので、スレッドはその後に終わる
     let image_thread = {
         let (request_tx, request_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
@@ -330,7 +330,7 @@ fn main() {
         handle
     };
 
-    // 操作の失敗・知らせの通知先。監視からの取り込みの失敗・権限の確認の結果もここへ積むので、監視より先に作り、
+    // 操作の失敗・通知の送り先。監視からの取り込みの失敗・権限の確認の結果もここへ積むので、監視より先に作り、
     // 操作スレッドの成否と関係なくビューアとつなぐ（作れなくても、取り込みの失敗は知らせ、終了の要求で閉じる）
     let failures = native::actions::FailureSink::new(move || waker.wake());
     app.attach_failures(failures.clone());
@@ -387,7 +387,7 @@ fn main() {
 
     sync_clipboard_on_start(&config, &core, &watcher);
 
-    // トレイ（設定で無効なら作らない。その場合は窓を閉じると終了する）。設定の反映で実行中に作るときも同じ
+    // トレイ（設定で無効なら作らない。その場合はウィンドウを閉じると終了する）。設定の反映で実行中に作るときも同じ
     // 送り手と起こし方を使う。アイコンは監視の実際の状態で決める
     app.attach_tray_source(tray_tx.clone(), waker);
     let tray = if config.read().unwrap().general.show_trayicon {
@@ -418,7 +418,7 @@ fn main() {
     };
     let hotkey_problems = hotkeys.as_ref().and_then(|h| hotkey_problems_message(h.startup_problems()));
 
-    // 非表示起動はトレイのアイコンを付けられたときだけ（アイコンが無いと窓へ戻る手段が見えないため。
+    // 非表示起動はトレイのアイコンを付けられたときだけ（アイコンが無いとウィンドウへ戻る手段が見えないため。
     // タスクバーができる前の登録で付けられなかった場合も表示して起動する）
     let start_hidden =
         config.read().unwrap().general.start_hidden && tray.as_ref().is_some_and(tray::Tray::icon_shown);
@@ -429,7 +429,7 @@ fn main() {
         report_error(&message);
     }
     if start_hidden {
-        // 表示するまで知らせを残す（隠したときと同じ。`on_hidden` は表示していない窓には来ない）
+        // 表示するまで通知を残す（隠したときと同じ。`on_hidden` は表示していないウィンドウには来ない）
         app.mark_viewer_hidden();
     } else {
         viewer::show(viewer.hwnd());
@@ -437,7 +437,7 @@ fn main() {
 
     run_message_loop(viewer.hwnd());
 
-    // 操作の失敗の通知先を閉じ（この後に届いた失敗はログだけ。破棄する窓へ起床を投稿しない）、
+    // 操作の失敗の通知先を閉じ（この後に届いた失敗はログだけ。破棄するウィンドウへ起床を投稿しない）、
     // 操作スレッドへの依頼の送り手を手放す
     app.finish_actions();
     // 終了: まず受け付けを閉じ、受け付け済みの操作が終わるのを待って最後の保存をする（スレッドを
@@ -450,12 +450,12 @@ fn main() {
         }
     }
     // 設定画面を破棄する（終了の要求では隠しただけ。ここならスタックに設定画面の処理は無い。ビューアを破棄すると
-    // 持たれた窓も破棄されるので、その前に明示的に破棄する）
+    // 持たれたウィンドウも破棄されるので、その前に明示的に破棄する）
     app.close_settings();
-    // ビューア窓を後片付け中にする（この後、ホットキー・トレイのスレッドの終わりを待つ間に送られた
+    // ビューアのウィンドウを後片付け中にする（この後、ホットキー・トレイのスレッドの終わりを待つ間に送られた
     // メッセージへ応じるが、アプリの処理は呼ばない）
     viewer::begin_teardown(viewer.hwnd());
-    // ホットキー → トレイ → 監視の順にスレッドを止め、窓を破棄する（ホットキー・トレイは、送られた
+    // ホットキー → トレイ → 監視の順にスレッドを止め、ウィンドウを破棄する（ホットキー・トレイは、送られた
     // メッセージに応じながら終わるまで待つ。`ui_thread::stop_ui_thread`）
     if let Some(Parts { watcher, tray, hotkeys }) = app.take_parts() {
         drop(hotkeys);
@@ -465,7 +465,7 @@ fn main() {
     app.detach_search();
     let _ = search_thread.join();
     drop(viewer);
-    // 窓の破棄で依頼の送り手が無くなり、読み込み中の1件を終えたところで抜ける
+    // ウィンドウの破棄で依頼の送り手が無くなり、読み込み中の1件を終えたところで抜ける
     let _ = image_thread.join();
 }
 
@@ -521,7 +521,7 @@ mod tests {
         );
     }
 
-    /// 設定ファイルを読めないときの知らせ: 起動をやめること・履歴は変えていないこと・ファイルの場所・誤りの説明
+    /// 設定ファイルを読めないときの通知: 起動をやめること・履歴は変えていないこと・ファイルの場所・誤りの説明
     /// （書式の誤りなら位置も）・直し方を出す。
     #[test]
     fn config_load_failure_message_explains_stop_and_fix() {

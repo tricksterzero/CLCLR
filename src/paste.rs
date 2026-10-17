@@ -37,7 +37,7 @@ impl FocusInfo {
         self.active_wnd != 0
     }
 
-    /// 今の前面の窓が、記録した窓のままか。
+    /// 今の前面のウィンドウが、記録したウィンドウのままか。
     pub fn is_foreground(&self) -> bool {
         self.matches_window(unsafe { GetForegroundWindow() }.0 as isize)
     }
@@ -232,7 +232,7 @@ fn notify_nc_activate(hwnd: HWND) {
 pub enum PasteSkipped {
     /// 修飾キーが離されないまま待ちが時間切れになった（送ると Ctrl+Alt+V などになる）
     ModifiersHeld,
-    /// 待っている間に前面の窓が、戻した窓から変わった（別の窓へ貼り付けない）
+    /// 待っている間に前面のウィンドウが、戻したウィンドウから変わった（別のウィンドウへ貼り付けない）
     ForegroundChanged,
     /// `SendInput` が送れたのは入力の一部だけ（送れた数）。送り直さない（二重に貼り付けうる）。押したままのキーを離す
     /// 入力は送った（それも入らなかったときはログに書く）。貼り付けが起きたかは分からない
@@ -243,8 +243,8 @@ pub enum PasteSkipped {
 ///
 /// 先に修飾キーの解放を待つ（C版 key_wait）: Alt+C 直後は Alt が押されたまま
 /// なので、待たずに送ると Ctrl+Alt+V になってしまう。待ちが時間切れなら送らない。
-/// 待った後、送る直前に前面の窓が `fi` で戻した窓のままかを確かめ、変わっていれば送らない（待っている間に利用者や
-/// ほかのアプリが前面を変えると、別の窓へ貼り付けてしまうため）。確かめるのは前面の窓までで、同じ窓の中で入力欄が
+/// 待った後、送る直前に前面のウィンドウが `fi` で戻したウィンドウのままかを確かめ、変わっていれば送らない（待っている間に利用者や
+/// ほかのアプリが前面を変えると、別のウィンドウへ貼り付けてしまうため）。確かめるのは前面のウィンドウまでで、同じウィンドウの中で入力欄が
 /// 変わったことは見分けない。確かめてから送るまでの間に変わることも防げない。
 pub fn send_paste(fi: &FocusInfo) -> Result<(), PasteSkipped> {
     let inputs = [
@@ -319,8 +319,8 @@ fn wait_modifiers_released() -> bool {
     false
 }
 
-/// 自分が `SendInput` で送るキー入力の目印（`KEYBDINPUT::dwExtraInfo`）。二度押しのキーフックは、注入の印があって
-/// この目印の入力を数えない（自動貼り付けの Ctrl を二度押しの1回目に数えない）。ほかのアプリが
+/// 自分が `SendInput` で送るキー入力のマーク（`KEYBDINPUT::dwExtraInfo`）。二度押しのキーフックは、注入のフラグがあって
+/// このマークの入力を数えない（自動貼り付けの Ctrl を二度押しの1回目に数えない）。ほかのアプリが
 /// 同じ値を使うと、その入力も数えない（残る制限）。
 pub const PASTE_INPUT_MARK: usize = 0x434C_434C; // "CLCL"
 
@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(keys_left_down(4), &[] as &[VIRTUAL_KEY]);
     }
 
-    /// 前面の窓が、戻した窓と違えば Ctrl+V を送らない（送れば別の窓へ貼り付けてしまう）。戻した窓に、前面に
+    /// 前面のウィンドウが、戻したウィンドウと違えば Ctrl+V を送らない（送れば別のウィンドウへ貼り付けてしまう）。戻したウィンドウに、前面に
     /// なりえない値（存在しないハンドル）を使う。
     #[test]
     fn send_paste_skips_when_foreground_is_not_the_restored_window() {
@@ -373,8 +373,8 @@ mod tests {
         assert_eq!(send_paste(&fi), Err(PasteSkipped::ForegroundChanged));
     }
 
-    /// 前面の窓が記録した窓なら真、違えば偽（メニューの位置に UI Automation の結果を使うかの判定と、
-    /// 自動貼り付けの前の確かめが使う `is_foreground` の比べ方）。実際の前面の窓は変わりうるので、比べる部分を見る。
+    /// 前面のウィンドウが記録したウィンドウなら真、違えば偽（メニューの位置に UI Automation の結果を使うかの判定と、
+    /// 自動貼り付けの前の確かめが使う `is_foreground` の比べ方）。実際の前面のウィンドウは変わりうるので、比べる部分を見る。
     #[test]
     fn matches_window_compares_with_recorded_window() {
         let fi = FocusInfo { active_wnd: 0x1234, focus_wnd: 0x5678, caret_pos: None };
@@ -468,7 +468,7 @@ mod tests {
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
 
-        // 窓を作って壊すので GUI 用のロックを取り、窓のスレッドの終わり（最後の join）まで持つ
+        // ウィンドウを作って壊すので GUI 用のロックを取り、ウィンドウのスレッドの終わり（最後の join）まで持つ
         let _gui = crate::tray::lock_gui_resource_tests();
         let (hwnd_tx, hwnd_rx) = mpsc::channel::<isize>();
         let handle = std::thread::spawn(move || unsafe {

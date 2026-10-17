@@ -116,17 +116,17 @@ fn to_win32(hotkey: &Hotkey) -> Option<(HOT_KEY_MODIFIERS, u32)> {
 
 // --- Hotkey thread ---
 
-/// ホットキー窓のコンテキスト。`GWLP_USERDATA`経由で`&HotkeyContext`（共有参照）として
+/// ホットキーのウィンドウのコンテキスト。`GWLP_USERDATA`経由で`&HotkeyContext`（共有参照）として
 /// 取り出す。`TrackPopupMenu`のモーダルループ中は`wndproc`が再入するため、可変な状態は
 /// `Cell`に持ち、`&mut`の別名を作らない。加えて、ポップアップ処理中（`busy`）に届いた
-/// 終了・再登録の依頼は保留し、処理が終わった最外周で実行する。窓の破棄でコンテキストが
+/// 終了・再登録の依頼は保留し、処理が終わった最外周で実行する。ウィンドウの破棄でコンテキストが
 /// 解放されるので、`show_popup_menu`が戻る前に解放しないための設計
 /// （解放後の参照を防ぐ）。
 struct HotkeyContext {
     events: Sender<HotkeyEvent>,
     config: Arc<RwLock<Config>>,
     core: Core,
-    /// クリップボードを開く窓と、抑止する変更番号（`ClipboardWatcher::port`。抑止は
+    /// クリップボードを開くウィンドウと、抑止する変更番号（`ClipboardWatcher::port`。抑止は
     /// `delete_on_send`設定と対）
     clipboard: Arc<ClipboardPort>,
     repaint: Box<dyn Fn() + Send>,
@@ -152,7 +152,7 @@ struct HotkeyContext {
     uia: OnceCell<Option<UiaCaret>>,
 }
 
-/// `GWLP_USERDATA`のコンテキストを共有参照で取り出す。窓の破棄後（null）は`None`。
+/// `GWLP_USERDATA`のコンテキストを共有参照で取り出す。ウィンドウの破棄後（null）は`None`。
 /// 返す参照は`WM_DESTROY`まで有効（ポップアップ処理中は解放されない）。
 unsafe fn ctx_ref<'a>(hwnd: HWND) -> Option<&'a HotkeyContext> {
     unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const HotkeyContext).as_ref() }
@@ -176,10 +176,10 @@ impl Drop for BusyGuard<'_> {
 
 // --- Low-level keyboard hook (double press) ---
 
-/// LLフックの転送先ウィンドウ（ホットキー窓。フックを外している間は 0）。フックプロシージャにはコンテキストを
+/// LLフックの転送先ウィンドウ（ホットキーのウィンドウ。フックを外している間は 0）。フックプロシージャにはコンテキストを
 /// 渡せないため static 経由で持つ（フックはこのプロセスで1つしか張らない）。
 static HOOK_TARGET: AtomicIsize = AtomicIsize::new(0);
-/// 今のフックの世代（転送に含め、ホットキー窓は今の世代と違う転送を捨てる。張り直しの前に投稿済みの古い転送を
+/// 今のフックの世代（転送に含め、ホットキーのウィンドウは今の世代と違う転送を捨てる。張り直しの前に投稿済みの古い転送を
 /// 数えない）
 static HOOK_GENERATION: AtomicU32 = AtomicU32::new(0);
 
@@ -246,7 +246,7 @@ impl Drop for HookThread {
     }
 }
 
-/// フックが転送するキー入力か。自分の `SendInput`（自動貼り付け）の入力は、注入の印があって目印
+/// フックが転送するキー入力か。自分の `SendInput`（自動貼り付け）の入力は、注入のフラグがあってマーク
 /// （`paste::PASTE_INPUT_MARK`）が一致するので数えない。
 fn should_forward(flags_injected: bool, extra_info: usize) -> bool {
     !(flags_injected && extra_info == crate::paste::PASTE_INPUT_MARK)
@@ -262,7 +262,7 @@ fn normalize_modifier(vk: u32) -> u32 {
     }
 }
 
-/// WH_KEYBOARD_LL フックプロシージャ（フック専用のスレッドで呼ばれる）。キーイベントをホットキー窓へ転送する
+/// WH_KEYBOARD_LL フックプロシージャ（フック専用のスレッドで呼ばれる）。キーイベントをホットキーのウィンドウへ転送する
 /// だけで、すぐ次のフックへ渡す（判定は wndproc 側=WM_APP_KEY_EVENTで行う。C版のDLLが転送のみだったのと同じ分担）。
 /// 転送には、キーが起きた時刻とフックの世代を含める。
 unsafe extern "system" fn ll_hook_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -708,7 +708,7 @@ fn append_menu_row(menu: &mut PopupMenu, target: HMENU, i: usize, ordinal: usize
 /// メニューを出す位置。`use_caret` が偽（トレイのクリック）ならマウスの位置、真なら設定の
 /// `menu_position` に従い、キャレットが取れなければマウスの位置。UI Automation の問い合わせは、
 /// 応答しないアプリでは `uia_caret::QUERY_WAIT` までこのスレッドを止める。UI Automation はその時点で
-/// フォーカスのある要素を見るので、問い合わせの間に前面の窓が `focus` で記録したもの（選んだ後に貼り付ける先）
+/// フォーカスのある要素を見るので、問い合わせの間に前面のウィンドウが `focus` で記録したもの（選んだ後に貼り付ける先）
 /// から替わっていれば、その位置は使わない。
 fn menu_point(ctx: &HotkeyContext, config: &Config, focus: &FocusInfo, use_caret: bool) -> (i32, i32) {
     if !use_caret {
@@ -740,7 +740,7 @@ fn show_popup_menu(hwnd: HWND, ctx: &HotkeyContext, use_caret: bool, content: Me
 
     // ロック順序: configのガードを手放してからserviceを取る（他スレッドと同順）
     let config = ctx.config.read().unwrap().clone();
-    // サービスのロックの中では行の写しだけを取り、サムネイルのファイルはロックの外で読む
+    // サービスのロックの中では行のコピーだけを取り、サムネイルのファイルはロックの外で読む
     let Some(mut layout) =
         ctx.core.read(|service| build_menu_layout(&service.history, &service.pinned, &config, content))
     else {
@@ -800,7 +800,7 @@ fn show_popup_menu(hwnd: HWND, ctx: &HotkeyContext, use_caret: bool, content: Me
         drop(popup);
 
         // 終了依頼でメニューが閉じられた場合は、送出（フォーカス復帰・書き込み・貼り付け）を
-        // しない。窓の破棄は戻った先のwndprocが行う
+        // しない。ウィンドウの破棄は戻った先のwndprocが行う
         if ctx.shutdown_pending.get() {
             return;
         }
@@ -821,9 +821,9 @@ fn show_popup_menu(hwnd: HWND, ctx: &HotkeyContext, use_caret: bool, content: Me
 /// メニューで選ばれたエントリを送出する（フォーカス復帰 → クリップボード → 自動ペースト）。
 ///
 /// C版と同じく、メニューを表示したこのスレッド上で完結させる。
-/// フォーカス復帰の`SetForegroundWindow`は、フォアグラウンド（メニューのオーナー窓）を所有する
+/// フォーカス復帰の`SetForegroundWindow`は、フォアグラウンド（メニューのオーナーウィンドウ）を所有する
 /// このスレッドから呼ばないと効かない（別のスレッドから呼ぶと成功を返しつつ実際には
-/// 切り替わらず、Ctrl+Vが自分の隠し窓に消えることを実機で確認）。
+/// 切り替わらず、Ctrl+Vが自分の隠しウィンドウに消えることを実機で確認）。
 /// `keys` は選んだときの修飾キー（`PickKeys`）。
 fn send_pick(hwnd: HWND, ctx: &HotkeyContext, id: Uuid, pinned: bool, keys: PickKeys, focus: &FocusInfo) {
     // 読み込みは受け付け・操作用のロックの下で、サービスのロックの外で行う（取り込みの変換中は
@@ -834,7 +834,7 @@ fn send_pick(hwnd: HWND, ctx: &HotkeyContext, id: Uuid, pinned: bool, keys: Pick
         Ok(entry) => entry,
         Err(e) => {
             eprintln!("メニュー選択エントリの読み込みに失敗: {e}");
-            // キャンセルと同じく、元のウィンドウへフォーカスを返す（前面がメニューのオーナーの隠し窓のまま
+            // キャンセルと同じく、元のウィンドウへフォーカスを返す（前面がメニューのオーナーの隠しウィンドウのまま
             // 残らないように）
             restore_focus(focus);
             return;
@@ -870,7 +870,7 @@ fn send_pick(hwnd: HWND, ctx: &HotkeyContext, id: Uuid, pinned: bool, keys: Pick
     // 誤ったウィンドウへCtrl+Vを送出しないため）
     if auto_paste && focus_restored && !keys.no_paste {
         unregister_all(hwnd);
-        // send_pasteのSendInputはWH_KEYBOARD_LLにも乗るが、目印（`paste::PASTE_INPUT_MARK`）を付けてあり、
+        // send_pasteのSendInputはWH_KEYBOARD_LLにも乗るが、マーク（`paste::PASTE_INPUT_MARK`）を付けてあり、
         // フックが二度押し判定へ転送しない（`should_forward`。Ctrl down→V down/up(リセット)→Ctrl up(新規1回
         // 押下として記録)という経路になり、直後の実操作と合算して誤発火しうるため）
         if let Err(skipped) = crate::paste::send_paste(focus) {
@@ -1077,11 +1077,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 LRESULT(0)
             }
             // WM_CLOSEは既定処理（DefWindowProcW）がDestroyWindowを呼ぶため、外部から
-            // （タスクの終了要求・SC_CLOSE等）届いてもモーダル中に窓が破棄されないよう、
+            // （タスクの終了要求・SC_CLOSE等）届いてもモーダル中にウィンドウが破棄されないよう、
             // 独自の終了依頼と同じ保留経路に通す
             WM_CLOSE | WM_APP_SHUTDOWN => {
                 match ctx_ref(hwnd) {
-                    // ポップアップ処理中: ここで窓を破棄するとshow_popup_menuの`ctx`が
+                    // ポップアップ処理中: ここでウィンドウを破棄するとshow_popup_menuの`ctx`が
                     // 解放済みになる。メニューだけ閉じ、破棄は戻った後に行う
                     Some(ctx) if ctx.menu_open.get() => {
                         ctx.shutdown_pending.set(true);
@@ -1163,9 +1163,9 @@ impl Hotkeys {
                         shutdown_pending: Cell::new(false),
                         uia: OnceCell::new(),
                     }));
-                    // メッセージ専用窓（HWND_MESSAGE）ではなく通常の非表示トップレベル窓に
+                    // メッセージ専用ウィンドウ（HWND_MESSAGE）ではなく通常の非表示トップレベルウィンドウに
                     // する。TrackPopupMenuのオーナーはフォアグラウンド化できる実ウィンドウで
-                    // ある必要があり、メッセージ専用窓を強制フォアグラウンドにすると
+                    // ある必要があり、メッセージ専用ウィンドウを強制フォアグラウンドにすると
                     // TrackPopupMenuがメニューを表示できないままモーダルループに入って
                     // フックスレッドごと固まる（実機確認）。表示しない限り画面には出ない
                     let hwnd = CreateWindowExW(
@@ -1183,7 +1183,7 @@ impl Hotkeys {
                         Some(ctx.cast()),
                     )?;
                     // ホットキー登録とキーフック同期をまとめて実行し、できなかったことを
-                    // 呼び出し元へ返す（このスレッドの窓なので、ここで直接呼んでも再入しない）
+                    // 呼び出し元へ返す（このスレッドのウィンドウなので、ここで直接呼んでも再入しない）
                     let problems = match ctx_ref(hwnd) {
                         Some(ctx) => apply_reregister(hwnd, ctx),
                         None => Vec::new(),
@@ -1224,13 +1224,13 @@ impl Hotkeys {
     }
 
     /// 起動時にできなかったこと（ホットキーの登録・キーフックの設定の失敗）の説明。
-    /// スレッドと窓は動いているので、呼び出し元はユーザーへ知らせて続行できる。
+    /// スレッドとウィンドウは動いているので、呼び出し元はユーザーへ知らせて続行できる。
     pub fn startup_problems(&self) -> &[String] {
         &self.startup_problems
     }
 
     /// 設定変更後の再登録（設定の反映から呼ぶ）。`generation` は依頼の番号（1 以上）で、結果は
-    /// `HotkeyEvent::Reregistered` で返る。投稿するだけで待たない（別のスレッドの窓へ `SendMessageW` で送ると、
+    /// `HotkeyEvent::Reregistered` で返る。投稿するだけで待たない（別のスレッドのウィンドウへ `SendMessageW` で送ると、
     /// 返事を待つ間に呼び出し元がほかのスレッドから送られたメッセージを処理し、ビューアのハンドラへ再入しうる
     /// ため）。ポップアップメニューの処理中なら、反映はメニューが閉じて送出が終わった
     /// 後になる（重なった依頼は最後の番号の1回だけ行う）。投稿できなければ Err。
@@ -1253,7 +1253,7 @@ impl Hotkeys {
 
 impl Drop for Hotkeys {
     /// 終了を依頼し、スレッドが終わるまで、送られたメッセージに応じながら待つ（`ui_thread::stop_ui_thread`。
-    /// ホットキースレッドの前面化がこのスレッドの窓へメッセージを送っても、互いに待たない）。
+    /// ホットキースレッドの前面化がこのスレッドのウィンドウへメッセージを送っても、互いに待たない）。
     fn drop(&mut self) {
         if let Some(t) = self.thread.take() {
             crate::ui_thread::stop_ui_thread(self.hwnd, WM_APP_SHUTDOWN, t, crate::ui_thread::REPOST_INTERVAL);
@@ -1352,7 +1352,7 @@ mod tests {
     /// モーダルループへ入れ、その最中に`Drop`（=`WM_APP_SHUTDOWN`）を届ける。
     /// 修正前はここで`HotkeyContext`が解放され、戻った先の`ctx`が解放済みになる。
     /// 修正後は`WM_DESTROY`の`debug_assert`が守り、Dropはメニューを閉じてから
-    /// 窓を破棄してスレッドをjoinできる。
+    /// ウィンドウを破棄してスレッドをjoinできる。
     #[test]
     fn shutdown_while_menu_is_open_is_deferred_until_menu_closes() {
         shutdown_while_menu_is_open(false);
@@ -1447,7 +1447,7 @@ mod tests {
         // 保留中: まだキーフックは張られていない
         assert_eq!(HOOK_TARGET.load(Ordering::Relaxed), 0);
 
-        // メニューを閉じる（オーナー窓へのWM_CANCELMODEでモーダルループが終わる）
+        // メニューを閉じる（オーナーウィンドウへのWM_CANCELMODEでモーダルループが終わる）
         unsafe {
             PostMessageW(Some(hotkeys.hwnd), WM_CANCELMODE, WPARAM(0), LPARAM(0)).unwrap();
         }
@@ -1865,8 +1865,8 @@ mod tests {
         }
     }
 
-    /// 自分の自動貼り付けの入力（注入の印と目印の両方がある）だけを転送しない。注入の印がない入力や、
-    /// 目印のない注入（ほかのアプリの `SendInput` など）は転送する。
+    /// 自分の自動貼り付けの入力（注入のフラグとマークの両方がある）だけを転送しない。注入のフラグがない入力や、
+    /// マークのない注入（ほかのアプリの `SendInput` など）は転送する。
     #[test]
     fn own_paste_input_is_not_forwarded() {
         let mark = crate::paste::PASTE_INPUT_MARK;

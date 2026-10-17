@@ -20,7 +20,7 @@ use crate::data::Format;
 use crate::storage::EntryMeta;
 
 /// ピン留めツリーの各ノード（メタデータのみ。実データはblobから遅延ロード）。
-/// Cloneは、`ops::Core` のピン留めの操作がツリーの写しを変えて `save_pinned` で保存し、
+/// Cloneは、`ops::Core` のピン留めの操作がツリーのコピーを変えて `save_pinned` で保存し、
 /// 保存できてからメモリへ反映する（失敗したらメモリを変えない）ために使う。
 #[derive(Clone)]
 pub enum PinnedNode {
@@ -279,7 +279,7 @@ pub struct HistoryItem {
     /// ディスクに書かない形式（`FormatFilter.save=false`、セッション内のみ保持）。
     /// 永続化モード自体が無効な場合は全形式がここに入る（完全メモリモード）。
     /// `Arc` で持つのは、サービスのロックの中では `Arc` の複製だけを取り、大きなデータの
-    /// 写し・切り出しをロックの外で行うため。`Format` の定義は変えない
+    /// コピー・切り出しをロックの外で行うため。`Format` の定義は変えない
     pub resident: Arc<Vec<Format>>,
 }
 

@@ -31,7 +31,7 @@ const SID_CREATOR_OWNER: &str = "S-1-3-0";
 /// 今の所有者を表す（所有者を信頼するときだけ信頼する）
 const SID_OWNER_RIGHTS: &str = "S-1-3-4";
 
-/// ACE の継承の印（`ACE_HEADER::AceFlags`）。
+/// ACE の継承のフラグ（`ACE_HEADER::AceFlags`）。
 const OBJECT_INHERIT: u8 = 0x1;
 const CONTAINER_INHERIT: u8 = 0x2;
 const INHERIT_ONLY: u8 = 0x8;
@@ -488,7 +488,7 @@ mod win {
         Ok(Security { owner, dacl: Dacl::Entries(aces) })
     }
 
-    /// リンク（ジャンクション・シンボリックリンクなど）か。クラウドのファイル（OneDrive など）の印は除く
+    /// リンク（ジャンクション・シンボリックリンクなど）か。クラウドのファイル（OneDrive など）のタグは除く
     /// （`IO_REPARSE_TAG_CLOUD_*`）。読めなければ Err。
     pub fn is_link(path: &Path, attributes: u32) -> Result<bool, String> {
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -934,7 +934,7 @@ mod tests {
         assert!(e.unknown_ace && e.concerns.is_empty());
     }
 
-    /// 継承の印: ファイルへ引き継がれる読み取り、フォルダだけへ引き継がれる一覧（問題にしない）と書き込み。
+    /// 継承のフラグ: ファイルへ引き継がれる読み取り、フォルダだけへ引き継がれる一覧（問題にしない）と書き込み。
     #[test]
     fn folder_inheritance_distinguishes_files_and_folders() {
         let t = trusted();

@@ -129,7 +129,7 @@ pub fn utf16_bytes(text: &str) -> Vec<u8> {
 }
 
 /// CF_UNICODETEXT（UTF-16LE・NUL終端）の文字を1つずつ返す（`utf16_text` と同じ文字。全文の文字列を
-/// 作らない。メモリだけに持つ全文の検索で写しを作らないため）。
+/// 作らない。メモリだけに持つ全文の検索でコピーを作らないため）。
 pub fn utf16_chars(data: &[u8]) -> impl Iterator<Item = char> + '_ {
     let units = data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0);
     char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))

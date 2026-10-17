@@ -2,8 +2,8 @@
 //!
 //! メニューはネイティブ`TrackPopupMenu`でツールチップ機能を持たないため、
 //! `WM_MENUSELECT`（マウス・キーボードどちらの選択変化でも届く）を契機に、
-//! 待ち時間のタイマー満了後に自前の小窓を項目の横へ出す（C版`ToolTip.c`相当）。
-//! 窓は`WS_EX_NOACTIVATE`でフォーカスを奪わず、マウス操作は素通しにする
+//! 待ち時間のタイマー満了後に自前の小さいウィンドウを項目の横へ出す（C版`ToolTip.c`相当）。
+//! ウィンドウは`WS_EX_NOACTIVATE`でフォーカスを奪わず、マウス操作は素通しにする
 //! （メニュー選択後のフォーカス復帰・ペースト送出を妨げないため）。
 //!
 //! 状態はホットキースレッドのthread_localに持つ。`TrackPopupMenu`のモーダル
@@ -48,11 +48,11 @@ use crate::ops::Core;
 use crate::service::HistoryService;
 use crate::store;
 
-/// ツールチップ表示待ちタイマーのID（ホットキー窓上。二度押し判定タイマーは1）
+/// ツールチップ表示待ちタイマーのID（ホットキーのウィンドウ上。二度押し判定タイマーは1）
 pub const TIMER_ID: usize = 2;
 
 const CLASS_NAME: PCWSTR = w!("CLCLR_MenuTooltip");
-/// 窓内側の余白・画像とテキストの間隔（96 DPI 基準の px。表示するモニターの DPI に合わせて使う）
+/// ウィンドウ内側の余白・画像とテキストの間隔（96 DPI 基準の px。表示するモニターの DPI に合わせて使う）
 const PAD: i32 = 6;
 const GAP: i32 = 6;
 /// テキストの折り返し幅（96 DPI 基準の px）
@@ -179,7 +179,7 @@ fn text_read_cap(cfg: &MenuTooltipConfig) -> usize {
     (cfg.max_chars as usize).saturating_mul(4).max(4)
 }
 
-/// 項目に対応するエントリの読み込み元（サービスのロックの中で取る。resident は `Arc` の写し
+/// 項目に対応するエントリの読み込み元（サービスのロックの中で取る。resident は `Arc` のコピー
 /// だけで、先頭の切り出しはロックの外の `Snapshot::from_source` で行う）。
 struct SnapshotSource {
     meta: crate::storage::EntryMeta,
@@ -252,7 +252,7 @@ fn build_content(snap: &Snapshot, cfg: &MenuTooltipConfig) -> Option<TooltipCont
 
 /// 画像は一覧と共通のサムネイル（長辺128px）を優先する。サムネイルが無い場合は
 /// 元データが`MAX_FALLBACK_DIB_BYTES`以下のときだけ復号する。いずれも長辺128pxへ
-/// 縮小して返す（窓が画像の原寸で巨大になるのを避ける）。
+/// 縮小して返す（ウィンドウが画像の原寸で巨大になるのを避ける）。
 fn load_image(snap: &Snapshot) -> Option<TooltipImage> {
     let edge = crate::dib::THUMB_LONG_EDGE;
     let decoded = if let Some(webp) = snap
@@ -301,7 +301,7 @@ struct Bounds {
     bottom: i32,
 }
 
-/// ツールチップ窓の左上座標を決める。項目の右隣に出し、作業領域の右端を越える
+/// ツールチップのウィンドウの左上座標を決める。項目の右隣に出し、作業領域の右端を越える
 /// なら左隣へ反転し、それでも収まらなければ作業領域内へ寄せる。縦は項目の上端に
 /// 揃え、下端を越えるなら押し上げる。
 fn place_tooltip(item: Bounds, size: (i32, i32), work: Bounds, anchor_gap: i32) -> (i32, i32) {
@@ -317,7 +317,7 @@ fn place_tooltip(item: Bounds, size: (i32, i32), work: Bounds, anchor_gap: i32) 
 
 // --- Window ---
 
-/// 描画時に参照する状態。窓の`GWLP_USERDATA`に`Box`で持たせ、`WM_NCDESTROY`で解放する。
+/// 描画時に参照する状態。ウィンドウの`GWLP_USERDATA`に`Box`で持たせ、`WM_NCDESTROY`で解放する。
 struct PaintState {
     /// `font` を作った DPI（表示するモニターの DPI が変わったら作り直す）
     dpi: u32,
@@ -449,7 +449,7 @@ unsafe fn paint(hdc: windows::Win32::Graphics::Gdi::HDC, st: &PaintState) {
     }
 }
 
-/// ツールチップ窓。ホットキースレッド上で生成・使用・破棄する。
+/// ツールチップのウィンドウ。ホットキースレッド上で生成・使用・破棄する。
 struct TooltipWindow {
     hwnd: HWND,
 }
@@ -499,7 +499,7 @@ impl TooltipWindow {
         }
     }
 
-    /// 描画状態への排他参照。状態は窓の`GWLP_USERDATA`にあり、`wndproc`（WM_PAINT）も
+    /// 描画状態への排他参照。状態はウィンドウの`GWLP_USERDATA`にあり、`wndproc`（WM_PAINT）も
     /// 読むため、`&mut self`を要求して同時に2本取れないようにする。
     fn state(&mut self) -> Option<&mut PaintState> {
         unsafe { (GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *mut PaintState).as_mut() }
@@ -709,7 +709,7 @@ fn work_area(anchor: Bounds) -> Bounds {
 // --- Session (ポップアップメニュー1回の表示中) ---
 
 struct Session {
-    /// タイマーを張る窓（ホットキー窓）
+    /// タイマーを張るウィンドウ（ホットキーのウィンドウ）
     owner: HWND,
     core: Core,
     cfg: MenuTooltipConfig,
@@ -774,12 +774,12 @@ pub fn begin_session(
     });
 }
 
-/// `TrackPopupMenu`から戻った直後に呼ぶ（タイマー停止・窓破棄）。
+/// `TrackPopupMenu`から戻った直後に呼ぶ（タイマー停止・ウィンドウ破棄）。
 pub fn end_session() {
     let session = SESSION.with(|s| s.borrow_mut().take());
     if let Some(mut session) = session {
         session.cancel();
-        // Dropで窓を破棄する
+        // Dropでウィンドウを破棄する
     }
 }
 
@@ -1134,7 +1134,7 @@ mod tests {
     }
 
     /// 空白のない長文（URL・ハッシュ等）でも、計測幅が折り返し幅を超えないこと。
-    /// 実際の窓とDCで`DT_CALCRECT`を測る（`DT_WORDBREAK`は最長単語が矩形より長いと
+    /// 実際のウィンドウとDCで`DT_CALCRECT`を測る（`DT_WORDBREAK`は最長単語が矩形より長いと
     /// 幅を広げるという指摘の実機確認）。
     #[test]
     fn unbreakable_long_text_stays_within_max_width() {

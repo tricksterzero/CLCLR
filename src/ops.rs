@@ -2,15 +2,15 @@
 //!
 //! 3つの仕組みで、ファイルの読み書き・変換をサービスのロック（`Mutex<HistoryService>`）の外へ
 //! 出す（ビューアのメインスレッドが取るサービスのロックは、メモリの
-//! 更新と写しを取る一瞬だけにする）。
+//! 更新とコピーを取る一瞬だけにする）。
 //!
 //! - **受け付け**（`Admission`）: 操作は始める前に登録する（`Ticket`）。終了処理
 //!   （`shutdown`）は受け付けを閉じ、登録済みの操作が終わるのを待ってから最後の保存をする。
 //!   締め切りは「受け付けに登録できた時点」
 //! - **操作用のロック**（`Mutex<OpState>`）: 登録済みの操作を1つずつ順に行う。変換・blob の
 //!   読み書き・インデックスの書き込み・blob の削除は、このロックを持ったまま、サービスの
-//!   ロックの外で行う。順に並ぶので、古い写しが新しい写しを上書きすることはない
-//! - **サービスのロック**: メモリの更新と写し（メタデータ、resident の `Arc`）を取る一瞬だけ
+//!   ロックの外で行う。順に並ぶので、古いコピーが新しいコピーを上書きすることはない
+//! - **サービスのロック**: メモリの更新とコピー（メタデータ、resident の `Arc`）を取る一瞬だけ
 //!
 //! ロックの順序は、受け付け（一瞬、他を持たずに）→ 操作用のロック → サービスのロック。
 //! サービスのロック・設定のガードを持ったまま `Core` の操作を呼ばない（`read` のクロージャの
@@ -166,7 +166,7 @@ struct Scope<'a> {
 
 /// 除いた項目の後始末のしかた。
 enum Retire {
-    /// 永続化が有効: この全件の写しでインデックスを書き直す
+    /// 永続化が有効: この全件のコピーでインデックスを書き直す
     Full(Vec<EntryMeta>),
     /// 完全メモリモード: ディスクのインデックスから、除いた項目の ID だけを消す
     /// （一致する ID が無ければ書かないので、新しいメタデータを書くことにはならない）
@@ -240,7 +240,7 @@ impl Core {
         Ok(Scope { ops, _ticket: ticket })
     }
 
-    /// 設定の写し（操作用のロックを取った後に取る。1つの操作の中では同じ写しを使う）。
+    /// 設定のコピー（操作用のロックを取った後に取る。1つの操作の中では同じコピーを使う）。
     fn cfg(&self) -> Config {
         self.inner.config.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
@@ -250,7 +250,7 @@ impl Core {
         Ok(f(&mut service))
     }
 
-    /// 除いた項目の後始末のしかた（永続化が有効なら全件の写しをサービスのロックの中で取る）。
+    /// 除いた項目の後始末のしかた（永続化が有効なら全件のコピーをサービスのロックの中で取る）。
     fn retire_kind(&self) -> Result<Retire, OpError> {
         if self.inner.persist {
             Ok(Retire::Full(self.with_service(|s| s.history_metas())?))
@@ -295,7 +295,7 @@ impl Core {
         let item = prepare_capture(&self.inner.storage, &cfg, persist, entry)?;
         let (evicted, snapshot) = self.with_service(|s| {
             let evicted = s.add_item(item, &cfg.history);
-            // 押し出しがあれば後始末のために、save_on_change なら毎回、全件の写しを取る。
+            // 押し出しがあれば後始末のために、save_on_change なら毎回、全件のコピーを取る。
             // save_on_exit だけで押し出しが無ければ、インデックスは終了時まで書かない
             let snapshot = (persist && (!evicted.is_empty() || cfg.history.save_on_change)).then(|| s.history_metas());
             (evicted, snapshot)
@@ -371,7 +371,7 @@ impl Core {
             meta.title = meta.preview.as_deref().and_then(auto_title);
         }
         let mut nodes = self.with_service(|s| s.pinned.clone())?;
-        // 入れる先は上で確かめた（操作用のロックの中なので、写しにもある）
+        // 入れる先は上で確かめた（操作用のロックの中なので、コピーにもある）
         let Some(children) = store::children_mut(&mut nodes, to) else {
             remove_blobs(&self.inner.storage, &meta);
             return Err(OpError::TargetNotFound);
@@ -381,7 +381,7 @@ impl Core {
             remove_blobs(&self.inner.storage, &meta);
             return Err(e.into());
         }
-        // 操作用のロックで順に並ぶので、写しを取ってからここまでの間にピン留めは変わらない
+        // 操作用のロックで順に並ぶので、コピーを取ってからここまでの間にピン留めは変わらない
         self.with_service(|s| s.set_pinned(nodes))?;
         Ok(())
     }
@@ -678,7 +678,7 @@ impl Core {
         // blob は、全部の書き直しの結果が決まってから消す。実際に消せた項目以外（残った項目・保存に失敗して残った
         // 項目・今の消し直し待ち・ディスクのインデックス）から参照されるものは消さない。
         // メモリの分は、ID で除くのではなく消した後の今の状態から取る（同じ ID の別の項目の参照も残す）。
-        // ディスクの分は、走査のときの写しから消した項目の ID を除く（消した項目はもう書き直した）
+        // ディスクの分は、走査のときのコピーから消した項目の ID を除く（消した項目はもう書き直した）
         let removed_history_ids: HashSet<Uuid> = removed_history.iter().map(|m| m.id).collect();
         let removed_pinned_ids: HashSet<Uuid> = removed_pinned.iter().map(|m| m.id).collect();
         let (history_now, pinned_now) = self.with_service(|s| (s.history_metas(), item_metas(&s.pinned)))?;
@@ -714,7 +714,7 @@ impl Core {
         true
     }
 
-    /// 走査（`check_data`・`clean_data` が操作用のロックの中で呼ぶ）。サービスのロックでは写しを取るだけで、
+    /// 走査（`check_data`・`clean_data` が操作用のロックの中で呼ぶ）。サービスのロックではコピーを取るだけで、
     /// ファイルの読み書きはその外。
     fn scan_data(&self, ops: &OpState) -> Result<DataScan, OpError> {
         self.check_closing()?;
@@ -945,7 +945,7 @@ fn remove_unreferenced_blobs(storage: &Storage, metas: &[EntryMeta], protected: 
     }
 }
 
-/// データのチェックの走査の結果と、消すときに使う参照の写し。
+/// データのチェックの走査の結果と、消すときに使う参照のコピー。
 struct DataScan {
     report: DataReport,
     /// ディスクの history.toml・pinned.toml の項目がすべてメモリにある（外から書き戻されていない）

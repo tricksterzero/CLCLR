@@ -179,7 +179,7 @@ impl Worker {
     }
 
     /// メモリだけに持つ全文が `needle` を含むか。ロックの中では resident の `Arc` だけを写し、照合は
-    /// ロックの外で、全文の写しを作らずに行う。
+    /// ロックの外で、全文のコピーを作らずに行う。
     fn resident_contains(&self, id: Uuid, needle: &str) -> bool {
         let Some(Some(resident)) = self.core.read(|s| s.history.get_by_id(id).map(|i| Arc::clone(&i.resident))) else {
             return false;

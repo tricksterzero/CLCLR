@@ -209,7 +209,7 @@ struct TrayContext {
     shutdown_pending: Cell<bool>,
 }
 
-/// `GWLP_USERDATA`のコンテキストを共有参照で取り出す。窓の破棄後（null）は`None`。
+/// `GWLP_USERDATA`のコンテキストを共有参照で取り出す。ウィンドウの破棄後（null）は`None`。
 /// 返す参照の有効期間は呼び出し側の責任: `WM_DESTROY`まで（=メニュー表示中は解放されない）。
 unsafe fn ctx_ref<'a>(hwnd: HWND) -> Option<&'a TrayContext> {
     unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TrayContext).as_ref() }
@@ -417,10 +417,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 LRESULT(0)
             }
             // WM_CLOSEは既定処理（DefWindowProcW）がDestroyWindowを呼ぶため、外部から届いても
-            // メニュー表示中に窓が破棄されないよう、独自の終了依頼と同じ保留経路に通す
+            // メニュー表示中にウィンドウが破棄されないよう、独自の終了依頼と同じ保留経路に通す
             WM_CLOSE | WM_APP_SHUTDOWN => {
                 match ctx_ref(hwnd) {
-                    // メニュー表示中: ここで窓を破棄するとTrackPopupMenuから戻った先の
+                    // メニュー表示中: ここでウィンドウを破棄するとTrackPopupMenuから戻った先の
                     // `ctx`が解放済みになる。メニューだけ閉じ、破棄は戻った後に行う
                     Some(ctx) if ctx.menu_open.get() => {
                         ctx.shutdown_pending.set(true);
@@ -441,7 +441,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let icon = ctx.icon.get();
                     let data = notify_icon_data(hwnd, icon);
                     let _ = Shell_NotifyIconW(NIM_DELETE, &data);
-                    // 外から `WM_CLOSE` が届いて窓が壊れた場合も、アイコンが無いことを `Tray::icon_shown` に出す
+                    // 外から `WM_CLOSE` が届いてウィンドウが壊れた場合も、アイコンが無いことを `Tray::icon_shown` に出す
                     ctx.icon_shown.store(false, Ordering::SeqCst);
                     let _ = DestroyIcon(icon);
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -541,8 +541,8 @@ impl Tray {
                     // 明示的にGWLP_USERDATAへ結び付けることで、失敗時は「まだどの
                     // ウィンドウにも結び付いていない」ことが保証され、finish_window_creation
                     // 側で迷いなく手動解放できる（WM_DESTROYとの二重解放の心配がない）。
-                    // 窓はメッセージ専用窓（HWND_MESSAGE）ではなく、表示しない通常のトップレベル窓にする
-                    // （メッセージ専用窓はブロードキャストを受け取らず、`TaskbarCreated` が届かない。
+                    // ウィンドウはメッセージ専用ウィンドウ（HWND_MESSAGE）ではなく、表示しない通常のトップレベルウィンドウにする
+                    // （メッセージ専用ウィンドウはブロードキャストを受け取らず、`TaskbarCreated` が届かない。
                     // Microsoft Learn「Window Features」）
                     let create_result = CreateWindowExW(
                         Default::default(),
@@ -595,7 +595,7 @@ impl Tray {
     }
 
     /// 通知領域にアイコンを付けられているか（最後の登録・付け直しの結果）。付けられていない間は、ビューアを
-    /// 隠して起動しない（窓へ戻る手段が見えないため）。エクスプローラーが落ちてアイコンが消えたことまでは
+    /// 隠して起動しない（ウィンドウへ戻る手段が見えないため）。エクスプローラーが落ちてアイコンが消えたことまでは
     /// 分からない（付け直しの `TaskbarCreated` が届くまで真のまま）。
     pub fn icon_shown(&self) -> bool {
         self.icon_shown.load(Ordering::SeqCst)
@@ -634,7 +634,7 @@ impl Drop for Tray {
 /// 複数のテストが並列に実測すると互いの増減が混ざり見かけ上の
 /// リークとして誤検出する（実機確認済み。clipboard.rsの
 /// `CLIPBOARD_TEST_LOCK`と同じ理由）。GUIリソース数を計測するテストと、
-/// 実際に窓・アイコン・ビットマップ等を作るテスト（menu_tooltip.rsを含む）は
+/// 実際にウィンドウ・アイコン・ビットマップ等を作るテスト（menu_tooltip.rsを含む）は
 /// このロックで直列化する。
 #[cfg(test)]
 pub(crate) static GUI_RESOURCE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -647,14 +647,14 @@ pub(crate) fn lock_gui_resource_tests() -> std::sync::MutexGuard<'static, ()> {
     GUI_RESOURCE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// ポップアップメニューの窓（クラス`#32768`）が現れるまで待つ（モーダル中の再入テスト用）。
-/// 他のアプリのメニューを誤検知しないよう、このプロセスが所有する窓だけを数える。
+/// ポップアップメニューのウィンドウ（クラス`#32768`）が現れるまで待つ（モーダル中の再入テスト用）。
+/// 他のアプリのメニューを誤検知しないよう、このプロセスが所有するウィンドウだけを数える。
 #[cfg(test)]
 pub(crate) fn wait_for_menu_window(timeout: std::time::Duration) -> bool {
     poll_menu_window(timeout, true)
 }
 
-/// ポップアップメニューの窓が消えるまで待つ。
+/// ポップアップメニューのウィンドウが消えるまで待つ。
 #[cfg(test)]
 pub(crate) fn wait_for_menu_window_gone(timeout: std::time::Duration) -> bool {
     poll_menu_window(timeout, false)
@@ -665,7 +665,7 @@ fn poll_menu_window(timeout: std::time::Duration, want_present: bool) -> bool {
     use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId};
 
-    /// このプロセスが所有するメニュー窓があるか
+    /// このプロセスが所有するメニューのウィンドウがあるか
     fn own_menu_window_exists() -> bool {
         let own_pid = unsafe { GetCurrentProcessId() };
         let mut prev = HWND::default();
@@ -783,9 +783,9 @@ mod tests {
         assert!(checked(true), "実際の状態がオンなのにチェックが無い");
     }
 
-    /// エクスプローラーの再起動でアイコンが消えても、`TaskbarCreated` を受けたトレイの窓が付け直す。
-    /// 消えたことを `NIM_DELETE` で、再起動の知らせを登録メッセージの投稿で作る（実際のブロードキャストは、
-    /// トップレベル窓であることで受け取れる。メッセージ専用窓は受け取らない）。付けられたかは
+    /// エクスプローラーの再起動でアイコンが消えても、`TaskbarCreated` を受けたトレイのウィンドウが付け直す。
+    /// 消えたことを `NIM_DELETE` で、再起動の通知を登録メッセージの投稿で作る（実際のブロードキャストは、
+    /// トップレベルウィンドウであることで受け取れる。メッセージ専用ウィンドウは受け取らない）。付けられたかは
     /// `Shell_NotifyIconGetRect` で確かめる（付いていなければ失敗する）。タスクバーのない環境では検証できない。
     #[test]
     fn taskbar_created_re_adds_removed_icon() {
@@ -796,7 +796,7 @@ mod tests {
         let _guard = lock_gui_resource_tests();
         let (tx, _rx) = std::sync::mpsc::channel::<TrayEvent>();
         let tray = Tray::spawn(Arc::new(AtomicBool::new(true)), tx, || {}).unwrap();
-        // 親はデスクトップ（トップレベル窓。メッセージ専用窓なら親はメッセージ専用のルート）
+        // 親はデスクトップ（トップレベルウィンドウ。メッセージ専用ウィンドウなら親はメッセージ専用のルート）
         assert_eq!(unsafe { GetAncestor(tray.hwnd, GA_PARENT) }, unsafe { GetDesktopWindow() });
         assert!(tray.icon_shown(), "アイコンを付けられなかった（タスクバーのない環境では検証できない）");
         let id = NOTIFYICONIDENTIFIER {
@@ -823,7 +823,7 @@ mod tests {
         assert!(is_added(), "TaskbarCreated でアイコンを付け直さなかった");
         assert!(tray.icon_shown());
 
-        // 外からの `WM_CLOSE` で窓が壊れたら、アイコンは外れ、`icon_shown` も偽になる
+        // 外からの `WM_CLOSE` でウィンドウが壊れたら、アイコンは外れ、`icon_shown` も偽になる
         unsafe { PostMessageW(Some(tray.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap() };
         let deadline = Instant::now() + Duration::from_secs(3);
         while tray.icon_shown() && Instant::now() < deadline {
@@ -834,7 +834,7 @@ mod tests {
         drop(tray);
     }
 
-    /// 実際のトレイウィンドウ（表示しないトップレベル窓）へ通知メッセージを直接投げ、
+    /// 実際のトレイウィンドウ（表示しないトップレベルウィンドウ）へ通知メッセージを直接投げ、
     /// タイマーが発火すること、単クリック→LeftClick・ダブルクリック→ShowViewerが届くことを確認する。
     /// 実シェルからの`WM_LBUTTONDBLCLK`等は関与しない（この実装はアップの回数だけで判定する）。
     #[test]
@@ -842,7 +842,7 @@ mod tests {
         use std::sync::mpsc::RecvTimeoutError;
         use std::time::Duration;
 
-        // 実際のトレイ窓・アイコン（USERオブジェクト）を作るため、プロセス全体の
+        // 実際のトレイのウィンドウ・アイコン（USERオブジェクト）を作るため、プロセス全体の
         // GUIリソース数を実測する他のテストと直列化する
         let _guard = lock_gui_resource_tests();
         let (tx, rx) = std::sync::mpsc::channel::<TrayEvent>();
@@ -875,7 +875,7 @@ mod tests {
     /// 実際に`TrackPopupMenu`のモーダルループへ入れ、その最中に`set_watch_icon`と`Drop`
     /// （=`WM_APP_SHUTDOWN`）を届ける。修正前はここで`TrayContext`が解放され、戻った先の
     /// `ctx`が解放済みになる。修正後は`WM_DESTROY`の`debug_assert`（メニュー表示中に
-    /// 解放しない）が守り、Dropはメニューを閉じてから窓を破棄してスレッドをjoinできる。
+    /// 解放しない）が守り、Dropはメニューを閉じてからウィンドウを破棄してスレッドをjoinできる。
     #[test]
     fn shutdown_while_menu_is_open_is_deferred_until_menu_closes() {
         shutdown_while_menu_is_open(false);

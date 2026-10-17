@@ -1,6 +1,6 @@
 //! ビューアの表示モデル（Win32 を使わない純粋な処理）。
 //!
-//! 一覧の行・ツリーの構成は、サービスのロックを取った短い間にここで作り、描画はこの写し
+//! 一覧の行・ツリーの構成は、サービスのロックを取った短い間にここで作り、描画はこのコピー
 //! （スナップショット）だけを読む（描画中に blob を読んだりロックを取ったりしないため）。
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -456,7 +456,7 @@ pub fn search_needle(input: &str) -> String {
 }
 
 /// `chars`（元の文字）を1文字ずつ小文字化しながら、`needle`（`search_needle` の結果）を含むかを
-/// 調べる。`search_fold` した全文に `contains` するのと同じ結果で、全文の写しを作らない（メモリだけに
+/// 調べる。`search_fold` した全文に `contains` するのと同じ結果で、全文のコピーを作らない（メモリだけに
 /// 持つ全文の検索）。照合は KMP 法（戻らずに1回だけ読む）。
 pub fn folded_chars_contain(chars: impl Iterator<Item = char>, needle: &str) -> bool {
     let pattern: Vec<char> = needle.chars().collect();

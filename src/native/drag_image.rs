@@ -1,8 +1,8 @@
-//! ドラッグ中の行の絵。ビューアの一覧の行・ツリーのフォルダをドラッグしている間、カーソルに付いて動く半透明の小窓。
+//! ドラッグ中の行の絵。ビューアの一覧の行・ツリーのフォルダをドラッグしている間、カーソルに付いて動く半透明の小さいウィンドウ。
 //!
-//! 絵はビューアが描いたビットマップをそのまま写す（描くのは `viewer`）。窓はビューアを持ち主にして、持ち主より
-//! 常に前に出し、持ち主と一緒に破棄されるようにする（Microsoft Learn の Window Features の Owned Windows）。
-//! `WS_EX_LAYERED` で半透明にし（`SetLayeredWindowAttributes`）、`WS_EX_TRANSPARENT` でマウスを下の窓へ
+//! 絵はビューアが描いたビットマップをそのまま写す（描くのは `viewer`）。ウィンドウはビューアをオーナーにして、オーナーより
+//! 常に前に出し、オーナーと一緒に破棄されるようにする（Microsoft Learn の Window Features の Owned Windows）。
+//! `WS_EX_LAYERED` で半透明にし（`SetLayeredWindowAttributes`）、`WS_EX_TRANSPARENT` でマウスを下のウィンドウへ
 //! 素通しし、`WS_EX_NOACTIVATE` でフォーカスを奪わない。
 
 use windows::core::{w, PCWSTR};
@@ -26,15 +26,15 @@ const CLASS_NAME: PCWSTR = w!("CLCLR_DragImage");
 /// 不透明度（0 は透明、255 は不透明）
 const ALPHA: u8 = 0xC0;
 
-/// 窓の `GWLP_USERDATA` に `Box` で置く絵。`WM_NCDESTROY` で解放する。
+/// ウィンドウの `GWLP_USERDATA` に `Box` で置く絵。`WM_NCDESTROY` で解放する。
 struct Picture {
     bitmap: HBITMAP,
     width: i32,
     height: i32,
 }
 
-/// `bitmap`（大きさ `width`×`height`）を写す小窓を、画面座標 (`x`, `y`) を左上にして出す。`bitmap` の持ち主は
-/// 窓になり、窓の破棄で解放する（作れなければここで解放して None）。
+/// `bitmap`（大きさ `width`×`height`）を写す小さいウィンドウを、画面座標 (`x`, `y`) を左上にして出す。`bitmap` の所有者は
+/// ウィンドウになり、ウィンドウの破棄で解放する（作れなければここで解放して None）。
 pub fn show(owner: HWND, bitmap: HBITMAP, width: i32, height: i32, x: i32, y: i32) -> Option<HWND> {
     let free = || unsafe {
         let _ = DeleteObject(bitmap.into());
@@ -83,14 +83,14 @@ fn create(owner: HWND, width: i32, height: i32, x: i32, y: i32) -> Option<HWND> 
     }
 }
 
-/// 小窓の左上を画面座標 (`x`, `y`) へ動かす。
+/// 小さいウィンドウの左上を画面座標 (`x`, `y`) へ動かす。
 pub fn move_to(hwnd: HWND, x: i32, y: i32) {
     unsafe {
         let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 
-/// 小窓を破棄する（絵は `WM_NCDESTROY` で解放される）。
+/// 小さいウィンドウを破棄する（絵は `WM_NCDESTROY` で解放される）。
 pub fn destroy(hwnd: HWND) {
     unsafe {
         let _ = DestroyWindow(hwnd);

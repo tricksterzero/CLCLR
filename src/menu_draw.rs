@@ -6,11 +6,11 @@
 //!   アドレスを `lpNewItem`（`itemData`）として渡す。描画に使う変わらないもの（フォント・寸法）は
 //!   `Rc<MenuResources>` を項目どうしで共有する（`PopupMenu` が別の場所へ移っても参照先は動かない）
 //! - `PopupMenu` の `Drop` は、先にメニュー（子メニューごと）を破棄してから項目のデータを解放する
-//! - 持ち主の窓は `WM_MEASUREITEM`・`WM_DRAWITEM`（`CtlType == ODT_MENU`）で `on_measure_item`・
+//! - オーナーのウィンドウは `WM_MEASUREITEM`・`WM_DRAWITEM`（`CtlType == ODT_MENU`）で `on_measure_item`・
 //!   `on_draw_item` を、`WM_MENUCHAR` で `on_menu_char` を呼ぶ。どれも `itemData` を共有参照で読むだけで、
-//!   `RefCell`・サービスのロックを使わない（メニューの表示中は窓のプロシージャが再入するため）
+//!   `RefCell`・サービスのロックを使わない（メニューの表示中はウィンドウのプロシージャが再入するため）
 //! - 実機で確かめたこと: 子メニューの矢印はシステムが
-//!   描く（選択行の上でも読める）。チェック印はシステムが描かないので自分で描く。システムは測った幅に
+//!   描く（選択行の上でも読める）。チェックマークはシステムが描かないので自分で描く。システムは測った幅に
 //!   固定の幅を足して描かせる（`MNS_NOCHECK` でも変わらない）。区切り線にも描画の呼び出しが来る。
 //!   自前描画の項目の `&` をシステムは扱わないので、アクセスキーは `WM_MENUCHAR` で解決する
 
@@ -40,7 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// 寸法（96 DPI 基準。メニューを出すモニターの DPI で換算する）。
 const ITEM_PAD_X: i32 = 4;
 const TEXT_PAD_Y: i32 = 4;
-/// 左の欄（チェック印・サムネイル）の最小の幅
+/// 左の欄（チェックマーク・サムネイル）の最小の幅
 const CHECK_COLUMN: i32 = 16;
 /// 左の欄と文字の間、文字の右の余白
 const COLUMN_GAP: i32 = 6;
@@ -203,7 +203,7 @@ pub(crate) enum TreeGuide {
 /// 項目1つ分の描画の材料（`itemData` が指す）。
 struct ItemData {
     kind: ItemKind,
-    /// 表示の文字列（NUL なし。`&` はアクセスキーの印、`&&` は文字の `&`）
+    /// 表示の文字列（NUL なし。`&` はアクセスキーのマーク、`&&` は文字の `&`）
     text: Vec<u16>,
     thumbnail: Option<Thumbnail>,
     /// アイコン（`ICON_SIZE` の大きさで描く。素材を縮めて持つ。同じ素材の行どうしで共有する）
@@ -391,13 +391,13 @@ impl Drop for PopupMenu {
     }
 }
 
-/// 窓のメニューバー。バーの並び（「ツール」など）は標準の描画のまま、ドロップダウンの項目を自前で描く。
+/// ウィンドウのメニューバー。バーの並び（「ツール」など）は標準の描画のまま、ドロップダウンの項目を自前で描く。
 ///
-/// メニューを破棄する責任は、窓に付けているかで変わる（Microsoft Learn: `DestroyWindow` は窓のメニューを
+/// メニューを破棄する責任は、ウィンドウに付けているかで変わる（Microsoft Learn: `DestroyWindow` はウィンドウのメニューを
 /// 破棄し、`SetMenu` は外したメニューを破棄しない）。
-/// - 窓に付ける前と、`SetMenu` で外した後は、この値の `Drop` がメニューを破棄してから項目のデータを解放する
-/// - 窓に付けている間（`mark_attached` の後）は、窓の破棄より前に `SetMenu(None)` で外してから
-///   `detached` を呼ぶ。付けたまま破棄された場合は、窓がまだメニューを使うかもしれないので、項目のデータを
+/// - ウィンドウに付ける前と、`SetMenu` で外した後は、この値の `Drop` がメニューを破棄してから項目のデータを解放する
+/// - ウィンドウに付けている間（`mark_attached` の後）は、ウィンドウの破棄より前に `SetMenu(None)` で外してから
+///   `detached` を呼ぶ。付けたまま破棄された場合は、ウィンドウがまだメニューを使うかもしれないので、項目のデータを
 ///   解放せずに残す（描画の中で解放済みのデータを読まないため。デバッグ時は `debug_assert` で知らせる）
 pub(crate) struct MenuBar {
     bar: HMENU,
@@ -406,7 +406,7 @@ pub(crate) struct MenuBar {
 }
 
 impl MenuBar {
-    /// `dpi` は窓の DPI（ドロップダウンの項目をこの DPI で描く）。
+    /// `dpi` はウィンドウの DPI（ドロップダウンの項目をこの DPI で描く）。
     pub(crate) fn new(dpi: u32) -> WinResult<Self> {
         let bar = unsafe { CreateMenu()? };
         Ok(Self { bar, store: ItemStore::new(dpi, None), attached: false })
@@ -416,13 +416,13 @@ impl MenuBar {
         self.bar
     }
 
-    /// 項目を描く DPI（作ったときの窓の DPI）。
+    /// 項目を描く DPI（作ったときのウィンドウの DPI）。
     pub(crate) fn dpi(&self) -> u32 {
         self.store.resources.dpi
     }
 
     /// バーにドロップダウンを足し、そのハンドルを返す（バーの項目は標準の描画。付けられなければ破棄して Err）。
-    /// メニューバーは、すべての項目を足せたときだけ窓に付ける（作り直しで、欠けたバーに差し替えない）ので、
+    /// メニューバーは、すべての項目を足せたときだけウィンドウに付ける（作り直しで、欠けたバーに差し替えない）ので、
     /// 足す操作はどれも失敗を返す。
     pub(crate) fn add_dropdown(&mut self, text: PCWSTR) -> WinResult<HMENU> {
         let dropdown = unsafe { CreatePopupMenu()? };
@@ -443,12 +443,12 @@ impl MenuBar {
         self.store.append_separator(target)
     }
 
-    /// 窓に付けた（`CreateWindowExW` の hMenu・`SetMenu` が成功した）。以後、メニューは窓が破棄する。
+    /// ウィンドウに付けた（`CreateWindowExW` の hMenu・`SetMenu` が成功した）。以後、メニューはウィンドウが破棄する。
     pub(crate) fn mark_attached(&mut self) {
         self.attached = true;
     }
 
-    /// 窓から外した（`SetMenu` で別のメニューへ替えた・None にした）。この値の破棄でメニューを破棄する。
+    /// ウィンドウから外した（`SetMenu` で別のメニューへ替えた・None にした）。この値の破棄でメニューを破棄する。
     pub(crate) fn detached(mut self) -> Self {
         self.attached = false;
         self
@@ -459,7 +459,7 @@ impl Drop for MenuBar {
     fn drop(&mut self) {
         if self.attached {
             debug_assert!(false, "窓に付けたままのメニューバーを破棄した（先に SetMenu で外す）");
-            // 窓がまだこのメニューを使うかもしれないので、項目のデータを解放しない
+            // ウィンドウがまだこのメニューを使うかもしれないので、項目のデータを解放しない
             std::mem::forget(std::mem::take(&mut self.store.items));
             return;
         }
@@ -787,7 +787,7 @@ unsafe fn draw_thumbnail(hdc: HDC, thumb: &Thumbnail, x: i32, y: i32, width: i32
     }
 }
 
-/// チェック印を `color` で描く。`DrawFrameControl` の白地に黒の印を反転して型にし、印の所だけを
+/// チェックマークを `color` で描く。`DrawFrameControl` の白地に黒のマークを反転して型にし、マークの所だけを
 /// 塗りつぶしの色にする（C 版 `menu_draw_ckeck` と同じ考え方。寸法は幅・高さで渡す）。
 unsafe fn draw_check(hdc: HDC, rc: RECT, color: COLORREF) {
     let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
@@ -858,7 +858,7 @@ fn resolve_menu_char(keys: &[Option<char>], hilite: Option<usize>, ch: char) -> 
 }
 
 /// `WM_MENUCHAR`。今のメニュー（lParam）に自前描画の項目があれば、アクセスキーを解決して戻り値を
-/// 返す。自前描画の項目が無いメニュー（標準のメニューバー・窓メニュー）は None（既定の処理へ渡す）。
+/// 返す。自前描画の項目が無いメニュー（標準のメニューバー・ウィンドウメニュー）は None（既定の処理へ渡す）。
 /// 候補から区切り線と、灰色・選べない項目を除く。
 ///
 /// # Safety
@@ -1068,7 +1068,7 @@ mod tests {
     }
 
     /// 選んでいる行は `COLOR_HIGHLIGHT`、そうでない行は `COLOR_MENU` で背景を塗る。原点が (0, 0) でない
-    /// 矩形でも、矩形の外を書き換えない。チェック印は文字の色で描く。
+    /// 矩形でも、矩形の外を書き換えない。チェックマークは文字の色で描く。
     #[test]
     fn draws_background_check_and_stays_inside_rect() {
         let _gui = crate::tray::lock_gui_resource_tests();
@@ -1087,7 +1087,7 @@ mod tests {
         let px = render(&item, w, h, rect, 0);
         assert_eq!(at(&px, rect.right - 2, rect.top + 1), dib_color(COLOR_MENU));
 
-        // チェック印: 左の欄に文字の色の画素がある（無ければ背景の色だけ）
+        // チェックマーク: 左の欄に文字の色の画素がある（無ければ背景の色だけ）
         let column = |px: &[u32]| {
             let left = rect.left + ITEM_PAD_X;
             (left..left + CHECK_COLUMN).flat_map(|x| (rect.top..rect.bottom).map(move |y| (x, y))).map(|(x, y)| at(px, x, y)).collect::<Vec<_>>()
