@@ -20,7 +20,8 @@ CLCLR の配布用の zip と、リリースのページの文面を作る（Git
    コミットが変わっていないことを確かめる
 5. zip と exe（zip の中のもの）の SHA-256 を出し、リリースのページの文面 <出力先>\dist\release-notes-<版>.md を作る
 6. ビルドに使う道具の目録（Rust のツールチェーン、Visual Studio と MSVC、Windows SDK、静的にリンクする C ランタイムの
-   ライブラリ、道具の選び方に関わる環境変数と Cargo の設定ファイル）を、テストの前と zip を作った後に取って比べ、
+   ライブラリ、道具を探すときに読むレジストリの値、道具の選び方に関わる環境変数と Cargo の設定ファイル）を、テストの
+   前と zip を作った後に取って比べ、
    違っていれば止める（下書きでも止める）。目録と exe の SHA-256・Rich ヘッダーを <出力先>\dist\build-tools-<版>.json
    に書く
 
@@ -344,6 +345,50 @@ function Get-FileRecord([string]$path) {
     return $null
 }
 
+# 実行ファイルの版と SHA-256（ファイルが無ければ $null）
+function Get-ExeRecord([string]$path) {
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        return [ordered]@{ version = Get-FileVersionOrNull $path; sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+    }
+    return $null
+}
+
+# HKLM のレジストリの文字列の値。表示（64 ビット・32 ビット）を指定して読む。キーか値が無ければ $null。読めない
+# とき（アクセス拒否など）は、有無を確かめられていないので止める
+function Get-RegistryValue([Microsoft.Win32.RegistryView]$view, [string]$subKey, [string]$name) {
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $view)
+    try {
+        $key = $base.OpenSubKey($subKey)
+        if ($null -eq $key) {
+            return $null
+        }
+        try {
+            return $key.GetValue($name)
+        } finally {
+            $key.Dispose()
+        }
+    } finally {
+        $base.Dispose()
+    }
+}
+
+# 既定のツールセットを決めるファイル（VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt）の中身。末尾の空白
+# を除く。ファイルが無ければ $null。リンカーを探す側は、ファイル全体を UTF-8 として読み（BOM は消さない）、末尾の
+# 空白を除いた文字列をツールセットの版にする。同じ名前のフォルダがある、読めない、UTF-8 として正しくないときは止める
+function Get-DefaultToolsetText([string]$installationPath) {
+    $path = Join-Path $installationPath 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt'
+    if (Test-Path -LiteralPath $path -PathType Container) {
+        throw "既定のツールセットのファイルと同じ名前のフォルダがあります（$path）"
+    }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return $null
+    }
+    $bytes = [System.IO.File]::ReadAllBytes($path)
+    # 2つ目の引数: 正しくないバイトを置き換えずに例外にする
+    $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    return $utf8.GetString($bytes).TrimEnd()
+}
+
 # フォルダの中のフォルダの名前（フォルダが無ければ空）。隠しフォルダも含める（道具を探す側は隠しフォルダも見る）
 function Get-SubfolderName([string]$path) {
     if (Test-Path -LiteralPath $path -PathType Container) {
@@ -352,10 +397,10 @@ function Get-SubfolderName([string]$path) {
     return @()
 }
 
-# ビルドに使う道具の目録。Rust のツールチェーン、Visual Studio と MSVC のツールセット（リンカーの版と、静的に
-# リンクする C ランタイムのライブラリ）、Windows SDK（版、rc.exe、静的にリンクする UCRT のライブラリ）、道具の
-# 選び方に関わる環境変数と Cargo の設定ファイル。どれも exe の中身を左右する。見るのは入っているものと選び方の
-# 指定で、ビルドで実際にどれが使われたかまでは確かめない
+# ビルドに使う道具の目録。Rust のツールチェーン、Visual Studio と MSVC のツールセット（リンカーの版と SHA-256、
+# 静的にリンクする C ランタイムのライブラリ、既定のツールセット）、Windows SDK（版、rc.exe、静的にリンクする UCRT
+# のライブラリ）、リンカーが SDK を探すときに読むレジストリの値、道具の選び方に関わる環境変数と Cargo の設定ファイル。
+# どれも exe の中身を左右する。見るのは入っているものと選び方の指定で、ビルドで実際にどれが使われたかまでは確かめない
 function Get-BuildToolInventory {
     $rustc = @(& rustc --version --verbose)
     if ($LASTEXITCODE -ne 0 -or $rustc.Count -eq 0) {
@@ -366,50 +411,60 @@ function Get-BuildToolInventory {
         throw "cargo --version が失敗しました（終了コード $LASTEXITCODE）"
     }
 
-    # Visual Studio のインスタンス（vswhere は Visual Studio のインストーラーに付く。無ければ空）
+    # Visual Studio のインスタンス（vswhere は Visual Studio のインストーラーに付く。無ければ空）。プレビュー版も
+    # 含める（リンカーを探す側は、プレビュー版も候補にする）
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     $instances = @()
     if (Test-Path -LiteralPath $vswhere -PathType Leaf) {
-        $json = @(& $vswhere -all -products '*' -format json)
+        $json = @(& $vswhere -all -prerelease -products '*' -format json)
         if ($LASTEXITCODE -ne 0) {
             throw "vswhere が失敗しました（終了コード $LASTEXITCODE）"
         }
         # JSON の配列を1つずつに分ける（ConvertFrom-Json は配列を1つのオブジェクトとして出す）
         $instances = @(($json -join "`n") | ConvertFrom-Json | ForEach-Object { $_ })
     }
+    # 既定のツールセットのファイルは、VCToolsVersion が無いときだけ記録する（あればツールセットはそれで決まり、
+    # ファイルは読まれない）
+    $useDefaultToolset = -not [Environment]::GetEnvironmentVariable('VCToolsVersion')
     $visualStudio = @(foreach ($instance in $instances | Sort-Object { Get-JsonProperty $_ 'installationPath' }) {
         $installationPath = Get-JsonProperty $instance 'installationPath'
         $msvcRoot = Join-Path $installationPath 'VC\Tools\MSVC'
         $toolsets = @(foreach ($toolset in Get-SubfolderName $msvcRoot) {
             $toolsetDir = Join-Path $msvcRoot $toolset
             [ordered]@{
-                version     = $toolset
-                link        = Get-FileVersionOrNull (Join-Path $toolsetDir 'bin\HostX64\x64\link.exe')
-                cvtres      = Get-FileVersionOrNull (Join-Path $toolsetDir 'bin\HostX64\x64\cvtres.exe')
-                libcmt      = Get-FileRecord (Join-Path $toolsetDir 'lib\x64\libcmt.lib')
+                version      = $toolset
+                link         = Get-ExeRecord (Join-Path $toolsetDir 'bin\HostX64\x64\link.exe')
+                cvtres       = Get-ExeRecord (Join-Path $toolsetDir 'bin\HostX64\x64\cvtres.exe')
+                libcmt       = Get-FileRecord (Join-Path $toolsetDir 'lib\x64\libcmt.lib')
                 libvcruntime = Get-FileRecord (Join-Path $toolsetDir 'lib\x64\libvcruntime.lib')
+                # リンカーは SDK より先にこれらのフォルダを探すので、ここに libucrt.lib があると SDK のものより先に使う
+                libucrtInLib    = Test-Path -LiteralPath (Join-Path $toolsetDir 'lib\x64\libucrt.lib') -PathType Leaf
+                libucrtInAtlmfc = Test-Path -LiteralPath (Join-Path $toolsetDir 'atlmfc\lib\x64\libucrt.lib') -PathType Leaf
             }
         })
+        $defaultToolset = $null
+        if ($useDefaultToolset) {
+            $defaultToolset = Get-DefaultToolsetText $installationPath
+        }
         [ordered]@{
             displayName           = Get-JsonProperty $instance 'displayName'
             productDisplayVersion = Get-JsonProperty (Get-JsonProperty $instance 'catalog') 'productDisplayVersion'
             installationVersion   = Get-JsonProperty $instance 'installationVersion'
             installationPath      = $installationPath
+            defaultToolset        = $defaultToolset
             toolsets              = $toolsets
         }
     })
 
-    # Windows SDK（Windows 10 以降の SDK の場所は、レジストリの KitsRoot10 にある）
-    # キーが無いときだけ「SDK なし」にする（読めないときは、SDK の有無を確かめられていないので止める）
-    $kitsRoot = $null
-    $installedRoots = $null
-    try {
-        $installedRoots = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -ErrorAction Stop
-    } catch [System.Management.Automation.ItemNotFoundException] {
-        $installedRoots = $null
-    }
-    if ($installedRoots) {
-        $kitsRoot = Get-JsonProperty $installedRoots 'KitsRoot10'
+    # Windows SDK（Windows 10 以降の SDK の場所は、レジストリの KitsRoot10 にある）。embed-resource（rc.exe を探す）は
+    # 64 ビットの表示を読む。キーか値が無いときだけ「SDK なし」にする（読めないときは止める）
+    $installedRootsKey = 'SOFTWARE\Microsoft\Windows Kits\Installed Roots'
+    $kitsRoot = Get-RegistryValue ([Microsoft.Win32.RegistryView]::Registry64) $installedRootsKey 'KitsRoot10'
+    # リンカーを探す側（rustc の中のもの）は 32 ビットの表示を読み、UCRT の場所を KitsRoot10 から、import ライブラリ
+    # の場所を Microsoft SDKs\Windows\v10.0 の InstallationFolder から決める
+    $registry = [ordered]@{
+        kitsRoot10_32              = Get-RegistryValue ([Microsoft.Win32.RegistryView]::Registry32) $installedRootsKey 'KitsRoot10'
+        sdk10InstallationFolder_32 = Get-RegistryValue ([Microsoft.Win32.RegistryView]::Registry32) 'SOFTWARE\Microsoft\Microsoft SDKs\Windows\v10.0' 'InstallationFolder'
     }
     $windowsSdk = $null
     if ($kitsRoot) {
@@ -420,13 +475,22 @@ function Get-BuildToolInventory {
         $rcFiles = @(foreach ($folder in Get-SubfolderName $binDir) {
             $rc = Join-Path $binDir "$folder\x64\rc.exe"
             if (Test-Path -LiteralPath $rc -PathType Leaf) {
-                [ordered]@{ path = $rc; version = Get-FileVersionOrNull $rc }
+                [ordered]@{ path = $rc; version = Get-FileVersionOrNull $rc; sha256 = (Get-FileHash -LiteralPath $rc -Algorithm SHA256).Hash }
             }
         })
         $libDir = Join-Path $kitsRoot 'Lib'
         $windowsSdk = [ordered]@{
             root    = $kitsRoot
             lib     = @(Get-SubfolderName $libDir)
+            # リンカーを探す側は、ucrt のフォルダがある版から UCRT を、um\x64\kernel32.lib がある版から import
+            # ライブラリを選ぶ
+            libVersions = @(foreach ($version in Get-SubfolderName $libDir) {
+                [ordered]@{
+                    version  = $version
+                    ucrt     = Test-Path -LiteralPath (Join-Path $libDir "$version\ucrt") -PathType Container
+                    kernel32 = Test-Path -LiteralPath (Join-Path $libDir "$version\um\x64\kernel32.lib") -PathType Leaf
+                }
+            })
             include = @(Get-SubfolderName (Join-Path $kitsRoot 'Include'))
             bin     = @(Get-SubfolderName $binDir)
             rc      = $rcFiles
@@ -439,11 +503,14 @@ function Get-BuildToolInventory {
         }
     }
 
-    # 道具の選び方に関わる環境変数（PATH は、ほかのソフトを入れるだけで変わるので含めない）
+    # 道具の選び方に関わる環境変数（PATH は、ほかのソフトを入れるだけで変わるので含めない）。リンカーと rc.exe を
+    # 探す側、cargo（使う rustc）、リンカー自身（LINK・_LINK_ の引数）が読むもの
     $environment = [ordered]@{}
-    foreach ($variable in 'VCINSTALLDIR', 'VCToolsInstallDir', 'WindowsSdkDir', 'LIB', 'INCLUDE', 'RC', 'RC_x86_64-pc-windows-msvc', 'RC_x86_64_pc_windows_msvc', 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER', 'CARGO_BUILD_TARGET', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_BUILD_RUSTFLAGS', 'RUSTUP_TOOLCHAIN') {
+    foreach ($variable in 'VCINSTALLDIR', 'VCToolsInstallDir', 'WindowsSdkDir', 'LIB', 'INCLUDE', 'RC', 'RC_x86_64-pc-windows-msvc', 'RC_x86_64_pc_windows_msvc', 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER', 'CARGO_BUILD_TARGET', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_BUILD_RUSTFLAGS', 'RUSTUP_TOOLCHAIN', 'VSTEL_MSBuildProjectFullPath', 'VCToolsVersion', 'WindowsSDKVersion', 'RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'CARGO_BUILD_RUSTC', 'CARGO_BUILD_RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER', 'LINK', '_LINK_') {
         $environment[$variable] = [Environment]::GetEnvironmentVariable($variable)
     }
+    # Spectre 対策版の C ランタイム（lib\spectre）を使うかどうか。値が spectre のときだけ効く
+    $environment['VSCMD_ARG_VCVARS_SPECTRE=spectre'] = ([Environment]::GetEnvironmentVariable('VSCMD_ARG_VCVARS_SPECTRE') -ceq 'spectre')
 
     # Cargo の設定ファイル（リポジトリのフォルダから上の各フォルダの .cargo と、Cargo のホーム）。中身は SHA-256 で
     # 比べる（リンカーや rustflags の指定が変われば変わる）
@@ -472,6 +539,7 @@ function Get-BuildToolInventory {
         rust         = [ordered]@{ rustc = @($rustc | ForEach-Object { "$_".Trim() }); cargo = "$($cargo[0])".Trim() }
         visualStudio = $visualStudio
         windowsSdk   = $windowsSdk
+        registry     = $registry
         environment  = $environment
         cargoConfig  = $configFiles
     }

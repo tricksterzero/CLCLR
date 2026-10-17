@@ -15,7 +15,7 @@ cargo test              # 自動テスト（ポップアップメニューが一
 
 配布用の zip は `scripts\release.ps1` で作ります。テストと release のビルドを通した後、`target\dist\` に zip と、リリースのページの文面（[CHANGELOG.md](CHANGELOG.md) のその版の節と SHA-256）を作ります。GitHub へのリリースは行わず、実行するコマンドを表示するだけです。
 
-あわせて、ビルドに使う道具の目録（Rust のツールチェーン、Visual Studio と MSVC、Windows SDK、静的にリンクする C ランタイムのライブラリ、道具の選び方に関わる環境変数と Cargo の設定ファイル）を、テストの前と zip を作った後に取って比べ、違っていれば止まります。目録と exe の SHA-256・Rich ヘッダーは `target\dist\build-tools-<版>.json` に書きます。前に書き出したこのファイルを `-BuildToolsBaseline` に渡すと、テストの前の目録をそれと比べ、違っていれば止まります。配布の zip を作るときは、採用した道具の目録のファイルを必ず渡します（省くと止まります）。試しに作る下書き（`-Draft`）では省けます。
+あわせて、ビルドに使う道具の目録（Rust のツールチェーン、Visual Studio と MSVC、Windows SDK、静的にリンクする C ランタイムのライブラリ、道具を探すときに読むレジストリの値、道具の選び方に関わる環境変数と Cargo の設定ファイル）を、テストの前と zip を作った後に取って比べ、違っていれば止まります。目録と exe の SHA-256・Rich ヘッダーは `target\dist\build-tools-<版>.json` に書きます。前に書き出したこのファイルを `-BuildToolsBaseline` に渡すと、テストの前の目録をそれと比べ、違っていれば止まります。配布の zip を作るときは、採用した道具の目録のファイルを必ず渡します（省くと止まります）。試しに作る下書き（`-Draft`）では省けます。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -BuildToolsBaseline <採用した目録の build-tools-<版>.json>
