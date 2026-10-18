@@ -717,6 +717,185 @@ fn poll_menu_window(timeout: std::time::Duration, done: impl Fn() -> bool) -> bo
     }
 }
 
+/// メニューのテストの間、前面のウィンドウの切り替え（すべてのプロセス）と、`thread` のスレッドのメニューの
+/// 開始・終わりを、起きた順に記録する。テストが失敗したときに、前面が移ってからメニューが閉じたのか、閉じて
+/// から移ったのかを見分けるため。通知（`SetWinEventHook` のプロセス外の通知）は、それを登録したスレッドが
+/// メッセージを処理しているときに届くので、専用のスレッドで受ける。GUI 用のロックは呼び出し側のテストが持つ
+/// （このスレッドでは取り直さない）。止めるのは `Drop`。
+#[cfg(test)]
+pub(crate) struct MenuEventRecorder {
+    menu_thread: u32,
+    recorder_thread: u32,
+    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+struct RecorderState {
+    menu_thread: u32,
+    started: std::time::Instant,
+    /// 最初の通知の発生時刻（`dwmsEventTime`）。各通知の発生時刻をこれからの差で出す
+    first_event_time: Option<u32>,
+    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECORDER: std::cell::RefCell<Option<RecorderState>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+impl MenuEventRecorder {
+    /// 記録を始める。`menu_thread` はメニューを出すスレッド（`window_thread` で取る）。
+    pub(crate) fn start(menu_thread: u32) -> Self {
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUPOPUPEND, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW,
+            WINEVENT_OUTOFCONTEXT,
+        };
+
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let thread_log = std::sync::Arc::clone(&log);
+        let handle = std::thread::spawn(move || unsafe {
+            // PostThreadMessageW で止められるよう、先にメッセージキューを作る
+            let mut msg = MSG::default();
+            let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+            RECORDER.with(|r| {
+                *r.borrow_mut() = Some(RecorderState {
+                    menu_thread,
+                    started: std::time::Instant::now(),
+                    first_event_time: None,
+                    log: thread_log,
+                })
+            });
+            // EVENT_SYSTEM_FOREGROUND（3）から EVENT_SYSTEM_MENUPOPUPEND（7）まで: 前面の切り替え、メニューの
+            // 開始・終わり、ポップアップの開始・終わり
+            let hook = SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_MENUPOPUPEND,
+                None,
+                Some(on_win_event),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            );
+            let _ = ready_tx.send((GetCurrentThreadId(), !hook.is_invalid()));
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+            if !hook.is_invalid() {
+                let _ = UnhookWinEvent(hook);
+            }
+        });
+        let (recorder_thread, hooked) = ready_rx.recv().expect("記録のスレッドが始まらなかった");
+        if !hooked {
+            log.lock().unwrap().push("（通知を登録できなかった）".to_string());
+        }
+        Self { menu_thread, recorder_thread, log, handle: Some(handle) }
+    }
+
+    /// これまでの記録（起きた順）。
+    pub(crate) fn events(&self) -> String {
+        let log = self.log.lock().unwrap();
+        if log.is_empty() { "記録なし".to_string() } else { log.join(" / ") }
+    }
+
+    /// 失敗の文に添える状況（今のメニューのウィンドウと前面のウィンドウ、これまでの記録）。
+    pub(crate) fn situation(&self) -> String {
+        format!("{}。記録: {}", menu_test_situation(self.menu_thread), self.events())
+    }
+}
+
+#[cfg(test)]
+impl Drop for MenuEventRecorder {
+    fn drop(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+        unsafe {
+            let _ = PostThreadMessageW(self.recorder_thread, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// `SetWinEventHook` の通知（記録のスレッドで呼ばれる）。前面の切り替えはすべて、メニューの通知はメニューを
+/// 出すスレッドのものだけを記録する。
+#[cfg(test)]
+unsafe extern "system" fn on_win_event(
+    _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    event_thread: u32,
+    event_time: u32,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MENUEND, EVENT_SYSTEM_MENUPOPUPEND, EVENT_SYSTEM_MENUPOPUPSTART,
+        EVENT_SYSTEM_MENUSTART, GetWindowThreadProcessId,
+    };
+
+    RECORDER.with(|r| {
+        let mut state = r.borrow_mut();
+        let Some(state) = state.as_mut() else { return };
+        let name = match event {
+            EVENT_SYSTEM_FOREGROUND => "前面",
+            EVENT_SYSTEM_MENUSTART => "メニューの開始",
+            EVENT_SYSTEM_MENUEND => "メニューの終わり",
+            EVENT_SYSTEM_MENUPOPUPSTART => "ポップアップの表示",
+            EVENT_SYSTEM_MENUPOPUPEND => "ポップアップの終わり",
+            _ => return,
+        };
+        if event != EVENT_SYSTEM_FOREGROUND && event_thread != state.menu_thread {
+            return;
+        }
+        let first = *state.first_event_time.get_or_insert(event_time);
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        let arrived = state.started.elapsed().as_millis();
+        state.log.lock().unwrap().push(format!(
+            "+{}ms（届いたのは +{arrived}ms）{name}: pid {pid} {}",
+            event_time.wrapping_sub(first),
+            process_name(pid)
+        ));
+    });
+}
+
+/// プロセスの exe の名前（読めなければ「不明」）。
+#[cfg(test)]
+fn process_name(pid: u32) -> String {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+
+    if pid == 0 {
+        return "不明".to_string();
+    }
+    unsafe {
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return "不明".to_string();
+        };
+        let mut buffer = [0u16; 1024];
+        let mut len = buffer.len() as u32;
+        let name = match QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        ) {
+            Ok(()) => {
+                let path = String::from_utf16_lossy(&buffer[..len as usize]);
+                path.rsplit('\\').next().unwrap_or(&path).to_string()
+            }
+            Err(_) => "不明".to_string(),
+        };
+        let _ = CloseHandle(process);
+        name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,6 +1109,8 @@ mod tests {
         let tray = Tray::spawn(Arc::new(AtomicBool::new(true)), tx, || {}).unwrap();
         // メニューはトレイのスレッドが出す。ウィンドウは Drop で壊れるので、スレッドの ID を先に取る
         let menu_thread = window_thread(tray.hwnd);
+        // 失敗したときに、前面の切り替えとメニューの開閉の順を添える
+        let recorder = MenuEventRecorder::start(menu_thread);
         let (measured, drawn) = crate::menu_draw::test_support::counts();
         unsafe {
             PostMessageW(Some(tray.hwnd), WM_TRAY_NOTIFY, WPARAM(0), LPARAM(WM_RBUTTONUP as isize)).unwrap();
@@ -937,7 +1118,7 @@ mod tests {
         assert!(
             wait_for_menu_window(menu_thread, Duration::from_secs(3)),
             "トレイのメニューが表示されなかった（デスクトップが使えない環境では検証できない）: {}",
-            menu_test_situation(menu_thread)
+            recorder.situation()
         );
         // メニューは自前描画の経路を通る（4項目: 3つのコマンドと区切り線）
         let (measured_after, drawn_after) =
@@ -945,12 +1126,12 @@ mod tests {
         assert!(
             measured_after >= measured + 4,
             "項目を測っていない: {measured} → {measured_after}（{}）",
-            menu_test_situation(menu_thread)
+            recorder.situation()
         );
         assert!(
             drawn_after >= drawn + 4,
             "項目を描いていない: {drawn} → {drawn_after}（{}）",
-            menu_test_situation(menu_thread)
+            recorder.situation()
         );
 
         // メニュー表示中のアイコン差し替え（再入しても安全に処理される）
@@ -963,7 +1144,7 @@ mod tests {
             assert!(
                 wait_for_menu_window_gone(menu_thread, Duration::from_secs(3)),
                 "WM_CLOSEでメニューが閉じられなかった: {}",
-                menu_test_situation(menu_thread)
+                recorder.situation()
             );
         }
 
@@ -983,10 +1164,12 @@ mod tests {
         assert!(
             wait_for_menu_window_gone(menu_thread, Duration::from_secs(3)),
             "終了後もメニューが残っている: {}",
-            menu_test_situation(menu_thread)
+            recorder.situation()
         );
         // 終了依頼で閉じたメニューの結果はUIへ送られない（コンテキスト解放でSenderは切断される）
         assert!(matches!(rx.recv_timeout(Duration::from_millis(300)), Err(RecvTimeoutError::Disconnected)));
+        // 成功したときの記録（`--nocapture` を付けたときだけ見える。記録が取れているかを確かめる用）
+        eprintln!("トレイのメニューのテストの記録: {}", recorder.events());
     }
 
     #[test]

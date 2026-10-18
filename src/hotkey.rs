@@ -1381,12 +1381,14 @@ mod tests {
         let (dir, hotkeys, _rx) = spawn_test_hotkeys(test_config());
         // メニューはホットキーのスレッドが出す。ウィンドウは Drop で壊れるので、スレッドの ID を先に取る
         let menu_thread = crate::tray::window_thread(hotkeys.hwnd);
+        // 失敗したときに、前面の切り替えとメニューの開閉の順を添える
+        let recorder = crate::tray::MenuEventRecorder::start(menu_thread);
         let (measured, drawn) = crate::menu_draw::test_support::counts();
         hotkeys.show_popup_menu_at_mouse();
         assert!(
             crate::tray::wait_for_menu_window(menu_thread, Duration::from_secs(3)),
             "ポップアップメニューが表示されなかった（デスクトップが使えない環境では検証できない）: {}",
-            crate::tray::menu_test_situation(menu_thread)
+            recorder.situation()
         );
         // メニュー（空の履歴なので「（履歴なし）」の1行）は自前描画の経路を通る
         let (measured_after, drawn_after) =
@@ -1394,12 +1396,12 @@ mod tests {
         assert!(
             measured_after > measured,
             "項目を測っていない: {measured} → {measured_after}（{}）",
-            crate::tray::menu_test_situation(menu_thread)
+            recorder.situation()
         );
         assert!(
             drawn_after > drawn,
             "項目を描いていない: {drawn} → {drawn_after}（{}）",
-            crate::tray::menu_test_situation(menu_thread)
+            recorder.situation()
         );
         if via_wm_close {
             unsafe {
@@ -1409,7 +1411,7 @@ mod tests {
             assert!(
                 crate::tray::wait_for_menu_window_gone(menu_thread, Duration::from_secs(3)),
                 "WM_CLOSEでメニューが閉じられなかった: {}",
-                crate::tray::menu_test_situation(menu_thread)
+                recorder.situation()
             );
         }
 
@@ -1427,8 +1429,10 @@ mod tests {
         assert!(
             crate::tray::wait_for_menu_window_gone(menu_thread, Duration::from_secs(3)),
             "終了後もメニューが残っている: {}",
-            crate::tray::menu_test_situation(menu_thread)
+            recorder.situation()
         );
+        // 成功したときの記録（`--nocapture` を付けたときだけ見える。記録が取れているかを確かめる用）
+        eprintln!("ホットキーのメニューのテストの記録: {}", recorder.events());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1444,6 +1448,7 @@ mod tests {
         let config = test_config();
         let (dir, hotkeys, rx) = spawn_test_hotkeys(Arc::clone(&config));
         let menu_thread = crate::tray::window_thread(hotkeys.hwnd);
+        let recorder = crate::tray::MenuEventRecorder::start(menu_thread);
         // 起動時の同期ではキーフックは張られない（二度押しアクションが全て無効）
         assert_eq!(HOOK_TARGET.load(Ordering::Relaxed), 0);
 
@@ -1451,7 +1456,7 @@ mod tests {
         assert!(
             crate::tray::wait_for_menu_window(menu_thread, Duration::from_secs(3)),
             "ポップアップメニューが表示されなかった（デスクトップが使えない環境では検証できない）: {}",
-            crate::tray::menu_test_situation(menu_thread)
+            recorder.situation()
         );
 
         // メニュー表示中に二度押しアクションを有効化して再登録を依頼する
@@ -1470,7 +1475,7 @@ mod tests {
         assert!(
             crate::tray::wait_for_menu_window_gone(menu_thread, Duration::from_secs(3)),
             "メニューを閉じられなかった: {}",
-            crate::tray::menu_test_situation(menu_thread)
+            recorder.situation()
         );
         // 閉じた後に保留の再登録が反映され、キーフックが張られる
         let deadline = Instant::now() + Duration::from_secs(3);
