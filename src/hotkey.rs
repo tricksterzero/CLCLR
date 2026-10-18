@@ -1383,26 +1383,8 @@ mod tests {
         let menu_thread = crate::tray::window_thread(hotkeys.hwnd);
         // 失敗したときに、前面の切り替えとメニューの開閉の順を添える
         let recorder = crate::tray::MenuEventRecorder::start(menu_thread);
-        let (measured, drawn) = crate::menu_draw::test_support::counts();
-        hotkeys.show_popup_menu_at_mouse();
-        assert!(
-            crate::tray::wait_for_menu_window(menu_thread, Duration::from_secs(3)),
-            "ポップアップメニューが表示されなかった（デスクトップが使えない環境では検証できない）: {}",
-            recorder.situation()
-        );
         // メニュー（空の履歴なので「（履歴なし）」の1行）は自前描画の経路を通る
-        let (measured_after, drawn_after) =
-            crate::menu_draw::test_support::wait_for_counts(measured + 1, drawn + 1, Duration::from_secs(3));
-        assert!(
-            measured_after > measured,
-            "項目を測っていない: {measured} → {measured_after}（{}）",
-            recorder.situation()
-        );
-        assert!(
-            drawn_after > drawn,
-            "項目を描いていない: {drawn} → {drawn_after}（{}）",
-            recorder.situation()
-        );
+        crate::tray::open_test_menu(|| hotkeys.show_popup_menu_at_mouse(), menu_thread, &recorder, 1);
         if via_wm_close {
             unsafe {
                 PostMessageW(Some(hotkeys.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap();
@@ -1452,12 +1434,7 @@ mod tests {
         // 起動時の同期ではキーフックは張られない（二度押しアクションが全て無効）
         assert_eq!(HOOK_TARGET.load(Ordering::Relaxed), 0);
 
-        hotkeys.show_popup_menu_at_mouse();
-        assert!(
-            crate::tray::wait_for_menu_window(menu_thread, Duration::from_secs(3)),
-            "ポップアップメニューが表示されなかった（デスクトップが使えない環境では検証できない）: {}",
-            recorder.situation()
-        );
+        crate::tray::open_test_menu(|| hotkeys.show_popup_menu_at_mouse(), menu_thread, &recorder, 1);
 
         // メニュー表示中に二度押しアクションを有効化して再登録を依頼する
         config.write().unwrap().hotkey.double_press_ctrl = DoublePressAction::Viewer;

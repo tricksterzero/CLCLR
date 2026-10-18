@@ -726,7 +726,7 @@ fn poll_menu_window(timeout: std::time::Duration, done: impl Fn() -> bool) -> bo
 pub(crate) struct MenuEventRecorder {
     menu_thread: u32,
     recorder_thread: u32,
-    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    log: std::sync::Arc<std::sync::Mutex<Vec<RecordedEvent>>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -736,7 +736,14 @@ struct RecorderState {
     started: std::time::Instant,
     /// 最初の通知の発生時刻（`dwmsEventTime`）。各通知の発生時刻をこれからの差で出す
     first_event_time: Option<u32>,
-    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    log: std::sync::Arc<std::sync::Mutex<Vec<RecordedEvent>>>,
+}
+
+/// 記録の1件。`foreground_pid` は前面の切り替えのときだけ、前面になったウィンドウのプロセス ID。
+#[cfg(test)]
+struct RecordedEvent {
+    text: String,
+    foreground_pid: Option<u32>,
 }
 
 #[cfg(test)]
@@ -788,16 +795,42 @@ impl MenuEventRecorder {
             }
         });
         let (recorder_thread, hooked) = ready_rx.recv().expect("記録のスレッドが始まらなかった");
+        let recorder = Self { menu_thread, recorder_thread, log, handle: Some(handle) };
         if !hooked {
-            log.lock().unwrap().push("（通知を登録できなかった）".to_string());
+            recorder.note("（通知を登録できなかった）");
         }
-        Self { menu_thread, recorder_thread, log, handle: Some(handle) }
+        recorder
     }
 
     /// これまでの記録（起きた順）。
     pub(crate) fn events(&self) -> String {
         let log = self.log.lock().unwrap();
-        if log.is_empty() { "記録なし".to_string() } else { log.join(" / ") }
+        if log.is_empty() {
+            "記録なし".to_string()
+        } else {
+            log.iter().map(|e| e.text.as_str()).collect::<Vec<_>>().join(" / ")
+        }
+    }
+
+    /// テストの側の出来事（再試行など）を記録に足す。
+    pub(crate) fn note(&self, text: &str) {
+        self.log.lock().unwrap().push(RecordedEvent { text: text.to_string(), foreground_pid: None });
+    }
+
+    /// 今の記録の位置（`foreground_lost_since` に渡す）。
+    pub(crate) fn mark(&self) -> usize {
+        self.log.lock().unwrap().len()
+    }
+
+    /// `mark` の位置より後に、前面がこのプロセス以外へ移った記録があれば、移った先の説明（最後のもの）。
+    pub(crate) fn foreground_lost_since(&self, mark: usize) -> Option<String> {
+        let own_pid = unsafe { windows::Win32::System::Threading::GetCurrentProcessId() };
+        let log = self.log.lock().unwrap();
+        log.iter()
+            .skip(mark)
+            .filter_map(|e| e.foreground_pid.filter(|&pid| pid != own_pid))
+            .last()
+            .map(|pid| format!("pid {pid} {}", process_name(pid)))
     }
 
     /// 失敗の文に添える状況（今のメニューのウィンドウと前面のウィンドウ、これまでの記録）。
@@ -854,12 +887,70 @@ unsafe extern "system" fn on_win_event(
         let mut pid = 0u32;
         unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
         let arrived = state.started.elapsed().as_millis();
-        state.log.lock().unwrap().push(format!(
-            "+{}ms（届いたのは +{arrived}ms）{name}: pid {pid} {}",
-            event_time.wrapping_sub(first),
-            process_name(pid)
-        ));
+        state.log.lock().unwrap().push(RecordedEvent {
+            text: format!(
+                "+{}ms（届いたのは +{arrived}ms）{name}: pid {pid} {}",
+                event_time.wrapping_sub(first),
+                process_name(pid)
+            ),
+            foreground_pid: (event == EVENT_SYSTEM_FOREGROUND).then_some(pid),
+        });
     });
+}
+
+/// テストのメニューを開き、表示されて自前描画の項目を `items` 個以上測り・描いたことを確かめる（hotkey・tray の
+/// メニューのテスト用）。`show` はメニューを出す依頼。メニューが開けなかったときでも、その試みの間に前面がこの
+/// プロセス以外へ移っていて（`recorder` の記録）、メニューのウィンドウが無くなっていれば、ほかのアプリが前面を
+/// 取ったことによる競争として、出し直す（試みは最大3回）。それ以外の失敗と、3回とも開けなかったときは、状況と
+/// 記録を添えて失敗にする。戻り値は試みの回数。
+///
+/// 出し直すのはメニューを開くところまで。開いた後にほかのアプリが前面を取ってメニューが閉じた場合は出し直さ
+/// ないので、その後の「閉じた」の確かめが、保留の処理を通らずに通ることがある。
+#[cfg(test)]
+pub(crate) fn open_test_menu(
+    show: impl Fn(),
+    menu_thread: u32,
+    recorder: &MenuEventRecorder,
+    items: usize,
+) -> u32 {
+    use std::time::Duration;
+
+    const ATTEMPTS: u32 = 3;
+    for attempt in 1..=ATTEMPTS {
+        let mark = recorder.mark();
+        let (measured, drawn) = crate::menu_draw::test_support::counts();
+        show();
+        let shown = wait_for_menu_window(menu_thread, Duration::from_secs(3));
+        let (measured_after, drawn_after) = if shown {
+            crate::menu_draw::test_support::wait_for_counts(measured + items, drawn + items, Duration::from_secs(3))
+        } else {
+            (measured, drawn)
+        };
+        let still_open = menu_windows(menu_thread).iter().any(|&(_, visible)| visible);
+        let opened = shown && measured_after >= measured + items && drawn_after >= drawn + items && still_open;
+        if opened {
+            return attempt;
+        }
+        // 前面の切り替えの通知は少し遅れて届くので、メニューのウィンドウが消えきるのを待ってから記録を見る
+        let gone = wait_for_menu_window_gone(menu_thread, Duration::from_secs(3));
+        if gone && attempt < ATTEMPTS {
+            if let Some(taken_by) = recorder.foreground_lost_since(mark) {
+                let note = format!("再試行: {attempt}回目は前面が {taken_by} へ移り、メニューが開けなかった");
+                eprintln!("{note}");
+                recorder.note(&note);
+                continue;
+            }
+        }
+        assert!(shown, "メニューが表示されなかった（デスクトップが使えない環境では検証できない）: {}", recorder.situation());
+        assert!(
+            measured_after >= measured + items,
+            "項目を測っていない: {measured} → {measured_after}（{}）",
+            recorder.situation()
+        );
+        assert!(drawn_after >= drawn + items, "項目を描いていない: {drawn} → {drawn_after}（{}）", recorder.situation());
+        panic!("メニューが開いた後すぐに閉じた: {}", recorder.situation());
+    }
+    unreachable!("試みの回数の上限で必ず戻るか失敗する")
 }
 
 /// プロセスの exe の名前（読めなければ「不明」）。
@@ -1111,27 +1202,15 @@ mod tests {
         let menu_thread = window_thread(tray.hwnd);
         // 失敗したときに、前面の切り替えとメニューの開閉の順を添える
         let recorder = MenuEventRecorder::start(menu_thread);
-        let (measured, drawn) = crate::menu_draw::test_support::counts();
-        unsafe {
-            PostMessageW(Some(tray.hwnd), WM_TRAY_NOTIFY, WPARAM(0), LPARAM(WM_RBUTTONUP as isize)).unwrap();
-        }
-        assert!(
-            wait_for_menu_window(menu_thread, Duration::from_secs(3)),
-            "トレイのメニューが表示されなかった（デスクトップが使えない環境では検証できない）: {}",
-            recorder.situation()
-        );
         // メニューは自前描画の経路を通る（4項目: 3つのコマンドと区切り線）
-        let (measured_after, drawn_after) =
-            crate::menu_draw::test_support::wait_for_counts(measured + 4, drawn + 4, Duration::from_secs(3));
-        assert!(
-            measured_after >= measured + 4,
-            "項目を測っていない: {measured} → {measured_after}（{}）",
-            recorder.situation()
-        );
-        assert!(
-            drawn_after >= drawn + 4,
-            "項目を描いていない: {drawn} → {drawn_after}（{}）",
-            recorder.situation()
+        let hwnd = tray.hwnd;
+        open_test_menu(
+            || unsafe {
+                PostMessageW(Some(hwnd), WM_TRAY_NOTIFY, WPARAM(0), LPARAM(WM_RBUTTONUP as isize)).unwrap();
+            },
+            menu_thread,
+            &recorder,
+            4,
         );
 
         // メニュー表示中のアイコン差し替え（再入しても安全に処理される）
