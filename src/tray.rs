@@ -654,14 +654,9 @@ pub(crate) fn window_thread(hwnd: HWND) -> u32 {
     unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, None) }
 }
 
-/// `thread` のスレッドのポップアップメニューのウィンドウ（クラス`#32768`）が表示されるまで待つ（モーダル中の
-/// 再入テスト用）。同じプロセスのほかのスレッドのメニューや、まだ表示されていないメニューのウィンドウは数えない。
-#[cfg(test)]
-pub(crate) fn wait_for_menu_window(thread: u32, timeout: std::time::Duration) -> bool {
-    poll_menu_window(timeout, || menu_windows(thread).iter().any(|&(_, visible)| visible))
-}
-
-/// `thread` のスレッドのポップアップメニューのウィンドウが、表示の有無を問わず無くなるまで待つ。
+/// `thread` のスレッドのポップアップメニューのウィンドウ（クラス`#32768`）が、表示の有無を問わず無くなるまで待つ
+/// （モーダル中の再入テスト用。表示されるのを待つのは `open_test_menu`）。同じプロセスのほかのスレッドのメニューは
+/// 数えない。
 #[cfg(test)]
 pub(crate) fn wait_for_menu_window_gone(thread: u32, timeout: std::time::Duration) -> bool {
     poll_menu_window(timeout, || menu_windows(thread).is_empty())
@@ -739,11 +734,13 @@ struct RecorderState {
     log: std::sync::Arc<std::sync::Mutex<Vec<RecordedEvent>>>,
 }
 
-/// 記録の1件。`foreground_pid` は前面の切り替えのときだけ、前面になったウィンドウのプロセス ID。
+/// 記録の1件。`foreground_pid` は前面の切り替えのときだけ、前面になったウィンドウのプロセス ID。`menu_end` は
+/// メニューを出すスレッドのメニューの終わりの通知のとき真。
 #[cfg(test)]
 struct RecordedEvent {
     text: String,
     foreground_pid: Option<u32>,
+    menu_end: bool,
 }
 
 #[cfg(test)]
@@ -814,7 +811,12 @@ impl MenuEventRecorder {
 
     /// テストの側の出来事（再試行など）を記録に足す。
     pub(crate) fn note(&self, text: &str) {
-        self.log.lock().unwrap().push(RecordedEvent { text: text.to_string(), foreground_pid: None });
+        self.log.lock().unwrap().push(RecordedEvent { text: text.to_string(), foreground_pid: None, menu_end: false });
+    }
+
+    /// `mark` の位置より後に、メニューを出すスレッドのメニューの終わりの記録があるか。
+    pub(crate) fn menu_ended_since(&self, mark: usize) -> bool {
+        self.log.lock().unwrap().iter().skip(mark).any(|e| e.menu_end)
     }
 
     /// 今の記録の位置（`foreground_lost_since` に渡す）。
@@ -894,6 +896,7 @@ unsafe extern "system" fn on_win_event(
                 process_name(pid)
             ),
             foreground_pid: (event == EVENT_SYSTEM_FOREGROUND).then_some(pid),
+            menu_end: event == EVENT_SYSTEM_MENUEND,
         });
     });
 }
@@ -920,9 +923,26 @@ pub(crate) fn open_test_menu(
         let mark = recorder.mark();
         let (measured, drawn) = crate::menu_draw::test_support::counts();
         show();
-        let shown = wait_for_menu_window(menu_thread, Duration::from_secs(3));
+        // 表示されるのを待つ。メニューが一瞬で閉じると表示中のウィンドウを見つけられないので、記録にメニューの
+        // 終わりが現れたら、その時点で待つのをやめる
+        let saw_visible = std::cell::Cell::new(false);
+        poll_menu_window(Duration::from_secs(3), || {
+            if menu_windows(menu_thread).iter().any(|&(_, visible)| visible) {
+                saw_visible.set(true);
+                return true;
+            }
+            recorder.menu_ended_since(mark)
+        });
+        let shown = saw_visible.get();
         let (measured_after, drawn_after) = if shown {
-            crate::menu_draw::test_support::wait_for_counts(measured + items, drawn + items, Duration::from_secs(3))
+            // メニューのウィンドウが無くなったら、もう描かれないので待つのをやめる（前面を取られて閉じたときに、
+            // 3秒待ち切らずに出し直せる）
+            crate::menu_draw::test_support::wait_for_counts(
+                measured + items,
+                drawn + items,
+                Duration::from_secs(3),
+                || menu_windows(menu_thread).is_empty(),
+            )
         } else {
             (measured, drawn)
         };
@@ -931,10 +951,17 @@ pub(crate) fn open_test_menu(
         if opened {
             return attempt;
         }
-        // 前面の切り替えの通知は少し遅れて届くので、メニューのウィンドウが消えきるのを待ってから記録を見る
+        // メニューのウィンドウが消えきるのを待ってから記録を見る。前面の切り替えの通知は少し遅れて届くので、
+        // 記録に現れるまで少し待つ
         let gone = wait_for_menu_window_gone(menu_thread, Duration::from_secs(3));
         if gone && attempt < ATTEMPTS {
-            if let Some(taken_by) = recorder.foreground_lost_since(mark) {
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            let mut taken_by = recorder.foreground_lost_since(mark);
+            while taken_by.is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+                taken_by = recorder.foreground_lost_since(mark);
+            }
+            if let Some(taken_by) = taken_by {
                 let note = format!("再試行: {attempt}回目は前面が {taken_by} へ移り、メニューが開けなかった");
                 eprintln!("{note}");
                 recorder.note(&note);

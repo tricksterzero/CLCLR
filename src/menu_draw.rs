@@ -929,15 +929,25 @@ pub(crate) mod test_support {
         (MEASURED.load(Ordering::SeqCst), DRAWN.load(Ordering::SeqCst))
     }
 
-    /// 測った回数・描いた回数が `(measured, drawn)` 以上になるまで、`timeout` まで待つ。戻り値は最後に
-    /// 読んだ回数（足りなければ、呼び出し側が回数ごとに確かめて失敗を出す）。描くのはメニューが表示された
-    /// 後なので、固定の時間だけ待つと、負荷が高いときに足りないことがある。
-    pub(crate) fn wait_for_counts(measured: usize, drawn: usize, timeout: std::time::Duration) -> (usize, usize) {
+    /// 測った回数・描いた回数が `(measured, drawn)` 以上になるまで、`timeout` まで待つ。`give_up` が真を返したら
+    /// （メニューのウィンドウが無くなり、もう描かれない、など）その時点でやめる。戻り値は最後に読んだ回数（足りな
+    /// ければ、呼び出し側が回数ごとに確かめて失敗を出す）。描くのはメニューが表示された後なので、固定の時間だけ
+    /// 待つと、負荷が高いときに足りないことがある。
+    pub(crate) fn wait_for_counts(
+        measured: usize,
+        drawn: usize,
+        timeout: std::time::Duration,
+        give_up: impl Fn() -> bool,
+    ) -> (usize, usize) {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let now = counts();
             if (now.0 >= measured && now.1 >= drawn) || std::time::Instant::now() >= deadline {
                 return now;
+            }
+            if give_up() {
+                // やめると決めた後に増えた分も拾う
+                return counts();
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
