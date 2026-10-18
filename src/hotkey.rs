@@ -1379,24 +1379,37 @@ mod tests {
 
         let _guard = crate::tray::lock_gui_resource_tests();
         let (dir, hotkeys, _rx) = spawn_test_hotkeys(test_config());
+        // メニューはホットキーのスレッドが出す。ウィンドウは Drop で壊れるので、スレッドの ID を先に取る
+        let menu_thread = crate::tray::window_thread(hotkeys.hwnd);
         let (measured, drawn) = crate::menu_draw::test_support::counts();
         hotkeys.show_popup_menu_at_mouse();
         assert!(
-            crate::tray::wait_for_menu_window(Duration::from_secs(3)),
-            "ポップアップメニューが表示されなかった（デスクトップが使えない環境では検証できない）"
+            crate::tray::wait_for_menu_window(menu_thread, Duration::from_secs(3)),
+            "ポップアップメニューが表示されなかった（デスクトップが使えない環境では検証できない）: {}",
+            crate::tray::menu_test_situation(menu_thread)
         );
         // メニュー（空の履歴なので「（履歴なし）」の1行）は自前描画の経路を通る
-        std::thread::sleep(Duration::from_millis(100));
-        let (measured_after, drawn_after) = crate::menu_draw::test_support::counts();
-        assert!(measured_after > measured && drawn_after > drawn, "自前描画の経路を通っていない");
+        let (measured_after, drawn_after) =
+            crate::menu_draw::test_support::wait_for_counts(measured + 1, drawn + 1, Duration::from_secs(3));
+        assert!(
+            measured_after > measured,
+            "項目を測っていない: {measured} → {measured_after}（{}）",
+            crate::tray::menu_test_situation(menu_thread)
+        );
+        assert!(
+            drawn_after > drawn,
+            "項目を描いていない: {drawn} → {drawn_after}（{}）",
+            crate::tray::menu_test_situation(menu_thread)
+        );
         if via_wm_close {
             unsafe {
                 PostMessageW(Some(hotkeys.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap();
             }
             // 閉じられる（=保留された終了が実行される）まで待つ。Dropはその後のjoinのみ
             assert!(
-                crate::tray::wait_for_menu_window_gone(Duration::from_secs(3)),
-                "WM_CLOSEでメニューが閉じられなかった"
+                crate::tray::wait_for_menu_window_gone(menu_thread, Duration::from_secs(3)),
+                "WM_CLOSEでメニューが閉じられなかった: {}",
+                crate::tray::menu_test_situation(menu_thread)
             );
         }
 
@@ -1412,8 +1425,9 @@ mod tests {
         );
         dropper.join().unwrap();
         assert!(
-            crate::tray::wait_for_menu_window_gone(Duration::from_secs(3)),
-            "終了後もメニューが残っている"
+            crate::tray::wait_for_menu_window_gone(menu_thread, Duration::from_secs(3)),
+            "終了後もメニューが残っている: {}",
+            crate::tray::menu_test_situation(menu_thread)
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1429,13 +1443,15 @@ mod tests {
         let _guard = crate::tray::lock_gui_resource_tests();
         let config = test_config();
         let (dir, hotkeys, rx) = spawn_test_hotkeys(Arc::clone(&config));
+        let menu_thread = crate::tray::window_thread(hotkeys.hwnd);
         // 起動時の同期ではキーフックは張られない（二度押しアクションが全て無効）
         assert_eq!(HOOK_TARGET.load(Ordering::Relaxed), 0);
 
         hotkeys.show_popup_menu_at_mouse();
         assert!(
-            crate::tray::wait_for_menu_window(Duration::from_secs(3)),
-            "ポップアップメニューが表示されなかった（デスクトップが使えない環境では検証できない）"
+            crate::tray::wait_for_menu_window(menu_thread, Duration::from_secs(3)),
+            "ポップアップメニューが表示されなかった（デスクトップが使えない環境では検証できない）: {}",
+            crate::tray::menu_test_situation(menu_thread)
         );
 
         // メニュー表示中に二度押しアクションを有効化して再登録を依頼する
@@ -1452,8 +1468,9 @@ mod tests {
             PostMessageW(Some(hotkeys.hwnd), WM_CANCELMODE, WPARAM(0), LPARAM(0)).unwrap();
         }
         assert!(
-            crate::tray::wait_for_menu_window_gone(Duration::from_secs(3)),
-            "メニューを閉じられなかった"
+            crate::tray::wait_for_menu_window_gone(menu_thread, Duration::from_secs(3)),
+            "メニューを閉じられなかった: {}",
+            crate::tray::menu_test_situation(menu_thread)
         );
         // 閉じた後に保留の再登録が反映され、キーフックが張られる
         let deadline = Instant::now() + Duration::from_secs(3);

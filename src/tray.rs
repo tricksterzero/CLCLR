@@ -647,43 +647,67 @@ pub(crate) fn lock_gui_resource_tests() -> std::sync::MutexGuard<'static, ()> {
     GUI_RESOURCE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// ポップアップメニューのウィンドウ（クラス`#32768`）が現れるまで待つ（モーダル中の再入テスト用）。
-/// 他のアプリのメニューを誤検知しないよう、このプロセスが所有するウィンドウだけを数える。
+/// ウィンドウを作ったスレッドの ID（メニューを待つ関数に渡す。ウィンドウが壊れると 0 になるので、
+/// テストの初めに取っておく）。
 #[cfg(test)]
-pub(crate) fn wait_for_menu_window(timeout: std::time::Duration) -> bool {
-    poll_menu_window(timeout, true)
+pub(crate) fn window_thread(hwnd: HWND) -> u32 {
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, None) }
 }
 
-/// ポップアップメニューのウィンドウが消えるまで待つ。
+/// `thread` のスレッドのポップアップメニューのウィンドウ（クラス`#32768`）が表示されるまで待つ（モーダル中の
+/// 再入テスト用）。同じプロセスのほかのスレッドのメニューや、まだ表示されていないメニューのウィンドウは数えない。
 #[cfg(test)]
-pub(crate) fn wait_for_menu_window_gone(timeout: std::time::Duration) -> bool {
-    poll_menu_window(timeout, false)
+pub(crate) fn wait_for_menu_window(thread: u32, timeout: std::time::Duration) -> bool {
+    poll_menu_window(timeout, || menu_windows(thread).iter().any(|&(_, visible)| visible))
 }
 
+/// `thread` のスレッドのポップアップメニューのウィンドウが、表示の有無を問わず無くなるまで待つ。
 #[cfg(test)]
-fn poll_menu_window(timeout: std::time::Duration, want_present: bool) -> bool {
+pub(crate) fn wait_for_menu_window_gone(thread: u32, timeout: std::time::Duration) -> bool {
+    poll_menu_window(timeout, || menu_windows(thread).is_empty())
+}
+
+/// メニューを待つテストが失敗したときに添える状況（`thread` のメニューのウィンドウと、前面のウィンドウの
+/// プロセス）。ほかのアプリの操作で前面が移ったのかを、失敗の出力から見分けるため。
+#[cfg(test)]
+pub(crate) fn menu_test_situation(thread: u32) -> String {
     use windows::Win32::System::Threading::GetCurrentProcessId;
-    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId};
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-    /// このプロセスが所有するメニューのウィンドウがあるか
-    fn own_menu_window_exists() -> bool {
-        let own_pid = unsafe { GetCurrentProcessId() };
-        let mut prev = HWND::default();
-        while let Ok(menu) = unsafe { FindWindowExW(None, Some(prev), w!("#32768"), None) } {
-            let mut pid = 0u32;
-            unsafe { GetWindowThreadProcessId(menu, Some(&mut pid)) };
-            if pid == own_pid {
-                return true;
-            }
-            prev = menu;
+    let menus = menu_windows(thread);
+    let visible = menus.iter().filter(|&&(_, visible)| visible).count();
+    let mut foreground_pid = 0u32;
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut foreground_pid)) };
+    let own_pid = unsafe { GetCurrentProcessId() };
+    let foreground = if foreground_pid == own_pid {
+        "このプロセス".to_string()
+    } else {
+        format!("ほかのプロセス（pid {foreground_pid}）")
+    };
+    format!("メニューのウィンドウ {} 個（うち表示中 {visible} 個）、前面のウィンドウは{foreground}", menus.len())
+}
+
+/// `thread` のスレッドが持つメニューのウィンドウと、それぞれが表示されているか。
+#[cfg(test)]
+fn menu_windows(thread: u32) -> Vec<(HWND, bool)> {
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId, IsWindowVisible};
+
+    let mut found = Vec::new();
+    let mut prev = HWND::default();
+    while let Ok(menu) = unsafe { FindWindowExW(None, Some(prev), w!("#32768"), None) } {
+        if thread != 0 && unsafe { GetWindowThreadProcessId(menu, None) } == thread {
+            found.push((menu, unsafe { IsWindowVisible(menu) }.as_bool()));
         }
-        false
+        prev = menu;
     }
+    found
+}
 
+#[cfg(test)]
+fn poll_menu_window(timeout: std::time::Duration, done: impl Fn() -> bool) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        let present = own_menu_window_exists();
-        if present == want_present {
+        if done() {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -904,19 +928,30 @@ mod tests {
         let _guard = lock_gui_resource_tests();
         let (tx, rx) = std::sync::mpsc::channel::<TrayEvent>();
         let tray = Tray::spawn(Arc::new(AtomicBool::new(true)), tx, || {}).unwrap();
+        // メニューはトレイのスレッドが出す。ウィンドウは Drop で壊れるので、スレッドの ID を先に取る
+        let menu_thread = window_thread(tray.hwnd);
         let (measured, drawn) = crate::menu_draw::test_support::counts();
         unsafe {
             PostMessageW(Some(tray.hwnd), WM_TRAY_NOTIFY, WPARAM(0), LPARAM(WM_RBUTTONUP as isize)).unwrap();
         }
         assert!(
-            wait_for_menu_window(Duration::from_secs(3)),
-            "トレイのメニューが表示されなかった（デスクトップが使えない環境では検証できない）"
+            wait_for_menu_window(menu_thread, Duration::from_secs(3)),
+            "トレイのメニューが表示されなかった（デスクトップが使えない環境では検証できない）: {}",
+            menu_test_situation(menu_thread)
         );
         // メニューは自前描画の経路を通る（4項目: 3つのコマンドと区切り線）
-        std::thread::sleep(Duration::from_millis(100));
-        let (measured_after, drawn_after) = crate::menu_draw::test_support::counts();
-        assert!(measured_after >= measured + 4, "項目を測っていない: {measured} → {measured_after}");
-        assert!(drawn_after >= drawn + 4, "項目を描いていない: {drawn} → {drawn_after}");
+        let (measured_after, drawn_after) =
+            crate::menu_draw::test_support::wait_for_counts(measured + 4, drawn + 4, Duration::from_secs(3));
+        assert!(
+            measured_after >= measured + 4,
+            "項目を測っていない: {measured} → {measured_after}（{}）",
+            menu_test_situation(menu_thread)
+        );
+        assert!(
+            drawn_after >= drawn + 4,
+            "項目を描いていない: {drawn} → {drawn_after}（{}）",
+            menu_test_situation(menu_thread)
+        );
 
         // メニュー表示中のアイコン差し替え（再入しても安全に処理される）
         tray.set_watch_icon(false);
@@ -926,8 +961,9 @@ mod tests {
                 PostMessageW(Some(tray.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap();
             }
             assert!(
-                wait_for_menu_window_gone(Duration::from_secs(3)),
-                "WM_CLOSEでメニューが閉じられなかった"
+                wait_for_menu_window_gone(menu_thread, Duration::from_secs(3)),
+                "WM_CLOSEでメニューが閉じられなかった: {}",
+                menu_test_situation(menu_thread)
             );
         }
 
@@ -945,8 +981,9 @@ mod tests {
         );
         dropper.join().unwrap();
         assert!(
-            wait_for_menu_window_gone(Duration::from_secs(3)),
-            "終了後もメニューが残っている"
+            wait_for_menu_window_gone(menu_thread, Duration::from_secs(3)),
+            "終了後もメニューが残っている: {}",
+            menu_test_situation(menu_thread)
         );
         // 終了依頼で閉じたメニューの結果はUIへ送られない（コンテキスト解放でSenderは切断される）
         assert!(matches!(rx.recv_timeout(Duration::from_millis(300)), Err(RecvTimeoutError::Disconnected)));

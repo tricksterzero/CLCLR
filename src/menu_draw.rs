@@ -928,6 +928,20 @@ pub(crate) mod test_support {
     pub(crate) fn counts() -> (usize, usize) {
         (MEASURED.load(Ordering::SeqCst), DRAWN.load(Ordering::SeqCst))
     }
+
+    /// 測った回数・描いた回数が `(measured, drawn)` 以上になるまで、`timeout` まで待つ。戻り値は最後に
+    /// 読んだ回数（足りなければ、呼び出し側が回数ごとに確かめて失敗を出す）。描くのはメニューが表示された
+    /// 後なので、固定の時間だけ待つと、負荷が高いときに足りないことがある。
+    pub(crate) fn wait_for_counts(measured: usize, drawn: usize, timeout: std::time::Duration) -> (usize, usize) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let now = counts();
+            if (now.0 >= measured && now.1 >= drawn) || std::time::Instant::now() >= deadline {
+                return now;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 }
 
 #[cfg(test)]
