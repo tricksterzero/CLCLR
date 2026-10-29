@@ -90,11 +90,13 @@ pub fn is_valid_hotkey_key(key: &str) -> bool {
     c.is_ascii_alphanumeric()
 }
 
-/// 設定のHotkeyをRegisterHotKey引数へ変換する。キーは英数字1文字のみ対応
-/// （それ以外・空文字はNone=登録しない）。
-fn to_win32(hotkey: &Hotkey) -> Option<(HOT_KEY_MODIFIERS, u32)> {
+/// 設定のHotkeyをRegisterHotKey引数へ変換する。無効なら `Ok(None)`（ほかの値は見ない）。有効なのに
+/// 登録できない値（"alt"・"ctrl"・"shift"・"win" 以外の修飾キー、英数字1文字でないキー）は、どの値かを
+/// 書いた理由の `Err`（手で書いた設定ファイルの値を、何も知らせずに登録しないままにしない）。修飾キーは
+/// 先に確かめ、最初に見つけた誤りだけを返す。
+fn to_win32(hotkey: &Hotkey) -> std::result::Result<Option<(HOT_KEY_MODIFIERS, u32)>, String> {
     if !hotkey.enabled {
-        return None;
+        return Ok(None);
     }
     let mut modifiers = HOT_KEY_MODIFIERS(0);
     for m in &hotkey.modifiers {
@@ -103,14 +105,18 @@ fn to_win32(hotkey: &Hotkey) -> Option<(HOT_KEY_MODIFIERS, u32)> {
             "ctrl" => MOD_CONTROL,
             "shift" => MOD_SHIFT,
             "win" => MOD_WIN,
-            _ => return None,
+            _ => return Err(format!("修飾キー「{m}」は使えません。alt・ctrl・shift・win のどれかにしてください")),
         };
     }
-    if !is_valid_hotkey_key(&hotkey.key) {
-        return None;
+    if hotkey.key.is_empty() {
+        return Err("キーが空です".to_string());
     }
-    let c = hotkey.key.chars().next()?.to_ascii_uppercase();
-    Some((modifiers, c as u32))
+    if !is_valid_hotkey_key(&hotkey.key) {
+        return Err(format!("キー「{}」は使えません。半角英数字1文字にしてください", hotkey.key));
+    }
+    // 英数字1文字であることは上で確かめた
+    let c = hotkey.key.chars().next().unwrap_or_default().to_ascii_uppercase();
+    Ok(Some((modifiers, c as u32)))
 }
 
 // --- Hotkey thread ---
@@ -917,10 +923,14 @@ fn entry_for_send(
     if pinned { crate::tools::text::convert_entry_date(entry, text_cfg) } else { entry }
 }
 
-/// 登録できなかったときは、その説明を返す。
+/// 登録できなかったときは、その説明を返す（設定の値が登録できないものだったときも）。無効なら何もしない。
 fn register_from_config(hwnd: HWND, config: &Arc<RwLock<Config>>) -> Option<String> {
     let hotkey = config.read().unwrap().hotkey.popup_menu.clone();
-    let (modifiers, vk) = to_win32(&hotkey)?;
+    let (modifiers, vk) = match to_win32(&hotkey) {
+        Ok(Some(registration)) => registration,
+        Ok(None) => return None,
+        Err(reason) => return Some(format!("ホットキー {} を登録できません（{reason}）", hotkey_label(&hotkey))),
+    };
     unsafe { RegisterHotKey(Some(hwnd), HOTKEY_ID_POPUP, modifiers, vk) }.err().map(|e| {
         format!(
             "ホットキー {} を登録できません（他のアプリが使っている可能性があります）: {e}",
@@ -1321,7 +1331,7 @@ mod tests {
             modifiers: vec!["ctrl".into(), "alt".into(), "shift".into()],
             key: "Q".into(),
         };
-        let (modifiers, vk) = to_win32(&config.read().unwrap().hotkey.popup_menu).unwrap();
+        let (modifiers, vk) = to_win32(&config.read().unwrap().hotkey.popup_menu).unwrap().unwrap();
 
         let (dir, hotkeys, _rx) = spawn_test_hotkeys(Arc::clone(&config));
         assert!(hotkeys.startup_problems().is_empty(), "競合がないのに問題がある: {:?}", hotkeys.startup_problems());
@@ -1733,16 +1743,56 @@ mod tests {
         };
         assert_eq!(
             to_win32(&hk(true, &["alt"], "C")),
-            Some((MOD_ALT, u32::from('C')))
+            Ok(Some((MOD_ALT, u32::from('C'))))
         );
         assert_eq!(
             to_win32(&hk(true, &["ctrl", "shift"], "v")),
-            Some((MOD_CONTROL | MOD_SHIFT, u32::from('V')))
+            Ok(Some((MOD_CONTROL | MOD_SHIFT, u32::from('V'))))
         );
-        assert_eq!(to_win32(&hk(false, &["alt"], "C")), None); // 無効
-        assert_eq!(to_win32(&hk(true, &["alt"], "")), None); // キーなし
-        assert_eq!(to_win32(&hk(true, &["alt"], "CX")), None); // 2文字
-        assert_eq!(to_win32(&hk(true, &["hyper"], "C")), None); // 未知の修飾
+        // 修飾キーの名前は大文字小文字を区別しない
+        assert_eq!(
+            to_win32(&hk(true, &["ALT", "Win"], "7")),
+            Ok(Some((MOD_ALT | MOD_WIN, u32::from('7'))))
+        );
+        assert_eq!(to_win32(&hk(true, &[], "C")), Ok(Some((HOT_KEY_MODIFIERS(0), u32::from('C'))))); // 修飾なし
+        assert_eq!(to_win32(&hk(false, &["alt"], "C")), Ok(None)); // 無効
+        // 無効なら、ほかの値が正しくなくても登録しないだけ（誤りにしない）
+        assert_eq!(to_win32(&hk(false, &["hyper"], "")), Ok(None));
+    }
+
+    /// 有効なのに登録できない値は、理由（どの値か）を返す。
+    #[test]
+    fn hotkey_parsing_reports_invalid_values() {
+        let hk = |mods: &[&str], key: &str| Hotkey {
+            enabled: true,
+            modifiers: mods.iter().map(|s| s.to_string()).collect(),
+            key: key.to_string(),
+        };
+        let err = |hotkey: Hotkey| to_win32(&hotkey).expect_err("登録できない値なのに誤りにならない");
+        assert!(err(hk(&["alt"], "")).contains("キーが空"));
+        assert!(err(hk(&["alt"], "CX")).contains("「CX」"));
+        assert!(err(hk(&["alt"], "あ")).contains("「あ」"));
+        assert!(err(hk(&["control"], "C")).contains("「control」"));
+        // 正しい修飾キーの後ろにある、知らない修飾キーも見つける
+        assert!(err(hk(&["alt", "hyper"], "C")).contains("「hyper」"));
+        // 修飾キーとキーの両方が正しくなければ、修飾キーの誤りを返す
+        assert!(err(hk(&["hyper"], "CX")).contains("「hyper」"));
+    }
+
+    /// 手で書いた設定ファイルの、登録できないホットキーを、起動時の問題として返す（何も知らせずに登録を
+    /// 飛ばさない）。登録は試みないので、常用中のアプリのキーを奪わない。
+    #[test]
+    fn startup_problems_report_invalid_hotkey_in_config() {
+        let _guard = crate::tray::lock_gui_resource_tests();
+        let config = test_config();
+        config.write().unwrap().hotkey.popup_menu =
+            Hotkey { enabled: true, modifiers: vec!["control".into()], key: "C".into() };
+        let (dir, hotkeys, _rx) = spawn_test_hotkeys(config);
+        let problems = hotkeys.startup_problems().to_vec();
+        drop(hotkeys);
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("「control」"), "{problems:?}");
     }
 
     #[test]
