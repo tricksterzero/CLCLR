@@ -121,8 +121,6 @@ pub struct App {
     tray_source: RefCell<Option<(Sender<TrayEvent>, viewer::Waker)>>,
     /// 設定の反映の途中（`apply_settings`。再入した反映は断る）
     applying: Cell<bool>,
-    /// 最後に頼んだホットキーの登録し直しの番号（`HotkeyEvent::Reregistered` の照合。0 はまだ無い）
-    settings_generation: Cell<u64>,
     /// 開いている設定画面（閉じると `on_settings_closed` が空にする。終了のときは `close_settings`）
     settings: RefCell<Option<SettingsWindow>>,
     /// 自分への弱い参照（設定画面の OK・閉じたときの処理が `App` を呼ぶため。`bind_self` で入れる）
@@ -256,7 +254,6 @@ impl App {
             session_ended: Cell::new(false),
             tray_source: RefCell::new(None),
             applying: Cell::new(false),
-            settings_generation: Cell::new(0),
             settings: RefCell::new(None),
             me: RefCell::new(Weak::new()),
             #[cfg(test)]
@@ -727,9 +724,7 @@ impl App {
                 if effects.hotkeys {
                     match &parts.hotkeys {
                         Some(hotkeys) => {
-                            let generation = self.settings_generation.get() + 1;
-                            self.settings_generation.set(generation);
-                            if let Err(e) = hotkeys.reregister(generation) {
+                            if let Err(e) = hotkeys.reregister() {
                                 failures.push(format!("ホットキーの設定を反映できません: {e}"));
                             }
                         }
@@ -1074,9 +1069,8 @@ impl ViewerHandler for App {
             match event {
                 HotkeyEvent::ShowViewer if self.exiting.get() => {}
                 HotkeyEvent::ShowViewer => viewer::show(hwnd),
-                // 最後に頼んだ登録し直しの結果だけを知らせる（古い番号の結果は、その後の反映で上書きされている）
-                HotkeyEvent::Reregistered { generation, problems } => {
-                    if generation == self.settings_generation.get() && !problems.is_empty() {
+                HotkeyEvent::Reregistered { problems } => {
+                    if !problems.is_empty() {
                         if self.exiting.get() {
                             self.log_settings_failures(problems);
                         } else {
@@ -2738,18 +2732,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// ホットキーの登録し直しの結果は、最後に頼んだ番号のものだけを知らせる（操作の失敗を知らせない設定でも）。
+    /// ホットキーの登録し直しでできなかったことを知らせる（操作の失敗を知らせない設定でも）。全部できた結果は知らせない。
     #[test]
-    fn only_latest_reregister_result_is_notified() {
+    fn reregister_problems_are_notified() {
         let h = NotifyHarness::new(false);
-        h.app.settings_generation.set(2);
-        for (generation, problems) in [(1, vec!["古い".to_string()]), (2, vec!["新しい".to_string()]), (2, vec![])] {
-            h.hotkey.send(HotkeyEvent::Reregistered { generation, problems }).unwrap();
+        for problems in [vec!["できない".to_string()], vec![]] {
+            h.hotkey.send(HotkeyEvent::Reregistered { problems }).unwrap();
         }
         h.wake();
         let shown = h.shown();
         assert_eq!(shown.len(), 1, "{shown:?}");
-        assert!(shown[0].contains("新しい") && !shown[0].contains("古い"), "{shown:?}");
+        assert!(shown[0].contains("できない"), "{shown:?}");
         assert!(shown[0].contains(REREGISTER_RETRY_NOTE), "保存したことと次の起動で試すことを添える: {shown:?}");
     }
 

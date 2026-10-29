@@ -57,10 +57,9 @@ use crate::uia_caret::{self, UiaCaret};
 pub enum HotkeyEvent {
     /// ビューアを表示する（二度押しアクション）
     ShowViewer,
-    /// 設定の反映による登録し直し（`Hotkeys::reregister`）を行った。`generation` は依頼の番号、`problems` は
-    /// できなかったことの説明（空なら全部できた）。メニューの表示中に重なった依頼は最後の1回だけ行うので、
-    /// 番号は行った依頼のもの
-    Reregistered { generation: u64, problems: Vec<String> },
+    /// 設定の反映による登録し直し（`Hotkeys::reregister`）を行った。`problems` はできなかったことの説明（空なら
+    /// 全部できた）。メニューの表示中に重なった依頼は1回だけ行う
+    Reregistered { problems: Vec<String> },
 }
 
 // --- Messages / ids ---
@@ -143,9 +142,8 @@ struct HotkeyContext {
     dp_count: Cell<u32>,
     /// 二度押し判定: 前に数えた key up が起きた時刻（ミリ秒、`KBDLLHOOKSTRUCT::time`）
     dp_last_up: Cell<u32>,
-    /// ポップアップ処理中に届いた設定の再登録依頼の番号（0 は依頼なし。重なった依頼は最後の番号だけを
-    /// 残し、処理後に1回だけ実行する）
-    reregister_pending: Cell<u64>,
+    /// ポップアップ処理中に届いた設定の再登録依頼（重なった依頼は処理後に1回だけ実行する）
+    reregister_pending: Cell<bool>,
     /// ポップアップ処理中に届いた終了依頼（処理後に`DestroyWindow`）
     shutdown_pending: Cell<bool>,
     /// UI Automation でキャレットの位置を取るスレッド（初めて要るときに作る。作れなければ `None` のまま）
@@ -960,14 +958,14 @@ fn apply_reregister(hwnd: HWND, ctx: &HotkeyContext) -> Vec<String> {
     problems
 }
 
-/// 設定の反映による登録し直しを行い、結果を番号付きでビューアへ返す。ビューアへは通り道と
-/// 投稿の起床で返し、同期では送らない。
-fn reregister_and_report(hwnd: HWND, ctx: &HotkeyContext, generation: u64) {
+/// 設定の反映による登録し直しを行い、結果をビューアへ返す。ビューアへは通り道と投稿の起床で返し、
+/// 同期では送らない。
+fn reregister_and_report(hwnd: HWND, ctx: &HotkeyContext) {
     let problems = apply_reregister(hwnd, ctx);
     for problem in &problems {
         eprintln!("{problem}");
     }
-    let _ = ctx.events.send(HotkeyEvent::Reregistered { generation, problems });
+    let _ = ctx.events.send(HotkeyEvent::Reregistered { problems });
     (ctx.repaint)();
 }
 
@@ -985,9 +983,8 @@ unsafe fn run_deferred(hwnd: HWND) {
             return;
         }
         if !ctx.shutdown_pending.get() {
-            let generation = ctx.reregister_pending.replace(0);
-            if generation != 0 {
-                reregister_and_report(hwnd, ctx, generation);
+            if ctx.reregister_pending.replace(false) {
+                reregister_and_report(hwnd, ctx);
             }
             return;
         }
@@ -1064,14 +1061,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_APP_REREGISTER => {
                 if let Some(ctx) = ctx_ref(hwnd) {
-                    // wParam は依頼の番号（`Hotkeys::reregister`）
-                    let generation = wparam.0 as u64;
                     if ctx.menu_open.get() {
                         // ポップアップ処理中は登録・フックを触らず、終わってから反映する
-                        // （依頼は投稿なので呼び出し元は待たない）。重なった依頼は最後の番号だけ残す
-                        ctx.reregister_pending.set(generation);
+                        // （依頼は投稿なので呼び出し元は待たない）。重なった依頼は1回にまとめる
+                        ctx.reregister_pending.set(true);
                     } else {
-                        reregister_and_report(hwnd, ctx, generation);
+                        reregister_and_report(hwnd, ctx);
                     }
                 }
                 LRESULT(0)
@@ -1159,7 +1154,7 @@ impl Hotkeys {
                         dp_vk: Cell::new(0),
                         dp_count: Cell::new(0),
                         dp_last_up: Cell::new(0),
-                        reregister_pending: Cell::new(0),
+                        reregister_pending: Cell::new(false),
                         shutdown_pending: Cell::new(false),
                         uia: OnceCell::new(),
                     }));
@@ -1229,14 +1224,12 @@ impl Hotkeys {
         &self.startup_problems
     }
 
-    /// 設定変更後の再登録（設定の反映から呼ぶ）。`generation` は依頼の番号（1 以上）で、結果は
-    /// `HotkeyEvent::Reregistered` で返る。投稿するだけで待たない（別のスレッドのウィンドウへ `SendMessageW` で送ると、
-    /// 返事を待つ間に呼び出し元がほかのスレッドから送られたメッセージを処理し、ビューアのハンドラへ再入しうる
-    /// ため）。ポップアップメニューの処理中なら、反映はメニューが閉じて送出が終わった
-    /// 後になる（重なった依頼は最後の番号の1回だけ行う）。投稿できなければ Err。
-    pub fn reregister(&self, generation: u64) -> WinResult<()> {
-        debug_assert!(generation != 0, "0 は「依頼なし」に使う");
-        unsafe { PostMessageW(Some(self.hwnd), WM_APP_REREGISTER, WPARAM(generation as usize), LPARAM(0)) }
+    /// 設定変更後の再登録（設定の反映から呼ぶ）。結果は `HotkeyEvent::Reregistered` で返る。投稿するだけで
+    /// 待たない（別のスレッドのウィンドウへ `SendMessageW` で送ると、返事を待つ間に呼び出し元がほかのスレッドから
+    /// 送られたメッセージを処理し、ビューアのハンドラへ再入しうるため）。ポップアップメニューの処理中なら、反映は
+    /// メニューが閉じて送出が終わった後になる（重なった依頼は1回にまとめる）。投稿できなければ Err。
+    pub fn reregister(&self) -> WinResult<()> {
+        unsafe { PostMessageW(Some(self.hwnd), WM_APP_REREGISTER, WPARAM(0), LPARAM(0)) }
     }
 
     /// トレイアイコンの左クリックからポップアップメニューを表示する
@@ -1419,8 +1412,7 @@ mod tests {
     }
 
     /// メニュー表示中の設定適用（`reregister`）は、呼び出しがすぐ戻り、キーフックの張り替えを
-    /// メニューが閉じるまで保留し、閉じた後に反映する。重なった依頼（番号 1・2）は最後の番号の1回だけ
-    /// 行い、結果は番号 2 の1件だけ届く。
+    /// メニューが閉じるまで保留し、閉じた後に反映する。重なった依頼（2回）は1回にまとめ、結果は1件だけ届く。
     #[test]
     fn reregister_while_menu_is_open_is_deferred_and_applied_after_close() {
         use std::time::{Duration, Instant};
@@ -1439,8 +1431,8 @@ mod tests {
         // メニュー表示中に二度押しアクションを有効化して再登録を依頼する
         config.write().unwrap().hotkey.double_press_ctrl = DoublePressAction::Viewer;
         let started = Instant::now();
-        hotkeys.reregister(1).unwrap();
-        hotkeys.reregister(2).unwrap();
+        hotkeys.reregister().unwrap();
+        hotkeys.reregister().unwrap();
         assert!(started.elapsed() < Duration::from_secs(2), "reregisterがメニュー表示中にブロックした");
         // 保留中: まだキーフックは張られていない
         assert_eq!(HOOK_TARGET.load(Ordering::Relaxed), 0);
@@ -1461,13 +1453,13 @@ mod tests {
         }
         assert_ne!(HOOK_TARGET.load(Ordering::Relaxed), 0, "保留した再登録が反映されなかった");
         // 結果はキーフックを張った後に送られるので、少し待って受け取る
-        let mut reports = Vec::new();
+        let mut reports = 0;
         while let Ok(event) = rx.recv_timeout(Duration::from_millis(500)) {
-            if let HotkeyEvent::Reregistered { generation, .. } = event {
-                reports.push(generation);
+            if let HotkeyEvent::Reregistered { .. } = event {
+                reports += 1;
             }
         }
-        assert_eq!(reports, [2], "重なった依頼の結果が最後の番号の1件になっていない");
+        assert_eq!(reports, 1, "重なった依頼の結果が1件になっていない");
 
         drop(hotkeys);
         assert_eq!(HOOK_TARGET.load(Ordering::Relaxed), 0);
