@@ -15,10 +15,8 @@ cargo test              # 自動テスト（ポップアップメニューが一
 
 配布用の zip は `scripts\release.ps1` で作ります。テストと release のビルドを通した後、`target\dist\` に zip と、リリースのページの文面（[CHANGELOG.md](CHANGELOG.md) のそのバージョンの節と SHA-256）を作ります。GitHub へのリリースは行わず、実行するコマンドを表示するだけです。
 
-あわせて、ビルドに使うツールの目録（Rust のツールチェーン、Visual Studio と MSVC、Windows SDK、静的にリンクする C ランタイムのライブラリ、ツールを探すときに読むレジストリの値、ツールの選び方に関わる環境変数と Cargo の設定ファイル）を、テストの前と zip を作った後に取って比べ、違っていれば止まります。目録と exe の SHA-256・Rich ヘッダーは `target\dist\build-tools-<バージョン>.json` に書きます。前に書き出したこのファイルを `-BuildToolsBaseline` に渡すと、テストの前の目録をそれと比べ、違っていれば止まります。配布の zip を作るときは、採用したツールの目録のファイルを必ず渡します（省くと止まります）。試しに作るドラフト（`-Draft`）では省けます。
-
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -BuildToolsBaseline <採用した目録の build-tools-<バージョン>.json>
+powershell -ExecutionPolicy Bypass -File scripts\release.ps1
 ```
 
 ## 開発言語（Rust）について

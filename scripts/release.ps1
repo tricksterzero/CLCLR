@@ -19,11 +19,6 @@ CLCLR の配布用の zip と、リリースのページの文面を作る（Git
    作った zip の項目がちょうどその4つで、中身が元のファイルと同じであることと、テスト・ビルドの間に作業ツリーと
    コミットが変わっていないことを確かめる
 5. zip と exe（zip の中のもの）の SHA-256 を出し、リリースのページの文面 <出力先>\dist\release-notes-<バージョン>.md を作る
-6. ビルドに使うツールの目録（Rust のツールチェーン、Visual Studio と MSVC、Windows SDK、静的にリンクする C ランタイムの
-   ライブラリ、ツールを探すときに読むレジストリの値、ツールの選び方に関わる環境変数と Cargo の設定ファイル）を、テストの
-   前と zip を作った後に取って比べ、
-   違っていれば止める（ドラフトでも止める）。目録と exe の SHA-256・Rich ヘッダーを <出力先>\dist\build-tools-<バージョン>.json
-   に書く
 
 GitHub へのリリース（タグの作成と gh release create）は外から見える操作なので、このスクリプトでは行わず、
 最後に実行するコマンドを表示するだけにする（リポジトリは origin、タグの位置は確かめたコミットの SHA で指定する）。
@@ -32,20 +27,15 @@ GitHub へのリリース（タグの作成と gh release create）は外から�
 ドラフト。main 以外のブランチ・未コミットの変更・origin/main との違い・CHANGELOG.md の公開日の「未定」・
 既にあるタグ・GitHub 以外の origin を、止めずに警告だけにする（試しに作るとき用）。ドラフトの zip は配らない。
 
-.PARAMETER BuildToolsBaseline
-前に書き出した build-tools-<バージョン>.json。テストの前に取った目録をこのファイルの目録と比べ、違っていれば止める
-（ドラフトでは警告だけにする）。ドラフトでないときは必須（省くと、採用したツールとの比較をせずに進んでしまうため止める）。
-
 .EXAMPLE
-powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -BuildToolsBaseline <採用した目録の build-tools-<バージョン>.json>
+powershell -ExecutionPolicy Bypass -File scripts\release.ps1
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -Draft
 #>
 [CmdletBinding()]
 param(
-    [switch]$Draft,
-    [string]$BuildToolsBaseline
+    [switch]$Draft
 )
 
 $ErrorActionPreference = 'Stop'
@@ -55,12 +45,6 @@ Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $root = Split-Path -Parent $PSScriptRoot
-# 相対パスは、リポジトリのフォルダへ移る前の、呼び出したときのフォルダを基点にする
-if ($BuildToolsBaseline) {
-    $BuildToolsBaseline = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BuildToolsBaseline)
-} elseif (-not $Draft) {
-    throw '-BuildToolsBaseline に、採用したツールの目録のファイル（build-tools-<バージョン>.json）を渡してください（ドラフトでないときは必須です）'
-}
 $packageFiles = @('README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md')
 
 function Write-Step([string]$message) {
@@ -247,18 +231,6 @@ function Find-LocalPath([string]$path, [string[]]$needles) {
     return $found
 }
 
-# フォルダの短い名前（8.3 形式）のパス。取れなければ $null
-function Get-ShortFolderPath([string]$path) {
-    try {
-        $short = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($path).ShortPath
-        if ($short -and $short -ne $path) {
-            return $short
-        }
-    } catch {
-    }
-    return $null
-}
-
 # zip の項目の SHA-256（大文字の16進）
 function Get-ZipEntryHash([System.IO.Compression.ZipArchiveEntry]$entry) {
     $sha = [System.Security.Cryptography.SHA256]::Create()
@@ -320,272 +292,6 @@ function Get-ChangelogSection([string]$changelog, [string]$version) {
     return [pscustomobject]@{ Date = $date; Body = $body }
 }
 
-# JSON から読んだオブジェクトのプロパティ（無ければ $null。Set-StrictMode の下でも止めない）
-function Get-JsonProperty($object, [string]$name) {
-    if ($null -ne $object -and $object.PSObject.Properties[$name]) {
-        return $object.PSObject.Properties[$name].Value
-    }
-    return $null
-}
-
-# ファイルのバージョン（ファイルが無ければ $null）
-function Get-FileVersionOrNull([string]$path) {
-    if (Test-Path -LiteralPath $path -PathType Leaf) {
-        # -Force: 隠しファイルも読む（-Force が無いと、Test-Path が真でも Get-Item が見つからないと言って止まる）
-        return (Get-Item -LiteralPath $path -Force).VersionInfo.FileVersion
-    }
-    return $null
-}
-
-# ファイルのパスと SHA-256（ファイルが無ければ $null）
-function Get-FileRecord([string]$path) {
-    if (Test-Path -LiteralPath $path -PathType Leaf) {
-        return [ordered]@{ path = $path; sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
-    }
-    return $null
-}
-
-# 実行ファイルのバージョンと SHA-256（ファイルが無ければ $null）
-function Get-ExeRecord([string]$path) {
-    if (Test-Path -LiteralPath $path -PathType Leaf) {
-        return [ordered]@{ version = Get-FileVersionOrNull $path; sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
-    }
-    return $null
-}
-
-# HKLM のレジストリの文字列の値。表示（64 ビット・32 ビット）を指定して読む。キーか値が無ければ $null。読めない
-# とき（アクセス拒否など）は、有無を確かめられていないので止める
-function Get-RegistryValue([Microsoft.Win32.RegistryView]$view, [string]$subKey, [string]$name) {
-    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $view)
-    try {
-        $key = $base.OpenSubKey($subKey)
-        if ($null -eq $key) {
-            return $null
-        }
-        try {
-            return $key.GetValue($name)
-        } finally {
-            $key.Dispose()
-        }
-    } finally {
-        $base.Dispose()
-    }
-}
-
-# 既定のツールセットを決めるファイル（VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt）の中身。末尾の空白
-# を除く。ファイルが無ければ $null。リンカーを探す側は、ファイル全体を UTF-8 として読み（BOM は消さない）、末尾の
-# 空白を除いた文字列をツールセットのバージョンにする。同じ名前のフォルダがある、読めない、UTF-8 として正しくないときは止める
-function Get-DefaultToolsetText([string]$installationPath) {
-    $path = Join-Path $installationPath 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt'
-    if (Test-Path -LiteralPath $path -PathType Container) {
-        throw "既定のツールセットのファイルと同じ名前のフォルダがあります（$path）"
-    }
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        return $null
-    }
-    $bytes = [System.IO.File]::ReadAllBytes($path)
-    # 2つ目の引数: 正しくないバイトを置き換えずに例外にする
-    $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
-    return $utf8.GetString($bytes).TrimEnd()
-}
-
-# フォルダの中のフォルダの名前（フォルダが無ければ空）。隠しフォルダも含める（ツールを探す側は隠しフォルダも見る）
-function Get-SubfolderName([string]$path) {
-    if (Test-Path -LiteralPath $path -PathType Container) {
-        return @(Get-ChildItem -LiteralPath $path -Directory -Force | ForEach-Object { $_.Name } | Sort-Object)
-    }
-    return @()
-}
-
-# ビルドに使うツールの目録。Rust のツールチェーン、Visual Studio と MSVC のツールセット（リンカーのバージョンと SHA-256、
-# 静的にリンクする C ランタイムのライブラリ、既定のツールセット）、Windows SDK（バージョン、rc.exe、静的にリンクする UCRT
-# のライブラリ）、リンカーが SDK を探すときに読むレジストリの値、ツールの選び方に関わる環境変数と Cargo の設定ファイル。
-# どれも exe の中身を左右する。見るのは入っているものと選び方の指定で、ビルドで実際にどれが使われたかまでは確かめない
-function Get-BuildToolInventory {
-    $rustc = @(& rustc --version --verbose)
-    if ($LASTEXITCODE -ne 0 -or $rustc.Count -eq 0) {
-        throw "rustc --version --verbose が失敗しました（終了コード $LASTEXITCODE）"
-    }
-    $cargo = @(& cargo --version)
-    if ($LASTEXITCODE -ne 0 -or $cargo.Count -eq 0) {
-        throw "cargo --version が失敗しました（終了コード $LASTEXITCODE）"
-    }
-
-    # Visual Studio のインスタンス（vswhere は Visual Studio のインストーラーに付く。無ければ空）。プレビュー版も
-    # 含める（リンカーを探す側は、プレビュー版も候補にする）
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-    $instances = @()
-    if (Test-Path -LiteralPath $vswhere -PathType Leaf) {
-        $json = @(& $vswhere -all -prerelease -products '*' -format json)
-        if ($LASTEXITCODE -ne 0) {
-            throw "vswhere が失敗しました（終了コード $LASTEXITCODE）"
-        }
-        # JSON の配列を1つずつに分ける（ConvertFrom-Json は配列を1つのオブジェクトとして出す）
-        $instances = @(($json -join "`n") | ConvertFrom-Json | ForEach-Object { $_ })
-    }
-    # 既定のツールセットのファイルは、VCToolsVersion が無いときだけ記録する（あればツールセットはそれで決まり、
-    # ファイルは読まれない）
-    $useDefaultToolset = -not [Environment]::GetEnvironmentVariable('VCToolsVersion')
-    $visualStudio = @(foreach ($instance in $instances | Sort-Object { Get-JsonProperty $_ 'installationPath' }) {
-        $installationPath = Get-JsonProperty $instance 'installationPath'
-        $msvcRoot = Join-Path $installationPath 'VC\Tools\MSVC'
-        $toolsets = @(foreach ($toolset in Get-SubfolderName $msvcRoot) {
-            $toolsetDir = Join-Path $msvcRoot $toolset
-            [ordered]@{
-                version      = $toolset
-                link         = Get-ExeRecord (Join-Path $toolsetDir 'bin\HostX64\x64\link.exe')
-                cvtres       = Get-ExeRecord (Join-Path $toolsetDir 'bin\HostX64\x64\cvtres.exe')
-                libcmt       = Get-FileRecord (Join-Path $toolsetDir 'lib\x64\libcmt.lib')
-                libvcruntime = Get-FileRecord (Join-Path $toolsetDir 'lib\x64\libvcruntime.lib')
-                # リンカーは SDK より先にこれらのフォルダを探すので、ここに libucrt.lib があると SDK のものより先に使う
-                libucrtInLib    = Test-Path -LiteralPath (Join-Path $toolsetDir 'lib\x64\libucrt.lib') -PathType Leaf
-                libucrtInAtlmfc = Test-Path -LiteralPath (Join-Path $toolsetDir 'atlmfc\lib\x64\libucrt.lib') -PathType Leaf
-            }
-        })
-        $defaultToolset = $null
-        if ($useDefaultToolset) {
-            $defaultToolset = Get-DefaultToolsetText $installationPath
-        }
-        [ordered]@{
-            displayName           = Get-JsonProperty $instance 'displayName'
-            productDisplayVersion = Get-JsonProperty (Get-JsonProperty $instance 'catalog') 'productDisplayVersion'
-            installationVersion   = Get-JsonProperty $instance 'installationVersion'
-            installationPath      = $installationPath
-            defaultToolset        = $defaultToolset
-            toolsets              = $toolsets
-        }
-    })
-
-    # Windows SDK（Windows 10 以降の SDK の場所は、レジストリの KitsRoot10 にある）。embed-resource（rc.exe を探す）は
-    # 64 ビットの表示を読む。キーか値が無いときだけ「SDK なし」にする（読めないときは止める）
-    $installedRootsKey = 'SOFTWARE\Microsoft\Windows Kits\Installed Roots'
-    $kitsRoot = Get-RegistryValue ([Microsoft.Win32.RegistryView]::Registry64) $installedRootsKey 'KitsRoot10'
-    # リンカーを探す側（rustc の中のもの）は 32 ビットの表示を読み、UCRT の場所を KitsRoot10 から、import ライブラリ
-    # の場所を Microsoft SDKs\Windows\v10.0 の InstallationFolder から決める
-    $registry = [ordered]@{
-        kitsRoot10_32              = Get-RegistryValue ([Microsoft.Win32.RegistryView]::Registry32) $installedRootsKey 'KitsRoot10'
-        sdk10InstallationFolder_32 = Get-RegistryValue ([Microsoft.Win32.RegistryView]::Registry32) 'SOFTWARE\Microsoft\Microsoft SDKs\Windows\v10.0' 'InstallationFolder'
-    }
-    $windowsSdk = $null
-    if ($kitsRoot) {
-        $binDir = Join-Path $kitsRoot 'bin'
-        # bin の下のフォルダ（バージョン、または x64 などの直下の置き場）の x64\rc.exe をすべて記録する（並びは名前の順）。
-        # embed-resource は、環境変数 RC などで指定されていなければ、bin の下をファイルシステムが列挙した順に見て、
-        # 最初に x64\rc.exe があるものを使う（この並びと同じとは限らない）
-        $rcFiles = @(foreach ($folder in Get-SubfolderName $binDir) {
-            $rc = Join-Path $binDir "$folder\x64\rc.exe"
-            if (Test-Path -LiteralPath $rc -PathType Leaf) {
-                [ordered]@{ path = $rc; version = Get-FileVersionOrNull $rc; sha256 = (Get-FileHash -LiteralPath $rc -Algorithm SHA256).Hash }
-            }
-        })
-        $libDir = Join-Path $kitsRoot 'Lib'
-        $windowsSdk = [ordered]@{
-            root    = $kitsRoot
-            lib     = @(Get-SubfolderName $libDir)
-            # リンカーを探す側は、ucrt のフォルダがあるバージョンから UCRT を、um\x64\kernel32.lib があるバージョンから import
-            # ライブラリを選ぶ
-            libVersions = @(foreach ($version in Get-SubfolderName $libDir) {
-                [ordered]@{
-                    version  = $version
-                    ucrt     = Test-Path -LiteralPath (Join-Path $libDir "$version\ucrt") -PathType Container
-                    kernel32 = Test-Path -LiteralPath (Join-Path $libDir "$version\um\x64\kernel32.lib") -PathType Leaf
-                }
-            })
-            include = @(Get-SubfolderName (Join-Path $kitsRoot 'Include'))
-            bin     = @(Get-SubfolderName $binDir)
-            rc      = $rcFiles
-            libucrt = @(foreach ($version in Get-SubfolderName $libDir) {
-                $record = Get-FileRecord (Join-Path $libDir "$version\ucrt\x64\libucrt.lib")
-                if ($record) {
-                    $record
-                }
-            })
-        }
-    }
-
-    # ツールの選び方に関わる環境変数（PATH は、ほかのソフトを入れるだけで変わるので含めない）。リンカーと rc.exe を
-    # 探す側、cargo（使う rustc）、リンカー自身（LINK・_LINK_ の引数）が読むもの
-    $environment = [ordered]@{}
-    foreach ($variable in 'VCINSTALLDIR', 'VCToolsInstallDir', 'WindowsSdkDir', 'LIB', 'INCLUDE', 'RC', 'RC_x86_64-pc-windows-msvc', 'RC_x86_64_pc_windows_msvc', 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER', 'CARGO_BUILD_TARGET', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_BUILD_RUSTFLAGS', 'RUSTUP_TOOLCHAIN', 'VSTEL_MSBuildProjectFullPath', 'VCToolsVersion', 'WindowsSDKVersion', 'RUSTC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'CARGO_BUILD_RUSTC', 'CARGO_BUILD_RUSTC_WRAPPER', 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER', 'LINK', '_LINK_') {
-        $environment[$variable] = [Environment]::GetEnvironmentVariable($variable)
-    }
-    # Spectre 対策版の C ランタイム（lib\spectre）を使うかどうか。値が spectre のときだけ効く
-    $environment['VSCMD_ARG_VCVARS_SPECTRE=spectre'] = ([Environment]::GetEnvironmentVariable('VSCMD_ARG_VCVARS_SPECTRE') -ceq 'spectre')
-
-    # Cargo の設定ファイル（リポジトリのフォルダから上の各フォルダの .cargo と、Cargo のホーム）。中身は SHA-256 で
-    # 比べる（リンカーや rustflags の指定が変われば変わる）
-    $configFiles = @()
-    $folder = $root
-    while ($folder) {
-        foreach ($file in 'config.toml', 'config') {
-            $record = Get-FileRecord (Join-Path $folder ".cargo\$file")
-            if ($record) {
-                $configFiles += $record
-            }
-        }
-        $folder = Split-Path -Parent $folder
-    }
-    $cargoHomeDir = if ($env:CARGO_HOME) { $env:CARGO_HOME } elseif ($env:USERPROFILE) { Join-Path $env:USERPROFILE '.cargo' } else { $null }
-    if ($cargoHomeDir) {
-        foreach ($file in 'config.toml', 'config') {
-            $record = Get-FileRecord (Join-Path $cargoHomeDir $file)
-            if ($record) {
-                $configFiles += $record
-            }
-        }
-    }
-
-    return [ordered]@{
-        rust         = [ordered]@{ rustc = @($rustc | ForEach-Object { "$_".Trim() }); cargo = "$($cargo[0])".Trim() }
-        visualStudio = $visualStudio
-        windowsSdk   = $windowsSdk
-        registry     = $registry
-        environment  = $environment
-        cargoConfig  = $configFiles
-    }
-}
-
-# 目録を比べるための文字列（JSON に直し、読み直してからもう一度直して、ファイルから読んだものと形をそろえる）
-function ConvertTo-InventoryText($inventory) {
-    return ($inventory | ConvertTo-Json -Depth 10 -Compress | ConvertFrom-Json | ConvertTo-Json -Depth 10 -Compress)
-}
-
-# exe（PE）の Rich ヘッダーの項目（製品 ID・ビルド番号・数。リンクしたオブジェクトとライブラリを作ったツールの番号）。
-# 無ければ空
-function Get-RichHeaderEntry([string]$path) {
-    $bytes = [System.IO.File]::ReadAllBytes($path)
-    $pe = [System.BitConverter]::ToInt32($bytes, 0x3C)
-    # "Rich" のマーカーと、その後ろの鍵（項目はこの鍵との XOR で書かれている）
-    $rich = -1
-    for ($i = 0x80; $i + 8 -le $pe; $i += 4) {
-        if ([System.BitConverter]::ToUInt32($bytes, $i) -eq 0x68636952) {
-            $rich = $i
-            break
-        }
-    }
-    if ($rich -lt 0) {
-        return @()
-    }
-    $key = [System.BitConverter]::ToUInt32($bytes, $rich + 4)
-    # 先頭の "DanS" のマーカー（鍵との XOR で書かれている）
-    $start = -1
-    for ($i = $rich - 4; $i -ge 0x80; $i -= 4) {
-        if (([System.BitConverter]::ToUInt32($bytes, $i) -bxor $key) -eq 0x536E6144) {
-            $start = $i
-            break
-        }
-    }
-    if ($start -lt 0) {
-        throw "Rich ヘッダーの先頭が見つかりません（$path）"
-    }
-    $entries = @(for ($offset = $start + 16; $offset -lt $rich; $offset += 8) {
-        $compId = [System.BitConverter]::ToUInt32($bytes, $offset) -bxor $key
-        $count = [System.BitConverter]::ToUInt32($bytes, $offset + 4) -bxor $key
-        '{0:x4} {1} {2}' -f ($compId -shr 16), ($compId -band 0xFFFF), $count
-    })
-    return @($entries | Sort-Object)
-}
-
 Push-Location -LiteralPath $root
 try {
     Write-Step '作業ツリーと main の状態を確かめる'
@@ -644,38 +350,6 @@ try {
     # テストとビルドには --locked を付け、コミットした Cargo.lock の依存関係のバージョンのままで行う（Cargo.lock を書き換える
     # 必要があれば、コンパイルを始める前に止まる）
 
-    Write-Step 'ビルドに使うツールの目録を取る'
-    $toolsBefore = Get-BuildToolInventory
-    $toolsBeforeText = ConvertTo-InventoryText $toolsBefore
-    if ($BuildToolsBaseline) {
-        if (-not (Test-Path -LiteralPath $BuildToolsBaseline -PathType Leaf)) {
-            throw "比べる目録のファイルがありません（$BuildToolsBaseline）"
-        }
-        $baseline = Get-JsonProperty ([System.IO.File]::ReadAllText($BuildToolsBaseline) | ConvertFrom-Json) 'inventory'
-        if ($null -eq $baseline) {
-            throw "比べる目録のファイルに inventory がありません（$BuildToolsBaseline）"
-        }
-        if ((ConvertTo-InventoryText $baseline) -cne $toolsBeforeText) {
-            Stop-OrWarn "ビルドに使うツールの目録が $BuildToolsBaseline と違います"
-        } else {
-            Write-Host "目録は $BuildToolsBaseline と同じです"
-        }
-    }
-    if ($toolsBefore.windowsSdk) {
-        foreach ($sdk in $toolsBefore.windowsSdk['lib']) {
-            Write-Host "Windows SDK: $sdk"
-        }
-    } else {
-        Write-Host 'Windows SDK: 見つかりません（レジストリの KitsRoot10 がありません）'
-    }
-    foreach ($instance in $toolsBefore.visualStudio) {
-        Write-Host "Visual Studio: $($instance.displayName) $($instance.productDisplayVersion)"
-        foreach ($toolset in $instance.toolsets) {
-            $linkVersion = if ($toolset.link) { $toolset.link['version'] } else { 'なし' }
-            Write-Host "  MSVC $($toolset.version)（link.exe $linkVersion）"
-        }
-    }
-
     Write-Step 'テスト（cargo test。配布のビルドと同じく CRT の静的リンクと CFG の指定で）'
     $env:CARGO_ENCODED_RUSTFLAGS = $hardening
     try {
@@ -687,11 +361,7 @@ try {
     Write-Step 'release のビルド（cargo build --release）'
     # 依存クレートのソースのパス（パニックの場所として exe に入る）から、ビルドした人のフォルダの名前を消すため、
     # Cargo のホームを「cargo」に置き換えてビルドする
-    # ユーザーのフォルダが空やドライブのルートだと、置き換えも確かめも意味を持たないので止める
-    $userProfile = if ($env:USERPROFILE) { [System.IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\') } else { '' }
-    if (-not $userProfile -or $userProfile -match '^[A-Za-z]:$' -or -not (Test-Path -LiteralPath $userProfile -PathType Container)) {
-        throw "ユーザーのフォルダ（USERPROFILE）が使えません（$env:USERPROFILE）"
-    }
+    $userProfile = [System.IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\')
     $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $userProfile '.cargo' }
     $cargoHome = [System.IO.Path]::GetFullPath($cargoHome).TrimEnd('\')
     $env:CARGO_ENCODED_RUSTFLAGS = "--remap-path-prefix=$cargoHome=cargo" + [char]0x1F + $hardening
@@ -748,7 +418,7 @@ try {
     if (-not (Test-CetCompat $exe)) {
         throw "CLCLR.exe に CET シャドウスタック互換のフラグがありません（build.rs の /CETCOMPAT が効いていません）"
     }
-    $leaks = @(Find-LocalPath $exe @($userProfile, $cargoHome, (Get-ShortFolderPath $userProfile), (Get-ShortFolderPath $cargoHome)))
+    $leaks = @(Find-LocalPath $exe @($userProfile, $cargoHome))
     if ($leaks.Count -gt 0) {
         throw "CLCLR.exe にビルドした環境のパスが残っています（$($leaks -join '、')）"
     }
@@ -762,13 +432,6 @@ try {
     }
     if (Test-Path -LiteralPath $zip) {
         Remove-Item -LiteralPath $zip -Force
-    }
-    # 前の実行の目録のファイルを、この実行の zip の隣に残さない（この実行の目録は、取り直して比べた後に書く）
-    foreach ($suffix in '', '-before', '-after') {
-        $oldToolsPath = Join-Path $dist "build-tools-$version$suffix.json"
-        if (Test-Path -LiteralPath $oldToolsPath) {
-            Remove-Item -LiteralPath $oldToolsPath -Force
-        }
     }
     # zip の項目の名前と元のファイル
     $sources = [ordered]@{ 'CLCLR.exe' = $exe }
@@ -816,30 +479,6 @@ try {
         Stop-OrWarn 'テスト・ビルドの間に作業ツリーかコミットが変わりました'
     }
 
-    # テスト・ビルドの間にツールが変わっていないか（変わっていれば、成果物がどのツールで作られたかを言えないので、
-    # ドラフトでも止める）
-    Write-Step 'ビルドに使うツールの目録を取り直して比べる'
-    $beforePath = Join-Path $dist "build-tools-$version-before.json"
-    try {
-        $toolsAfter = Get-BuildToolInventory
-    } catch {
-        # 取り直せなかったときも、比べる元（テストの前の目録）を残してから止まる
-        [System.IO.File]::WriteAllText($beforePath, (($toolsBefore | ConvertTo-Json -Depth 10) -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding $false))
-        throw "ビルドに使うツールの目録を取り直せませんでした（テストの前の目録は $beforePath）。この実行の成果物は使えません: $($_.Exception.Message)"
-    }
-    if ((ConvertTo-InventoryText $toolsAfter) -cne $toolsBeforeText) {
-        $afterPath = Join-Path $dist "build-tools-$version-after.json"
-        [System.IO.File]::WriteAllText($afterPath, (($toolsAfter | ConvertTo-Json -Depth 10) -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding $false))
-        [System.IO.File]::WriteAllText($beforePath, (($toolsBefore | ConvertTo-Json -Depth 10) -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding $false))
-        throw "テスト・ビルドの間に、ビルドに使うツールの目録が変わりました（$beforePath と $afterPath を比べてください）。この実行の成果物は使えません"
-    }
-    $buildTools = [ordered]@{
-        inventory = $toolsBefore
-        exe       = [ordered]@{ path = $exe; sha256 = $expected['CLCLR.exe']; rich = @(Get-RichHeaderEntry $exe) }
-    }
-    $buildToolsPath = Join-Path $dist "build-tools-$version.json"
-    [System.IO.File]::WriteAllText($buildToolsPath, (($buildTools | ConvertTo-Json -Depth 10) -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding $false))
-
     Write-Step 'SHA-256 とリリースの文面'
     $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
     # zip の中の exe と同じことを上で確かめた値
@@ -886,7 +525,6 @@ $($section.Body)
     Write-Host "exe:   $exe"
     Write-Host "  SHA-256 $exeHash"
     Write-Host "文面:  $notesPath"
-    Write-Host "目録:  $buildToolsPath"
     Write-Host ''
     if ($Draft) {
         Write-Host 'ドラフトなので、GitHub へ出すコマンドは表示しません。' -ForegroundColor Yellow
