@@ -2,7 +2,7 @@
 //!
 //! メタデータ（TOML）とblob（バイナリ本体）を分離して保存する。大きなデータ
 //! （画像等）を毎回全件読み込まずに済むよう、Entry/Nodeへの復元は必要になった
-//! 時点で該当blobだけを読む（`load_entry_data`）形にしている。
+//! 時点で該当blobだけを読む（`load_entry_data_strict`）形にしている。
 //! CF_DIBのblobはWebPロスレスに変換して保存し（dib.rs）、それ以外は生バイナリ。
 
 use std::borrow::Cow;
@@ -296,7 +296,7 @@ impl Storage {
     /// 一度もディスクへ書いていない項目」のidを渡しても、その項目はそもそも
     /// ディスク上に存在しないため何も変わらない（メモリ専用モードでは
     /// プレビュー本文を含むメタデータを新規にディスクへ書いてしまわないための
-    /// 安全策。HistoryService::persist_evicted_then_remove_blobs参照）。
+    /// 安全策。ops.rs の `retire_items`・`retry_pending` と `Core::clean_data` 参照）。
     /// 対象idが1件も一致しない場合は書き込み自体を行わない（save_on_exit
     /// のみの構成で不要な書き込みを増やさないため）。
     pub fn remove_from_history_index(&self, ids: &[Uuid]) -> Result<()> {
@@ -333,7 +333,6 @@ impl Storage {
 
     /// `load_entry_data` の厳密版。メタデータにある形式が1つでも読めなければエラーにする
     /// （送る・ピン留めの複製で、一部の形式だけが欠けたものを正常として扱わないため）。
-    /// プレビュー・ツールチップは、読めた分だけを出す `load_entry_data` を使う。
     pub fn load_entry_data_strict(&self, meta: &EntryMeta) -> Result<Entry> {
         let formats = meta.formats.iter().map(|fm| self.load_format(fm)).collect::<Result<Vec<Format>>>()?;
         Ok(Entry {
@@ -381,8 +380,8 @@ impl Storage {
     /// フィルタの有無で他形式のblob名は変わらない。
     ///
     /// 呼び出し元は常に新規生成の`entry.id`（`Entry::new`直後）でこの関数を呼ぶため
-    /// （`pin_by_id`は複製元を参照せず新idで複製、`on_captured`は捕捉のたび新規
-    /// エントリ）、blob名は本呼び出しで初めて使われるファイル名になる。途中の形式で
+    /// （`Core::pin`は複製元を参照せず新idで複製、`Core::capture`はクリップボードから
+    /// 読んだ新規エントリ）、blob名は本呼び出しで初めて使われるファイル名になる。途中の形式で
     /// 書き込みが失敗した場合、それより前に本呼び出しで書いたblob（本体・サムネイル
     /// とも）は他から参照されないため、エラーを返す前に削除してから戻る
     /// （孤児化の回避。削除自体の失敗は握り潰す＝ベストエフォート、削除できなくても

@@ -200,8 +200,8 @@ fn generate_r1_test_data() {
         children: Vec::new(),
     }));
     root.extend(items); // 残り5件はルート直下
-    // フォルダへの振り分けは Core の操作にないので、pinned.toml へ直接書く（最後の保存は履歴の
-    // インデックスだけを書くので、この pinned.toml はそのまま残る）
+    // `Core::create_folder` は作ったフォルダの ID を返さず、入れ子の振り分けを組みにくいので、pinned.toml へ
+    // 直接書く（最後の保存は履歴のインデックスだけを書くので、この pinned.toml はそのまま残る）
     core.storage().save_pinned(&root).unwrap();
 
     core.shutdown(None).unwrap();

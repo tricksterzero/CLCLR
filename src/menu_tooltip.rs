@@ -7,7 +7,7 @@
 //! （メニュー選択後のフォーカス復帰・ペースト送出を妨げないため）。
 //!
 //! 状態はホットキースレッドのthread_localに持つ。`TrackPopupMenu`のモーダル
-//! ループ中は、`show_popup_menu`が持つ`&mut HotkeyContext`をまたいで`wndproc`が
+//! ループ中は、`show_popup_menu`が`&HotkeyContext`を持ったまま`wndproc`が
 //! 再入するため、コンテキスト経由ではなく自己完結したセッションにしている。
 //!
 //! 表示内容は選択時に遅延読み込みする（メニュー構築時のI/Oを増やさない）。
