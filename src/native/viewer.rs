@@ -119,11 +119,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use uuid::Uuid;
 
-// 【読み上げ】ここから — 一覧の読み上げ用の文字列（要件ではない）。
-// このマーカーの対（開始と終了の行を含む）の範囲をすべて消すと外れる（マーカーはこのファイルの中だけ）
-use windows::Win32::UI::Controls::{LVIF_TEXT, LVN_GETDISPINFOW, NMLVDISPINFOW};
-// 【読み上げ】ここまで
-
 use crate::native::model::{
     delete_folder_message, EntryKind, Row, RowCommand, RowMenu, RowTarget, Source, ToolCommand, TreeCommand, TreeMenu,
     TreeNode, HISTORY_LABEL,
@@ -3122,36 +3117,6 @@ unsafe extern "system" fn image_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
     }
 }
 
-// 【読み上げ】ここから
-/// 自前で描いている一覧でも、読み上げソフト（Narrator 等）は項目のテキストを
-/// LVN_GETDISPINFOW で取りに来るため、画面の2行（タイトルと、経過時間・形式）をつないで返す。
-/// このテキストは画面には描かない（行は WM_DRAWITEM で描く）。
-unsafe fn fill_dispinfo(ctx: &WindowCtx, info: &mut NMLVDISPINFOW) {
-    if (info.item.mask & LVIF_TEXT).0 == 0 || info.item.pszText.is_null() || info.item.cchTextMax <= 0 {
-        return;
-    }
-    let view = ctx.view.borrow();
-    let now = crate::native::model::unix_now();
-    let text = view.rows.get(info.item.iItem as usize).map_or(String::new(), |row| accessible_text(row, now));
-    let max = info.item.cchTextMax as usize - 1;
-    let units: Vec<u16> = text.encode_utf16().take(max).collect();
-    unsafe {
-        std::ptr::copy_nonoverlapping(units.as_ptr(), info.item.pszText.0, units.len());
-        *info.item.pszText.0.add(units.len()) = 0;
-    }
-}
-
-/// 読み上げ用の項目のテキスト（2行目が空なら1行目だけ）。`now` は UNIX 秒。
-fn accessible_text(row: &Row, now: f64) -> String {
-    let detail = row.detail(now);
-    if detail.is_empty() {
-        row.label.clone()
-    } else {
-        format!("{}、{}", row.label, detail)
-    }
-}
-// 【読み上げ】ここまで
-
 /// 一覧の選択が変わったことを、ハンドラへ伝える予約をする。1回のクリックや範囲選択でも
 /// 通知は「全部の選択を外す」「選ぶ」など複数届くため、その場では伝えず、自分宛てに
 /// `WM_APP_SELECTION` を1回だけ送っておき、それを処理するときに選択を数え直して1回だけ伝える
@@ -4303,12 +4268,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     return DefWindowProcW(hwnd, msg, wparam, lparam);
                 };
                 match (hdr.idFrom as i32, hdr.code) {
-                    // 【読み上げ】ここから（外すと、この通知は下の既定の処理へ流れ、項目の文字列は空になる）
-                    (ID_LIST, LVN_GETDISPINFOW) => {
-                        fill_dispinfo(ctx, &mut *(lparam.0 as *mut NMLVDISPINFOW));
-                        LRESULT(0)
-                    }
-                    // 【読み上げ】ここまで
                     (ID_LIST, LVN_ITEMCHANGED) => {
                         let nm = &*(lparam.0 as *const NMLISTVIEW);
                         let selection_changed = (nm.uChanged.0 & LVIF_STATE.0) != 0
@@ -4743,9 +4702,6 @@ mod tests {
     use crate::native::model::EntryKind;
     use std::cell::Cell;
     use uuid::Uuid;
-    // 【読み上げ】ここから
-    use windows::Win32::UI::Controls::{LVM_GETITEMCOUNT, LVM_GETITEMTEXTW};
-    // 【読み上げ】ここまで
     use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, IsWindow, PeekMessageW, MSG, PM_REMOVE};
 
     #[derive(Default)]
@@ -4883,17 +4839,6 @@ mod tests {
         unsafe { GetDlgItem(Some(window.hwnd()), ID_LIST).unwrap() }
     }
 
-    // 【読み上げ】ここから
-    fn item_text(list: HWND, index: usize) -> String {
-        let mut buf = [0u16; 256];
-        let item = LVITEMW { pszText: PWSTR(buf.as_mut_ptr()), cchTextMax: buf.len() as i32, ..Default::default() };
-        let len = unsafe {
-            SendMessageW(list, LVM_GETITEMTEXTW, Some(WPARAM(index)), Some(LPARAM(&item as *const _ as isize))).0
-        };
-        String::from_utf16_lossy(&buf[..len as usize])
-    }
-    // 【読み上げ】ここまで
-
     /// ウィンドウは非表示で作られ、一覧・ツリー・プレビューの子コントロールを持つ。
     #[test]
     fn create_makes_hidden_window_with_child_controls() {
@@ -4957,27 +4902,6 @@ mod tests {
         drop(window);
         assert_eq!(Rc::strong_count(&recorder), 1);
     }
-
-    // 【読み上げ】ここから
-    /// 自前で描く一覧でも、項目のテキスト（読み上げソフトが読む）は画面の2行をつないで返す。
-    /// 2行目の経過時間は取り出したときの時刻で作る。2行目が空ならタイトルだけ。
-    #[test]
-    fn list_reports_row_label_and_detail_as_item_text() {
-        let _gui = crate::tray::lock_gui_resource_tests();
-        let (window, _recorder) = create_test_window();
-        let with_detail = Row {
-            modified: crate::native::model::unix_now() - 150.0,
-            formats: "CF_UNICODETEXT".to_string(),
-            ..row("二件目")
-        };
-        set_rows(window.hwnd(), vec![row("一件目"), with_detail, row("三件目")], false);
-        let list = list(&window);
-        assert_eq!(unsafe { SendMessageW(list, LVM_GETITEMCOUNT, None, None).0 }, 3);
-        assert_eq!(item_text(list, 0), "一件目");
-        assert_eq!(item_text(list, 1), "二件目、2分前 — CF_UNICODETEXT");
-        assert_eq!(item_text(list, 2), "三件目");
-    }
-    // 【読み上げ】ここまで
 
     /// 先頭に新しい行が入っても、選んでいた項目を UUID で選び直す。
     #[test]
