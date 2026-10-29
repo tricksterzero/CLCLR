@@ -52,8 +52,6 @@ pub enum OpError {
     TimedOut,
     /// 最後の保存で、インデックスから消せていない履歴の項目が残った
     Unsaved(usize),
-    /// 別の `Core` の受け付けの `Ticket` を渡された（呼び出し側の誤り）
-    ForeignTicket,
     /// 項目はメモリから除いたが、履歴のインデックス（history.toml）を書き直せなかった。あとの操作と最後の保存で
     /// 書き直す（それまでに異常終了すると、次の起動で除いた項目が戻る）。利用者に知らせるために返す
     IndexNotSaved(StorageError),
@@ -80,7 +78,6 @@ impl fmt::Display for OpError {
             Self::Empty => write!(f, "項目に形式がありません"),
             Self::TimedOut => write!(f, "処理中の操作が終わらないため、保存しませんでした"),
             Self::Unsaved(n) => write!(f, "履歴のインデックスから {n} 件を消せていません"),
-            Self::ForeignTicket => write!(f, "別の受け付けの登録が渡されました"),
             Self::IndexNotSaved(e) => {
                 write!(f, "履歴のファイルへ書けませんでした（項目は消しました。あとで書き直します）: {e}")
             }
@@ -524,8 +521,7 @@ impl Core {
 
     /// `load_for_send` を、呼び出し側が持つ受け付けの登録（`ticket`）の下で行う。読み込みの後の
     /// 書き込みまでを1つの登録で覆うときに使う（ビューアの操作）。受け付けは取り直さない
-    /// ので、登録の後に終了処理が受け付けを閉じても読み込みは続く。`ticket` はこの `Core`（の複製）の
-    /// ものでなければ `ForeignTicket`。
+    /// ので、登録の後に終了処理が受け付けを閉じても読み込みは続く。`ticket` はこの `Core`（の複製）のもの。
     pub fn load_for_send_admitted(&self, ticket: &Ticket, id: Uuid, pinned: bool) -> Result<Entry, OpError> {
         self.read_source_admitted(ticket, id, pinned, |source| source.load_strict()?.ok_or(OpError::Empty))
     }
@@ -536,17 +532,15 @@ impl Core {
         self.read_source_admitted(ticket, id, pinned, |source| Ok(source.load_image()?))
     }
 
-    /// 登録（`ticket`）の下で、操作用のロックを持って項目の読み込み元を取り、`read` で読む。
+    /// 登録（`Ticket`。持っていることを引数で求める）の下で、操作用のロックを持って項目の読み込み元を取り、
+    /// `read` で読む。
     fn read_source_admitted<T>(
         &self,
-        ticket: &Ticket,
+        _ticket: &Ticket,
         id: Uuid,
         pinned: bool,
         read: impl FnOnce(EntrySource) -> Result<T, OpError>,
     ) -> Result<T, OpError> {
-        if !Arc::ptr_eq(&self.inner, &ticket.inner) {
-            return Err(OpError::ForeignTicket);
-        }
         let mut ops = self.inner.ops.lock().map_err(|_| OpError::Poisoned)?;
         retry_pending(&self.inner, &mut ops);
         let source = self
@@ -1104,17 +1098,13 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    /// 登録（`Ticket`）の下での読み込みは、別の `Core` の登録を断り、同じ `Core` の複製の登録は
-    /// 通す。登録の後に終了処理が受け付けを閉じても読み込みは続き、終了処理は登録が外れるまで待つ。
+    /// 登録（`Ticket`）の下での読み込みは、同じ `Core` の複製の登録で通る。登録の後に終了処理が受け付けを
+    /// 閉じても読み込みは続き、終了処理は登録が外れるまで待つ。
     #[test]
-    fn load_admitted_checks_ticket_owner_and_continues_after_closing() {
+    fn load_admitted_continues_after_closing() {
         let (dir_a, a) = temp_core(Config::default());
-        let (dir_b, b) = temp_core(Config::default());
         a.capture(text_entry("A")).unwrap();
         let id = front_id(&a);
-        let foreign = b.admit().unwrap();
-        assert!(matches!(a.load_for_send_admitted(&foreign, id, false), Err(OpError::ForeignTicket)));
-        drop(foreign);
 
         let ticket = a.clone().admit().unwrap();
         let shutdown = {
@@ -1135,7 +1125,6 @@ pub(crate) mod tests {
         drop(ticket);
         shutdown.join().unwrap().unwrap();
         let _ = std::fs::remove_dir_all(dir_a);
-        let _ = std::fs::remove_dir_all(dir_b);
     }
 
     /// 実際に音が鳴ったかまでは検証できないが、空文字列（システムビープへのフォールバック）、
