@@ -905,7 +905,8 @@ fn entry_for_send(
     if text_only {
         entry.retain_text_only();
     }
-    if pinned { crate::tools::text::convert_entry_date(entry, text_cfg) } else { entry }
+    use crate::tools::text::{convert_entry_date, DateText};
+    if pinned { convert_entry_date(entry, text_cfg, || DateText::now(text_cfg)) } else { entry }
 }
 
 /// 登録できなかったときは、その説明を返す（設定の値が登録できないものだったときも）。無効なら何もしない。

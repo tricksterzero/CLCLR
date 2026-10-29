@@ -181,42 +181,63 @@ fn word_break(text: &str, width: usize) -> String {
     out
 }
 
-/// 日時変換（C版 CLCL の tool_text convert_date）: `%d`→日付、`%t`→時刻に置換する。
-/// ピン留めアイテムの送出時に自動適用される（定型文テンプレート用途。C版の
-/// 「データをクリップボードに送る時」相当）。書式が空ならロケール既定の表記。
-pub fn convert_date(text: &str, date_format: &str, time_format: &str) -> String {
-    if !text.contains("%d") && !text.contains("%t") {
-        return text.to_string();
+/// 日時変換の `%d`・`%t` の置き換え先（送る時点の日付・時刻の文字列）。
+pub struct DateText {
+    pub date: String,
+    pub time: String,
+}
+
+impl DateText {
+    /// 今の日付・時刻を、設定の書式（GetDateFormatW/GetTimeFormatW形式）で文字列にする。書式が空なら
+    /// ロケール既定の表記。書式が正しくなければ、書式そのものを入れる（`format_now`）。
+    pub fn now(cfg: &TextToolsConfig) -> Self {
+        Self { date: format_now(&cfg.date_format, FormatKind::Date), time: format_now(&cfg.time_format, FormatKind::Time) }
     }
-    let date = format_now(date_format, FormatKind::Date);
-    let time = format_now(time_format, FormatKind::Time);
-    text.replace("%d", &date).replace("%t", &time)
+}
+
+/// 日時変換（C版 CLCL の tool_text convert_date）: `%d`→日付、`%t`→時刻に置換する（`now` の文字列で。
+/// 今の日時は読まない）。
+fn convert_date(text: &str, now: &DateText) -> String {
+    text.replace("%d", &now.date).replace("%t", &now.time)
+}
+
+/// `%d`・`%t` を含むか。
+fn has_date_placeholder(text: &str) -> bool {
+    text.contains("%d") || text.contains("%t")
 }
 
 /// ピン留めアイテムの送出前処理: 設定が有効ならテキスト中の %d/%t を日時に
-/// 変換した複製を返す（C版 CLCL の tool_text の日時変換。定型文テンプレート用途）。
-/// メニュー送出（hotkey.rs）とビューア送出（native/actions.rs）で共用する。
+/// 変換した複製を返す（C版 CLCL の tool_text の日時変換。定型文テンプレート用途。C版の
+/// 「データをクリップボードに送る時」相当）。メニュー送出（hotkey.rs）とビューア送出（native/actions.rs）で共用する。
+/// 置き換え先の日時は `now` で得る（呼び出し側は `|| DateText::now(cfg)` を渡す）。`now` を呼ぶのは、設定が
+/// 有効で、CF_UNICODETEXT に %d/%t があるときだけ（1回）。
 ///
 /// 置き換えたときは CF_UNICODETEXT だけを残す。ほかの形式（形式フィルタで足した HTML Format・
 /// Rich Text Format など）は置き換えられないため、残すと貼り付け先がそちらを選び、%d/%t のままの
 /// 内容が貼られる。置き換えるものが無ければ、全形式をそのまま返す。
-pub fn convert_entry_date(mut entry: crate::data::Entry, cfg: &TextToolsConfig) -> crate::data::Entry {
-    if !cfg.convert_date_on_send {
+pub fn convert_entry_date(
+    mut entry: crate::data::Entry,
+    cfg: &TextToolsConfig,
+    now: impl FnOnce() -> DateText,
+) -> crate::data::Entry {
+    let is_text = |fmt: &crate::data::Format| fmt.format_name == "CF_UNICODETEXT";
+    let placeholders =
+        entry.formats.iter().any(|fmt| is_text(fmt) && has_date_placeholder(&crate::data::utf16_text(&fmt.data)));
+    if !cfg.convert_date_on_send || !placeholders {
         return entry;
     }
+    let now = now();
     let mut replaced = false;
-    for fmt in &mut entry.formats {
-        if fmt.format_name == "CF_UNICODETEXT" {
-            let text = crate::data::utf16_text(&fmt.data);
-            let converted = convert_date(&text, &cfg.date_format, &cfg.time_format);
-            if converted != text {
-                fmt.data = crate::data::utf16_bytes(&converted);
-                replaced = true;
-            }
+    for fmt in entry.formats.iter_mut().filter(|fmt| is_text(fmt)) {
+        let text = crate::data::utf16_text(&fmt.data);
+        let converted = convert_date(&text, &now);
+        if converted != text {
+            fmt.data = crate::data::utf16_bytes(&converted);
+            replaced = true;
         }
     }
     if replaced {
-        entry.formats.retain(|fmt| fmt.format_name == "CF_UNICODETEXT");
+        entry.formats.retain(is_text);
     }
     entry
 }
@@ -326,22 +347,37 @@ mod tests {
         assert_eq!(word_break("ab\r\ncd", 10), "ab\r\ncd");
     }
 
-    #[test]
-    fn convert_date_replaces_placeholders() {
-        let out = convert_date("日付:%d 時刻:%t", "", "");
-        assert!(!out.contains("%d") && !out.contains("%t"));
-        assert!(out.starts_with("日付:") && out.len() > "日付: 時刻:".len());
-        // プレースホルダなしはそのまま（日時取得もしない）
-        assert_eq!(convert_date("そのまま", "", ""), "そのまま");
+    /// テストで渡す決まった日時。
+    fn fixed() -> DateText {
+        DateText { date: "2026/10/30".to_string(), time: "12:34".to_string() }
     }
 
+    /// 今の日時を読んではいけない場面で渡す（呼ばれたらテストを失敗させる）。
+    fn never() -> DateText {
+        panic!("今の日時を読んだ")
+    }
+
+    /// `%d` は日付、`%t` は時刻の文字列に、どれも（何回出ても）置き換える。無ければそのまま。
     #[test]
-    fn convert_date_uses_explicit_format() {
-        let out = convert_date("%d", "yyyy-MM-dd", "");
-        // yyyy-MM-dd → 4桁-2桁-2桁
-        assert_eq!(out.len(), 10);
-        assert_eq!(out.as_bytes()[4], b'-');
-        assert_eq!(out.as_bytes()[7], b'-');
+    fn convert_date_replaces_every_placeholder_with_given_text() {
+        assert_eq!(convert_date("日付:%d 時刻:%t 再び:%d", &fixed()), "日付:2026/10/30 時刻:12:34 再び:2026/10/30");
+        assert_eq!(convert_date("そのまま", &fixed()), "そのまま");
+        assert_eq!(convert_date("", &fixed()), "");
+    }
+
+    /// 今の日時を設定の書式（GetDateFormatW・GetTimeFormatW の形式）で文字列にする。書式が空ならロケール既定の表記。
+    #[test]
+    fn date_text_now_uses_format_or_locale_default() {
+        let mut c = cfg();
+        c.date_format = "yyyy-MM-dd".to_string();
+        c.time_format = "HH:mm".to_string();
+        let now = DateText::now(&c);
+        // yyyy-MM-dd → 4桁-2桁-2桁、HH:mm → 2桁:2桁
+        assert_eq!((now.date.len(), now.date.as_bytes()[4], now.date.as_bytes()[7]), (10, b'-', b'-'), "{}", now.date);
+        assert_eq!((now.time.len(), now.time.as_bytes()[2]), (5, b':'), "{}", now.time);
+
+        let default = DateText::now(&cfg());
+        assert!(!default.date.is_empty() && !default.time.is_empty(), "{} {}", default.date, default.time);
     }
 
     /// 全角の英数字・記号の93文字はどれも ASCII の `!`〜`}` に、全角スペースは半角スペースに、`￥` は U+00A5 になる。
@@ -370,12 +406,13 @@ mod tests {
         }
     }
 
+    /// 無効なら何も変えず、今の日時も読まない。
     #[test]
     fn convert_entry_date_is_noop_when_disabled() {
         let mut c = cfg();
         c.convert_date_on_send = false;
         let entry = crate::data::Entry::new(vec![unicodetext_format("%d固定")]);
-        let converted = convert_entry_date(entry, &c);
+        let converted = convert_entry_date(entry, &c, never);
         assert_eq!(
             crate::data::utf16_text(&converted.formats[0].data),
             "%d固定"
@@ -389,11 +426,11 @@ mod tests {
         let entry = crate::data::Entry::new(vec![crate::data::Format {
             format_name: "CF_HDROP".to_string(),
             format_id: 15,
-            data: b"C:\\a.txt".to_vec(),
+            data: b"C:\\%d.txt".to_vec(),
         }]);
-        let converted = convert_entry_date(entry, &c);
-        // CF_UNICODETEXTではないため変換対象にならず、バイト列はそのまま
-        assert_eq!(converted.formats[0].data, b"C:\\a.txt");
+        let converted = convert_entry_date(entry, &c, never);
+        // CF_UNICODETEXTではないため変換対象にならず（今の日時も読まず）、バイト列はそのまま
+        assert_eq!(converted.formats[0].data, b"C:\\%d.txt");
     }
 
     fn html_format(html: &str) -> crate::data::Format {
@@ -408,21 +445,22 @@ mod tests {
     fn convert_entry_date_keeps_only_text_when_replaced() {
         let mut c = cfg();
         c.convert_date_on_send = true;
-        let entry = crate::data::Entry::new(vec![html_format("<b>%d</b>"), unicodetext_format("日付:%d")]);
-        let converted = convert_entry_date(entry, &c);
-        // 置き換えられない HTML Format は外し、置き換えたテキストだけを送る
+        let entry = crate::data::Entry::new(vec![html_format("<b>%d</b>"), unicodetext_format("日付:%d 時刻:%t")]);
+        let converted = convert_entry_date(entry, &c, fixed);
+        // 置き換えられない HTML Format は外し、渡した日時で置き換えたテキストだけを送る
         assert_eq!(format_names(&converted), ["CF_UNICODETEXT"]);
-        assert!(!crate::data::utf16_text(&converted.formats[0].data).contains("%d"));
+        assert_eq!(crate::data::utf16_text(&converted.formats[0].data), "日付:2026/10/30 時刻:12:34");
     }
 
+    /// 置き換えるものが無ければ全形式をそのまま返し、今の日時も読まない。
     #[test]
     fn convert_entry_date_keeps_all_formats_without_placeholders() {
         let mut c = cfg();
         c.convert_date_on_send = true;
-        let entry = crate::data::Entry::new(vec![html_format("<b>固定</b>"), unicodetext_format("固定")]);
-        let converted = convert_entry_date(entry, &c);
+        let entry = crate::data::Entry::new(vec![html_format("<b>%d</b>"), unicodetext_format("固定")]);
+        let converted = convert_entry_date(entry, &c, never);
         assert_eq!(format_names(&converted), ["HTML Format", "CF_UNICODETEXT"]);
-        assert_eq!(converted.formats[0].data, "<b>固定</b>".as_bytes());
+        assert_eq!(converted.formats[0].data, "<b>%d</b>".as_bytes());
     }
 
     #[test]
@@ -430,7 +468,7 @@ mod tests {
         let mut c = cfg();
         c.convert_date_on_send = false;
         let entry = crate::data::Entry::new(vec![html_format("<b>%d</b>"), unicodetext_format("%d")]);
-        let converted = convert_entry_date(entry, &c);
+        let converted = convert_entry_date(entry, &c, never);
         assert_eq!(format_names(&converted), ["HTML Format", "CF_UNICODETEXT"]);
     }
 
@@ -439,7 +477,7 @@ mod tests {
         let mut c = cfg();
         c.convert_date_on_send = true;
         let entry = crate::data::Entry::new(vec![unicodetext_format("プレースホルダなし")]);
-        let converted = convert_entry_date(entry, &c);
+        let converted = convert_entry_date(entry, &c, never);
         assert_eq!(
             crate::data::utf16_text(&converted.formats[0].data),
             "プレースホルダなし"

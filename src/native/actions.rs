@@ -44,7 +44,7 @@ use crate::folder_security::FolderReport;
 use crate::ops::{Core, OpError};
 use crate::service::ImageData;
 use crate::store::Direction;
-use crate::tools::text::{convert_entry_date, TextTransform};
+use crate::tools::text::{convert_entry_date, DateText, TextTransform};
 
 /// 同時に起動中にできる「関連付けで開く」の数（ダイアログを閉じずに開き続けても、Shell
 /// スレッドが増え続けないようにする）。
@@ -718,7 +718,7 @@ impl<E: Effects> Worker<E> {
             let cfg = self.config.read().unwrap_or_else(|p| p.into_inner());
             (cfg.history.delete_on_send, cfg.tools.text.clone())
         };
-        let entry = if pinned { convert_entry_date(entry, &text_cfg) } else { entry };
+        let entry = if pinned { convert_entry_date(entry, &text_cfg, || DateText::now(&text_cfg)) } else { entry };
         self.effects.write_send(&self.port, &entry.formats, delete_on_send).map_err(Stop::Failed)?;
         drop(ticket);
         Ok(())
