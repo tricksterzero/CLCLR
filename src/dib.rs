@@ -224,6 +224,14 @@ pub(crate) fn scale_rgba(w: u32, h: u32, rgba: Vec<u8>, max_edge: u32) -> (u32, 
     (tw, th, downscale_box(&rgba, w, h, 4, tw, th))
 }
 
+/// RGBA（アルファを掛けていない）を、`AlphaBlend`（`AC_SRC_ALPHA`）が求めるアルファを掛けた BGRA にする（色は
+/// 四捨五入）。長さが 4 の倍数でなければ、末尾の端数は出力に含めない。ホットキー・トレイのメニューの画像と、
+/// ビューアの画像（native/images.rs）で共用する。
+pub fn premultiplied_bgra(rgba: &[u8]) -> Vec<u8> {
+    let mul = |c: u8, a: u8| ((u16::from(c) * u16::from(a) + 127) / 255) as u8;
+    rgba.chunks_exact(4).flat_map(|p| [mul(p[2], p[3]), mul(p[1], p[3]), mul(p[0], p[3]), p[3]]).collect()
+}
+
 /// `webp_to_rgba_scaled` が展開してよい原寸の大きさ（RGBA に換算したバイト数。2048 × 2048 相当）。
 pub const SCALED_WEBP_MAX_BYTES: u64 = 2048 * 2048 * 4;
 
@@ -615,6 +623,22 @@ pub(crate) fn build_dib_32bpp(width: u32, height: u32, pixels: &[u8], has_alpha:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RGBA を BGRA へ並べ替え、色にアルファを掛ける（四捨五入）。アルファが 0 なら色も 0、255 なら色はそのまま。
+    /// 長さが 4 の倍数でなければ、末尾の端数は出力に含めない。
+    #[test]
+    fn premultiplied_bgra_swaps_channels_and_multiplies_alpha() {
+        assert_eq!(premultiplied_bgra(&[10, 20, 30, 255]), vec![30, 20, 10, 255]);
+        assert_eq!(premultiplied_bgra(&[255, 128, 0, 255]), vec![0, 128, 255, 255]);
+        assert_eq!(premultiplied_bgra(&[200, 100, 50, 0]), vec![0, 0, 0, 0]);
+        assert_eq!(premultiplied_bgra(&[255, 255, 255, 128]), vec![128, 128, 128, 128]);
+        assert_eq!(premultiplied_bgra(&[200, 100, 50, 128]), vec![25, 50, 100, 128]);
+        // 2画素
+        assert_eq!(premultiplied_bgra(&[10, 20, 30, 255, 200, 100, 50, 0]), vec![30, 20, 10, 255, 0, 0, 0, 0]);
+        // 空と端数
+        assert_eq!(premultiplied_bgra(&[]), Vec::<u8>::new());
+        assert_eq!(premultiplied_bgra(&[10, 20, 30, 255, 1, 2, 3]), vec![30, 20, 10, 255]);
+    }
 
     /// ヘッダーの幅・高さ・`biClrUsed` が極端な値でも、必要な長さの計算が桁あふれせず、パニックせずに
     /// 誤りを返す（ほかのアプリがクリップボードに置く信頼できない入力）。

@@ -418,6 +418,11 @@ pub fn build_tree(history_len: usize, grouping: &HistoryGroupingConfig, pinned: 
     ]
 }
 
+/// ツリーの構成（`build_tree`）に `source` の項目があるか（入れ子の中も探す）。
+pub fn tree_contains(nodes: &[TreeNode], source: Source) -> bool {
+    nodes.iter().any(|n| n.source == source || tree_contains(&n.children, source))
+}
+
 fn pinned_folders(nodes: &[PinnedNode]) -> Vec<TreeNode> {
     nodes
         .iter()
@@ -625,6 +630,23 @@ mod tests {
         let row = folder_row(&folder);
         assert_eq!((row.label.as_str(), row.detail(0.0).as_str()), ("箱", "フォルダ — 項目 1 件、フォルダ 1 個"));
         assert_eq!(row.target(), RowTarget { id: folder.id, pinned: true, folder: true });
+    }
+
+    /// ツリーの構成に表示元があるか（根・入れ子の深い所も探す。無ければ false、空の構成も false）。
+    #[test]
+    fn tree_contains_searches_nested_nodes() {
+        let node = |source: Source, children: Vec<TreeNode>| TreeNode { label: String::new(), source, children };
+        let (outer, inner, missing) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let tree = vec![
+            node(Source::History, vec![node(Source::HistoryGroup(0), vec![])]),
+            node(Source::Pinned(None), vec![node(Source::Pinned(Some(outer)), vec![node(Source::Pinned(Some(inner)), vec![])])]),
+        ];
+        for source in [Source::History, Source::HistoryGroup(0), Source::Pinned(None), Source::Pinned(Some(outer)), Source::Pinned(Some(inner))] {
+            assert!(tree_contains(&tree, source), "{source:?} が見つからない");
+        }
+        assert!(!tree_contains(&tree, Source::HistoryGroup(1)));
+        assert!(!tree_contains(&tree, Source::Pinned(Some(missing))));
+        assert!(!tree_contains(&[], Source::History));
     }
 
     #[test]

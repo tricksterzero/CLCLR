@@ -43,6 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW, WS_OVERLAPPED,
 };
 
+use crate::busy::BusyGuard;
 use crate::menu_draw::{self, PopupMenu};
 
 // --- Public events ---
@@ -251,22 +252,6 @@ fn show_icon(hwnd: HWND, ctx: &TrayContext) {
     ctx.icon_shown.store(shown, Ordering::SeqCst);
     if !shown {
         eprintln!("トレイアイコンを通知領域に付けられませんでした（タスクバーができたら付け直します）");
-    }
-}
-
-/// `menu_open`を、スコープを抜ける（早期returnを含む）ときに必ず下ろす。
-struct BusyGuard<'a>(&'a Cell<bool>);
-
-impl<'a> BusyGuard<'a> {
-    fn enter(flag: &'a Cell<bool>) -> Self {
-        flag.set(true);
-        Self(flag)
-    }
-}
-
-impl Drop for BusyGuard<'_> {
-    fn drop(&mut self) {
-        self.0.set(false);
     }
 }
 

@@ -27,6 +27,7 @@ use windows::core::HSTRING;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, PostMessageW, PostQuitMessage, MB_ICONWARNING, MB_OK};
 
+use crate::busy::BusyGuard;
 use crate::clipboard::ClipboardWatcher;
 use crate::config::{merge_edit, Config, ConfigIssue};
 use crate::data::{utf16_text, Format};
@@ -139,15 +140,6 @@ pub enum ApplyError {
     Save(String),
     /// 今は反映できない（反映の途中・終了の要求の後・メニューやダイアログ・失敗の通知の表示中。何もしていない）
     Busy,
-}
-
-/// スコープを抜けると `Cell<bool>` を下ろす（早期の return・パニックでも）。
-struct FlagReset<'a>(&'a Cell<bool>);
-
-impl Drop for FlagReset<'_> {
-    fn drop(&mut self) {
-        self.0.set(false);
-    }
 }
 
 /// 操作スレッドとのつなぎ。依頼の送り手を手放すと操作スレッドは終わる。
@@ -694,8 +686,7 @@ impl App {
         if !issues.is_empty() {
             return Err(ApplyError::Invalid(issues));
         }
-        self.applying.set(true);
-        let _applying = FlagReset(&self.applying);
+        let _applying = BusyGuard::enter(&self.applying);
 
         // 再入しない区間
         let current = self.config.read().unwrap().clone();
@@ -831,7 +822,7 @@ impl App {
         let read = self.core.read(|service| {
             let tree = model::build_tree(service.history.len(), &grouping, &service.pinned);
             // 表示中の対象が消えた（ピン留めフォルダの削除、階層フォルダの減少）ときは履歴へ戻す
-            let source = if tree_contains(&tree, current) { current } else { Source::History };
+            let source = if model::tree_contains(&tree, current) { current } else { Source::History };
             let listing = if needle.is_empty() {
                 Listing::Rows(model::rows_for(service, source, &grouping))
             } else {
@@ -918,10 +909,6 @@ impl App {
             Some(PreviewContent::Nothing) | None => viewer::set_preview_none(hwnd),
         }
     }
-}
-
-fn tree_contains(nodes: &[TreeNode], source: Source) -> bool {
-    nodes.iter().any(|n| n.source == source || tree_contains(&n.children, source))
 }
 
 fn resident_head(formats: &[Format], name: &str, cap: usize) -> Option<ResidentHead> {

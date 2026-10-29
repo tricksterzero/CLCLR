@@ -150,7 +150,7 @@ impl Thumbnail {
             }
             return None;
         }
-        let bgra = premultiplied_bgra(rgba);
+        let bgra = crate::dib::premultiplied_bgra(rgba);
         unsafe {
             std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits.cast::<u8>(), bgra.len());
         }
@@ -164,12 +164,6 @@ impl Drop for Thumbnail {
             let _ = DeleteObject(self.hbmp.into());
         }
     }
-}
-
-/// RGBA（アルファを掛けていない）を、`AlphaBlend`（`AC_SRC_ALPHA`）が求めるアルファを掛けた BGRA にする。
-fn premultiplied_bgra(rgba: &[u8]) -> Vec<u8> {
-    let mul = |c: u8, a: u8| ((u16::from(c) * u16::from(a) + 127) / 255) as u8;
-    rgba.chunks_exact(4).flat_map(|p| [mul(p[2], p[3]), mul(p[1], p[3]), mul(p[0], p[3]), p[3]]).collect()
 }
 
 /// 項目の左の欄に出す画像。
@@ -1034,13 +1028,6 @@ mod tests {
         // 200%: 段の幅 32、太さ 2
         let at_192 = guide_rects(&[TreeGuide::Branch], 0, 0, 48, 192);
         assert_eq!(at_192, [RECT { left: 16, top: 0, right: 18, bottom: 48 }, RECT { left: 16, top: 24, right: 30, bottom: 26 }]);
-    }
-
-    #[test]
-    fn premultiplies_and_swaps_to_bgra() {
-        assert_eq!(premultiplied_bgra(&[255, 128, 0, 255]), vec![0, 128, 255, 255]);
-        assert_eq!(premultiplied_bgra(&[255, 255, 255, 0]), vec![0, 0, 0, 0]);
-        assert_eq!(premultiplied_bgra(&[200, 100, 50, 128]), vec![25, 50, 100, 128]);
     }
 
     /// 32bpp のメモリ DC（`MemoryCanvas` は画面と同じ形式）に描いて画素を読む。

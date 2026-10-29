@@ -38,6 +38,7 @@ use crate::config::{
     self, Config, ConfigIssue, DoublePressAction, FilterAction, FormatFilter, MenuPosition, NumberField, OverlapCheck,
     WindowFilter,
 };
+use crate::busy::BusyGuard;
 use crate::native::app::ApplyError;
 
 include!(concat!(env!("OUT_DIR"), "/resource_ids.rs"));
@@ -781,8 +782,7 @@ fn fill_editor(ctx: &Ctx, rl: &RowList) {
     // 値を写してから UI を呼ぶ（入力欄への書き込みは同期の通知を起こす）
     let format = (rl.page == PAGE_FORMAT).then(|| selected.and_then(|i| ctx.formats.borrow().get(i).cloned()));
     let window = (rl.page == PAGE_WINDOW).then(|| selected.and_then(|i| ctx.windows.borrow().get(i).cloned()));
-    ctx.syncing.set(true);
-    let _syncing = FlagReset(&ctx.syncing);
+    let _syncing = BusyGuard::enter(&ctx.syncing);
     match (format, window) {
         (Some(row), _) => {
             let row = row.unwrap_or_else(|| FormatRow { limit_text: String::new(), ..FormatRow::new() });
@@ -867,8 +867,7 @@ fn store_field(ctx: &Ctx, rl: &RowList, id: i32) {
 /// （途中の通知で、確定する前の行や「選択なし」を入力欄に出さない）。
 fn with_rows_changing(ctx: &Ctx, rl: &RowList, change: impl FnOnce()) {
     {
-        ctx.suppress.set(true);
-        let _suppress = FlagReset(&ctx.suppress);
+        let _suppress = BusyGuard::enter(&ctx.suppress);
         change();
     }
     fill_editor(ctx, rl);
@@ -1186,15 +1185,6 @@ fn request_close(dialog: HWND) {
     post_close(dialog, ctx);
 }
 
-/// スコープを抜けると `Cell<bool>` を下ろす（早期の return でも）。
-struct FlagReset<'a>(&'a Cell<bool>);
-
-impl Drop for FlagReset<'_> {
-    fn drop(&mut self) {
-        self.0.set(false);
-    }
-}
-
 /// OK: ドラフトを作り、`on_ok` を呼ぶ。成功（または処理中の閉じる要求）で閉じ、誤りはウィンドウの中に出して開いたまま。
 fn press_ok(dialog: HWND) {
     let Some(ctx) = (unsafe { ctx_ref(dialog) }) else {
@@ -1215,9 +1205,8 @@ fn press_ok(dialog: HWND) {
     // 反映の間に使うものを手元に持つ（反映の中でメッセージを処理しても、コンテキストの中を参照し続けない）
     let base = ctx.base.clone();
     let on_ok = Rc::clone(&ctx.on_ok);
-    ctx.ok_running.set(true);
     let result = {
-        let _running = FlagReset(&ctx.ok_running);
+        let _running = BusyGuard::enter(&ctx.ok_running);
         on_ok(&base, &draft)
     };
     // OK の処理中は破棄の入口が働かないので、コンテキストはまだある

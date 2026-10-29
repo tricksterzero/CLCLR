@@ -40,6 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_MENUSELECT, WM_NCCREATE, WM_SYSKEYUP, WM_TIMER, WM_USER, WNDCLASSW, WS_OVERLAPPED,
 };
 
+use crate::busy::BusyGuard;
 use crate::clipboard::ClipboardPort;
 use crate::config::{Config, DoublePressAction, Hotkey, MenuPosition};
 use crate::data::EntryKind;
@@ -160,22 +161,6 @@ struct HotkeyContext {
 /// 返す参照は`WM_DESTROY`まで有効（ポップアップ処理中は解放されない）。
 unsafe fn ctx_ref<'a>(hwnd: HWND) -> Option<&'a HotkeyContext> {
     unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const HotkeyContext).as_ref() }
-}
-
-/// `menu_open`を、スコープを抜ける（早期returnを含む）ときに必ず下ろす。
-struct BusyGuard<'a>(&'a Cell<bool>);
-
-impl<'a> BusyGuard<'a> {
-    fn enter(flag: &'a Cell<bool>) -> Self {
-        flag.set(true);
-        Self(flag)
-    }
-}
-
-impl Drop for BusyGuard<'_> {
-    fn drop(&mut self) {
-        self.0.set(false);
-    }
 }
 
 // --- Low-level keyboard hook (double press) ---

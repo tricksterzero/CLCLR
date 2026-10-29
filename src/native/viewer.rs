@@ -139,6 +139,7 @@ use crate::store::Direction;
 use windows::Win32::Graphics::Gdi::{CreateCompatibleBitmap, MapWindowPoints, UpdateWindow, DT_CALCRECT};
 use windows::Win32::UI::Controls::{LVN_BEGINDRAG, TVGN_PARENT, TVN_BEGINDRAGW};
 use windows::Win32::UI::WindowsAndMessaging::IDC_NO;
+use crate::busy::BusyGuard;
 use crate::icons;
 use crate::menu_draw::{self, MenuBar, PopupMenu};
 use crate::tools::text::TextTransform;
@@ -2053,11 +2054,6 @@ fn rebuild_tree_now(ctx: &WindowCtx, tree: HWND, nodes: &[TreeNode], selected: S
     ctx.history_item.set(insert.history_item.map_or(0, |item| item.0));
 }
 
-/// 構成に `source` の項目があるか。
-fn nodes_contain(nodes: &[TreeNode], source: Source) -> bool {
-    nodes.iter().any(|n| n.source == source || nodes_contain(&n.children, source))
-}
-
 /// ツリーの `source` の項目（今のツリーを深さ優先で探す）。
 unsafe fn find_tree_item(ctx: &WindowCtx, tree: HWND, source: Source) -> Option<HTREEITEM> {
     unsafe fn walk(ctx: &WindowCtx, tree: HWND, first: HTREEITEM, source: Source) -> Option<HTREEITEM> {
@@ -2247,7 +2243,7 @@ unsafe fn complete_edit(hwnd: HWND, ctx: &WindowCtx) {
         let restore = ctx.edit_restore.take();
         let user_choice = ctx.edit_user_choice.take();
         let exists = |source: Source| match &pending {
-            Some((nodes, _)) => nodes_contain(nodes, source),
+            Some((nodes, _)) => crate::native::model::tree_contains(nodes, source),
             None => ctx.view.borrow().tree_tokens.contains(&source),
         };
         let chosen = [user_choice, pending.as_ref().map(|(_, selected)| *selected), restore, Some(Source::History)]
@@ -3857,22 +3853,6 @@ fn row_command(id: usize, spec: &RowMenu) -> Option<RowCommand> {
             .checked_sub(MENU_TRANSFORM_BASE)
             .and_then(|i| TextTransform::ALL.get(i))
             .map(|t| RowCommand::Transform(*t)),
-    }
-}
-
-/// `menu_open` を、スコープを抜ける（早期 return を含む）ときに必ず下ろす（hotkey・tray と同じ）。
-struct BusyGuard<'a>(&'a Cell<bool>);
-
-impl<'a> BusyGuard<'a> {
-    fn enter(flag: &'a Cell<bool>) -> Self {
-        flag.set(true);
-        Self(flag)
-    }
-}
-
-impl Drop for BusyGuard<'_> {
-    fn drop(&mut self) {
-        self.0.set(false);
     }
 }
 

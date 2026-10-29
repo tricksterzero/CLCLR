@@ -2,6 +2,7 @@
 // eprintlnによる開発時診断を見えるようにする
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod busy;
 mod clipboard;
 mod config;
 mod data;

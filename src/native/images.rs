@@ -200,7 +200,7 @@ fn fitted_webp(webp: &[u8], request: &ImageRequest, limit: u64) -> Option<ImageC
     }
     let (tw, th) = fit_size(w, h, request.max_width, request.max_height);
     let (width, height, rgba) = crate::dib::webp_to_rgba_downscaled(webp, tw, th).ok()?;
-    Some(ImageContent::Pixels { width, height, bgra: premultiplied_bgra(&rgba), source_width: w, source_height: h })
+    Some(ImageContent::Pixels { width, height, bgra: crate::dib::premultiplied_bgra(&rgba), source_width: w, source_height: h })
 }
 
 fn fitted_dib(dib: &[u8], request: &ImageRequest, limit: u64) -> Option<ImageContent> {
@@ -210,7 +210,7 @@ fn fitted_dib(dib: &[u8], request: &ImageRequest, limit: u64) -> Option<ImageCon
     }
     let (tw, th) = fit_size(w, h, request.max_width, request.max_height);
     let (width, height, rgba) = crate::dib::dib_to_rgba_downscaled(dib, tw, th).ok()?;
-    Some(ImageContent::Pixels { width, height, bgra: premultiplied_bgra(&rgba), source_width: w, source_height: h })
+    Some(ImageContent::Pixels { width, height, bgra: crate::dib::premultiplied_bgra(&rgba), source_width: w, source_height: h })
 }
 
 /// 縦横比を保って `max_width` × `max_height` に収まる大きさ（元より大きくはしない。最小1px）。
@@ -220,18 +220,6 @@ pub fn fit_size(w: u32, h: u32, max_width: u32, max_height: u32) -> (u32, u32) {
     }
     let scale = (f64::from(max_width) / f64::from(w)).min(f64::from(max_height) / f64::from(h)).min(1.0);
     (((f64::from(w) * scale).round() as u32).max(1), ((f64::from(h) * scale).round() as u32).max(1))
-}
-
-/// RGBA（アルファを掛けていない）を、アルファを掛けた BGRA にする（`AlphaBlend` の
-/// `AC_SRC_ALPHA` はアルファを掛けた値を前提とする）。
-pub fn premultiplied_bgra(rgba: &[u8]) -> Vec<u8> {
-    rgba.chunks_exact(4)
-        .flat_map(|p| {
-            let a = u32::from(p[3]);
-            let mul = |c: u8| ((u32::from(c) * a + 127) / 255) as u8;
-            [mul(p[2]), mul(p[1]), mul(p[0]), p[3]]
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -247,13 +235,6 @@ mod tests {
         assert_eq!(fit_size(1920, 1080, 800, 200), (356, 200));
         assert_eq!(fit_size(16, 16, 32, 32), (16, 16));
         assert_eq!(fit_size(4000, 1, 32, 32), (32, 1));
-    }
-
-    #[test]
-    fn premultiplied_bgra_swaps_channels_and_multiplies_alpha() {
-        assert_eq!(premultiplied_bgra(&[10, 20, 30, 255]), vec![30, 20, 10, 255]);
-        assert_eq!(premultiplied_bgra(&[200, 100, 50, 0]), vec![0, 0, 0, 0]);
-        assert_eq!(premultiplied_bgra(&[255, 255, 255, 128]), vec![128, 128, 128, 128]);
     }
 
     fn dib_32bpp(w: u32, h: u32) -> Vec<u8> {
