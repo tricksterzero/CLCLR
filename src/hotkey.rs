@@ -143,12 +143,8 @@ struct HotkeyContext {
     hook: RefCell<Option<HookThread>>,
     /// 今のフックの世代（張るたびに進める。古い世代の転送は捨てる）
     hook_generation: Cell<u32>,
-    /// 二度押し判定: 監視中の修飾キー（0=無効状態）
-    dp_vk: Cell<u32>,
-    /// 二度押し判定: 対象修飾キーのkey up回数
-    dp_count: Cell<u32>,
-    /// 二度押し判定: 前に数えた key up が起きた時刻（ミリ秒、`KBDLLHOOKSTRUCT::time`）
-    dp_last_up: Cell<u32>,
+    /// 二度押し判定の状態（数えている修飾キー・回数・前の key up の時刻）
+    double_press: Cell<DoublePress>,
     /// ポップアップ処理中に届いた設定の再登録依頼（重なった依頼は処理後に1回だけ実行する）
     reregister_pending: Cell<bool>,
     /// ポップアップ処理中に届いた終了依頼（処理後に`DestroyWindow`）
@@ -294,9 +290,7 @@ fn unpack_key_event(wparam: WPARAM, lparam: LPARAM) -> (u32, u32, u32, bool) {
 
 /// 二度押しの判定の状態とタイマーを捨てる（フックを張る・外すとき。前のフックの間に数えたものと合わせない）。
 fn reset_double_press(hwnd: HWND, ctx: &HotkeyContext) {
-    ctx.dp_vk.set(0);
-    ctx.dp_count.set(0);
-    ctx.dp_last_up.set(0);
+    ctx.double_press.set(DoublePress::default());
     unsafe {
         let _ = KillTimer(Some(hwnd), DOUBLE_PRESS_TIMER_ID);
     }
@@ -336,53 +330,59 @@ fn stop_keyboard_hook(hwnd: HWND, ctx: &HotkeyContext) {
     reset_double_press(hwnd, ctx);
 }
 
-/// 二度押し判定の状態遷移（C版 MainProc.c WM_KEY_HOOKハンドラの移植、
-/// Win32呼び出しを含まない部分だけを切り出したもの）。修飾キーのkey upを数え、
-/// 他のキーが挟まったら無効化する。同じ修飾キーの key up でも、前の key up から `interval` ミリ秒を超えて
-/// 起きたものは数え直す（時刻はキーが起きた時刻。ホットキーのスレッドが止まっている間にたまった転送を続けて受け取っても、
-/// 間を空けた2回を二度押しと数えない）。戻り値はタイマーを(再)設定すべきか。
-fn advance_double_press(
-    dp_vk: &mut u32,
-    dp_count: &mut u32,
-    last_up: &mut u32,
+/// 二度押しの判定の状態（`HotkeyContext::double_press`）。変える操作は新しい状態を返す。数えていない間は
+/// `vk` と `count` がどちらも 0（`Default`）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DoublePress {
+    /// 数えている修飾キー（0 は数えていない）
     vk: u32,
-    up: bool,
-    time: u32,
-    interval: u32,
-) -> bool {
-    let is_modifier = vk == VK_CONTROL.0 as u32 || vk == VK_SHIFT.0 as u32 || vk == VK_MENU.0 as u32;
-    if !is_modifier {
-        // 修飾キー以外が挟まったら判定を無効化（Ctrl+C等を二度押しと誤認しない）
-        *dp_vk = 0;
-        *dp_count = 0;
-        return false;
+    /// その修飾キーの key up の回数
+    count: u32,
+    /// 前に数えた key up が起きた時刻（ミリ秒、`KBDLLHOOKSTRUCT::time`）
+    last_up: u32,
+}
+
+impl DoublePress {
+    /// 1件のキー入力で進めた状態と、タイマーを(再)設定すべきか（C版 MainProc.c WM_KEY_HOOKハンドラの移植、
+    /// Win32呼び出しを含まない部分だけを切り出したもの）。修飾キーのkey upを数え、
+    /// 他のキーが挟まったら無効化する。同じ修飾キーの key up でも、前の key up から `interval` ミリ秒を超えて
+    /// 起きたものは数え直す（時刻はキーが起きた時刻。ホットキーのスレッドが止まっている間にたまった転送を続けて受け取っても、
+    /// 間を空けた2回を二度押しと数えない）。
+    fn advance(self, vk: u32, up: bool, time: u32, interval: u32) -> (Self, bool) {
+        let is_modifier = vk == VK_CONTROL.0 as u32 || vk == VK_SHIFT.0 as u32 || vk == VK_MENU.0 as u32;
+        if !is_modifier {
+            // 修飾キー以外が挟まったら判定を無効化（Ctrl+C等を二度押しと誤認しない）
+            return (Self { vk: 0, count: 0, ..self }, false);
+        }
+        if !up {
+            return (self, false);
+        }
+        let count = if self.vk == vk && self.count > 0 && time.wrapping_sub(self.last_up) <= interval {
+            self.count.saturating_add(1)
+        } else {
+            1
+        };
+        (Self { vk, count, last_up: time }, true)
     }
-    if !up {
-        return false;
+
+    /// タイマーの満了: 回数が2以上なら二度押しとして発火する修飾キー（`Some`）と、数え直しの状態（修飾キーと回数を0に。
+    /// 前の時刻は残す）。
+    fn expire(self) -> (Self, Option<u32>) {
+        let fired = (self.count > 1).then_some(self.vk);
+        (Self { vk: 0, count: 0, ..self }, fired)
     }
-    if *dp_vk == vk && *dp_count > 0 && time.wrapping_sub(*last_up) <= interval {
-        *dp_count += 1;
-    } else {
-        *dp_vk = vk;
-        *dp_count = 1;
-    }
-    *last_up = time;
-    true
 }
 
 /// 二度押し判定。タイマー満了時にカウントが2以上なら二度押しとして発火する。
 fn on_key_event(hwnd: HWND, ctx: &HotkeyContext, vk: u32, up: bool, time: u32) {
-    let (mut dp_vk, mut dp_count, mut last_up) = (ctx.dp_vk.get(), ctx.dp_count.get(), ctx.dp_last_up.get());
     let interval = unsafe { GetDoubleClickTime() };
-    let arm_timer = advance_double_press(&mut dp_vk, &mut dp_count, &mut last_up, vk, up, time, interval);
-    ctx.dp_vk.set(dp_vk);
-    ctx.dp_count.set(dp_count);
-    ctx.dp_last_up.set(last_up);
+    let (state, arm_timer) = ctx.double_press.get().advance(vk, up, time, interval);
+    ctx.double_press.set(state);
     if !arm_timer {
         return;
     }
     // 1回目は二度押し猶予時間の満了を待ち、2回目以降は即座にタイマーを発火させる
-    let wait_ms = if dp_count == 1 { interval } else { 1 };
+    let wait_ms = if state.count == 1 { interval } else { 1 };
     unsafe {
         SetTimer(Some(hwnd), DOUBLE_PRESS_TIMER_ID, wait_ms, None);
     }
@@ -393,13 +393,11 @@ fn on_double_press_timer(hwnd: HWND, ctx: &HotkeyContext) {
     unsafe {
         let _ = KillTimer(Some(hwnd), DOUBLE_PRESS_TIMER_ID);
     }
-    let fired = ctx.dp_count.get() > 1;
-    let vk = ctx.dp_vk.get();
-    ctx.dp_vk.set(0);
-    ctx.dp_count.set(0);
-    if !fired {
+    let (state, fired) = ctx.double_press.get().expire();
+    ctx.double_press.set(state);
+    let Some(vk) = fired else {
         return;
-    }
+    };
     let hk = ctx.config.read().unwrap().hotkey.clone();
     let action = match vk {
         v if v == VK_CONTROL.0 as u32 => hk.double_press_ctrl,
@@ -1147,9 +1145,7 @@ impl Hotkeys {
                         menu_open: Cell::new(false),
                         hook: RefCell::new(None),
                         hook_generation: Cell::new(0),
-                        dp_vk: Cell::new(0),
-                        dp_count: Cell::new(0),
-                        dp_last_up: Cell::new(0),
+                        double_press: Cell::new(DoublePress::default()),
                         reregister_pending: Cell::new(false),
                         shutdown_pending: Cell::new(false),
                         uia: OnceCell::new(),
@@ -1793,73 +1789,55 @@ mod tests {
     }
 
     /// 二度押しの判定の状態（VK・回数・前の key up の時刻）
-    struct Press {
-        vk: u32,
-        count: u32,
-        last_up: u32,
+    fn press(vk: u32, count: u32, last_up: u32) -> DoublePress {
+        DoublePress { vk, count, last_up }
     }
 
-    impl Press {
-        fn new(vk: u32, count: u32, last_up: u32) -> Self {
-            Self { vk, count, last_up }
-        }
-
-        /// 猶予 500ms で1件進める
-        fn step(&mut self, vk: u32, up: bool, time: u32) -> bool {
-            advance_double_press(&mut self.vk, &mut self.count, &mut self.last_up, vk, up, time, 500)
-        }
+    /// 猶予 500ms で1件進める
+    fn step(state: DoublePress, vk: u32, up: bool, time: u32) -> (DoublePress, bool) {
+        state.advance(vk, up, time, 500)
     }
 
+    /// 修飾キーでないキーの key down は、タイマーを張らず、数えていなければ何も変えない。
     #[test]
     fn advance_double_press_ignores_non_modifier_key_down() {
-        let mut p = Press::new(0, 0, 0);
         let vk_a = 0x41; // 'A'、修飾キーではない
-        assert!(!p.step(vk_a, false, 100));
-        assert_eq!((p.vk, p.count), (0, 0));
+        assert_eq!(step(DoublePress::default(), vk_a, false, 100), (DoublePress::default(), false));
     }
 
     #[test]
     fn advance_double_press_resets_state_when_non_modifier_key_is_pressed() {
         // Ctrlを1回押した状態で、その後Cを押すと二度押し判定はリセットされる
-        // （Ctrl+C等を誤って二度押しと認識しない）
-        let mut p = Press::new(VK_CONTROL.0 as u32, 1, 100);
+        // （Ctrl+C等を誤って二度押しと認識しない）。前の時刻は残す
         let vk_c = 0x43;
-        assert!(!p.step(vk_c, true, 150));
-        assert_eq!((p.vk, p.count), (0, 0));
+        assert_eq!(step(press(VK_CONTROL.0 as u32, 1, 100), vk_c, true, 150), (press(0, 0, 100), false));
     }
 
     #[test]
     fn advance_double_press_ignores_modifier_key_down() {
-        // key downでは何もしない（key upのみカウントする）
-        let mut p = Press::new(0, 0, 0);
+        // key downでは何もしない（key upのみカウントする。数えている途中でも変えない）
         let modifier = VK_CONTROL.0 as u32;
-        assert!(!p.step(modifier, false, 100));
-        assert_eq!((p.vk, p.count), (0, 0));
+        assert_eq!(step(DoublePress::default(), modifier, false, 100), (DoublePress::default(), false));
+        assert_eq!(step(press(modifier, 1, 100), modifier, false, 150), (press(modifier, 1, 100), false));
     }
 
     #[test]
     fn advance_double_press_first_key_up_sets_count_to_one() {
-        let mut p = Press::new(0, 0, 0);
         let modifier = VK_SHIFT.0 as u32;
-        assert!(p.step(modifier, true, 100));
-        assert_eq!((p.vk, p.count, p.last_up), (modifier, 1, 100));
+        assert_eq!(step(DoublePress::default(), modifier, true, 100), (press(modifier, 1, 100), true));
     }
 
     #[test]
     fn advance_double_press_same_key_second_up_increments_count() {
         let modifier = VK_MENU.0 as u32;
-        let mut p = Press::new(modifier, 1, 100);
-        assert!(p.step(modifier, true, 400));
-        assert_eq!((p.vk, p.count, p.last_up), (modifier, 2, 400));
+        assert_eq!(step(press(modifier, 1, 100), modifier, true, 400), (press(modifier, 2, 400), true));
     }
 
     #[test]
     fn advance_double_press_different_modifier_restarts_count() {
         // Ctrlを1回押した直後にShiftを押すと、Shiftの1回目としてカウントし直す
-        let mut p = Press::new(VK_CONTROL.0 as u32, 1, 100);
         let shift = VK_SHIFT.0 as u32;
-        assert!(p.step(shift, true, 200));
-        assert_eq!((p.vk, p.count), (shift, 1));
+        assert_eq!(step(press(VK_CONTROL.0 as u32, 1, 100), shift, true, 200), (press(shift, 1, 200), true));
     }
 
     /// 同じ修飾キーでも、前の key up から猶予を超えて起きた key up は数え直す（ホットキーのスレッドが止まって
@@ -1868,15 +1846,23 @@ mod tests {
     #[test]
     fn advance_double_press_restarts_when_gap_exceeds_interval() {
         let ctrl = VK_CONTROL.0 as u32;
-        let mut p = Press::new(ctrl, 1, 1_000);
-        assert!(p.step(ctrl, true, 1_501));
-        assert_eq!((p.count, p.last_up), (1, 1_501), "猶予を超えた2回を二度押しと数えた");
-        assert!(p.step(ctrl, true, 2_001));
+        let (p, _) = step(press(ctrl, 1, 1_000), ctrl, true, 1_501);
+        assert_eq!(p, press(ctrl, 1, 1_501), "猶予を超えた2回を二度押しと数えた");
+        let (p, _) = step(p, ctrl, true, 2_001);
         assert_eq!(p.count, 2, "猶予ちょうどの2回を数えなかった");
 
-        let mut p = Press::new(ctrl, 1, u32::MAX - 100);
-        assert!(p.step(ctrl, true, 200));
+        let (p, _) = step(press(ctrl, 1, u32::MAX - 100), ctrl, true, 200);
         assert_eq!(p.count, 2, "時刻が一周した直後の2回を数えなかった");
+    }
+
+    /// タイマーの満了: 回数が2以上なら、その修飾キーを発火させる。どの場合も修飾キーと回数を0に戻す（前の時刻は残す）。
+    #[test]
+    fn expire_fires_only_after_two_or_more_key_ups() {
+        let ctrl = VK_CONTROL.0 as u32;
+        assert_eq!(press(ctrl, 2, 400).expire(), (press(0, 0, 400), Some(ctrl)));
+        assert_eq!(press(ctrl, 3, 500).expire(), (press(0, 0, 500), Some(ctrl)));
+        assert_eq!(press(ctrl, 1, 100).expire(), (press(0, 0, 100), None));
+        assert_eq!(DoublePress::default().expire(), (DoublePress::default(), None));
     }
 
     /// 転送の詰め方は、VK・世代・時刻（最大値を含む）・key up をそのまま戻す。
