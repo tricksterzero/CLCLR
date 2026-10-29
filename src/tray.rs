@@ -143,15 +143,23 @@ pub(crate) fn rgba_to_argb_pixels(rgba: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-/// 埋め込みRGBA（左上原点、R,G,B,A順）から32bpp ARGBビットマップ経由でHICONを作る。
-/// ビューアの種別アイコン（native/viewer.rs）でも共用する。
+/// 埋め込みRGBA（左上原点、R,G,B,A順）から32bpp ARGBビットマップ経由でHICONを作る（`size` px 角）。
+/// ビューアの種別アイコン（native/viewer.rs）でも共用する。`size` が 1 未満か、`rgba` の長さが `size × size × 4`
+/// でなければ、ビットマップを作らずに `E_INVALIDARG`（`CreateBitmap` は渡したバッファから決まった長さを読むので、
+/// 足りないバッファを渡さない）。
 pub(crate) fn icon_from_rgba(rgba: &[u8], size: i32) -> WinResult<HICON> {
+    let side = usize::try_from(size).ok().filter(|&side| side > 0);
+    let expected = side.and_then(|side| side.checked_mul(side)?.checked_mul(4));
+    let Some(side) = side.filter(|_| expected == Some(rgba.len())) else {
+        return Err(WinError::from_hresult(windows::Win32::Foundation::E_INVALIDARG));
+    };
     let pixels = rgba_to_argb_pixels(rgba);
 
     unsafe {
         let color = CreateBitmap(size, size, 1, 32, Some(pixels.as_ptr().cast()));
-        // マスクは全ピクセル不透明（ARGBのアルファで制御するため全0）
-        let mask_bits = vec![0u8; (size * size / 8) as usize];
+        // マスクは全ピクセル不透明（ARGBのアルファで制御するため全0）。1bpp の各行は WORD 境界まで埋める
+        // （Microsoft Learn の CreateBitmap の lpBits）
+        let mask_bits = vec![0u8; side.div_ceil(16) * 2 * side];
         let mask = CreateBitmap(size, size, 1, 1, Some(mask_bits.as_ptr().cast()));
         let info = ICONINFO {
             fIcon: true.into(),
@@ -1060,8 +1068,7 @@ mod tests {
 
     #[test]
     fn tray_icon_assets_have_expected_size_and_are_distinguishable() {
-        // icon_from_rgbaは長さを検査せずポインタを渡すため、素材の寸法違いは
-        // 範囲外読み取りになる。ここで固定する
+        // 寸法の違う素材は icon_from_rgba が断る（アイコンが付かない）ので、ここで固定する
         let bytes = (TRAY_ICON_SIZE * TRAY_ICON_SIZE * 4) as usize;
         assert_eq!(TRAY_WATCH_ON_RGBA.len(), bytes);
         assert_eq!(TRAY_WATCH_OFF_RGBA.len(), bytes);
@@ -1292,6 +1299,37 @@ mod tests {
             rgba_to_argb_pixels(&rgba),
             vec![0x80FF_0000, 0x4000_FF00]
         );
+    }
+
+    /// `icon_from_rgba` は、大きさが 1 未満か、RGBA の長さが `size × size × 4` でなければ、ビットマップを作らずに
+    /// `E_INVALIDARG` で断る（長さの足りないバッファを `CreateBitmap` に読ませない）。
+    #[test]
+    fn icon_from_rgba_rejects_bad_size_or_length() {
+        // 断れずに作ってしまう誤りのときは GUI リソースを作るので、ロックを取る
+        let _guard = lock_gui_resource_tests();
+        let invalid = |rgba: &[u8], size: i32| {
+            icon_from_rgba(rgba, size).expect_err("断るはずの引数で作れた").code() == windows::Win32::Foundation::E_INVALIDARG
+        };
+        let pixels = |size: usize| vec![0xFFu8; size * size * 4];
+        assert!(invalid(&pixels(32)[..32 * 32 * 4 - 1], 32), "1バイト足りない");
+        assert!(invalid(&[pixels(32), vec![0; 4]].concat(), 32), "1画素多い");
+        assert!(invalid(&pixels(16), 32), "ほかの大きさの素材");
+        assert!(invalid(&[], 0), "大きさ 0");
+        assert!(invalid(&[], -1), "負の大きさ");
+    }
+
+    /// `icon_from_rgba` は、16 の倍数でない大きさ（マスクの1行を WORD 境界へ切り上げる）でも、正しい長さの素材から
+    /// アイコンを作る（1・20・32）。
+    #[test]
+    fn icon_from_rgba_accepts_sizes_not_multiple_of_16() {
+        let _guard = lock_gui_resource_tests();
+        for size in [1, 20, 32] {
+            let rgba = vec![0x80u8; (size * size * 4) as usize];
+            let icon = icon_from_rgba(&rgba, size).unwrap_or_else(|e| panic!("{size}px のアイコンを作れない: {e}"));
+            unsafe {
+                let _ = DestroyIcon(icon);
+            }
+        }
     }
 
     /// `tray_icon`のGDIリーク回帰: `CreateIconIndirect`に渡した
