@@ -493,8 +493,7 @@ impl Storage {
     /// WebP の blob（サムネイルを含む）を、先に見出しと長さを確かめてから読む。CLCLR が書く形でないもの
     /// （`dib::webp_header_dimensions`）・寸法に見合わない長さのもの（`dib::webp_file_len_limit`）・読めないものは
     /// None。画素を RGBA に換算した大きさが `max_rgba` を超えるものは、全体を読まずに `TooLarge`。見出しと全体は
-    /// 同じ開いたファイルから読み、読めた長さか、読んだデータの見出しの寸法が確かめたものと違えば（読む間に書き換え
-    /// られた）None。
+    /// 同じ開いたファイルから読み、読めた長さが違えば None。
     pub(crate) fn load_webp(&self, name: &str, max_rgba: u64) -> Option<LoadedWebp> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = fs::File::open(self.blob_path(name)).ok()?;
@@ -511,13 +510,7 @@ impl Storage {
         file.seek(SeekFrom::Start(0)).ok()?;
         let mut data = Vec::with_capacity(len as usize);
         file.take(len + 1).read_to_end(&mut data).ok()?;
-        if data.len() as u64 != len {
-            return None;
-        }
-        // 見出しを確かめてから読み直すまでの間に、同じ長さのまま中身を書き換えられても、確かめた寸法（上限の判定に
-        // 使ったもの）と違う画像は返さない
-        let reread = dib::webp_header_dimensions(&data, len).ok()?;
-        (reread == (width, height)).then_some(LoadedWebp::Data(data))
+        (data.len() as u64 == len).then_some(LoadedWebp::Data(data))
     }
 
     /// 生のまま（.bin）の blob を、長さが `size` のときだけ読む（長さが違えば、全体を読まずに `Err`）。
@@ -596,18 +589,20 @@ impl Storage {
 
     // --- データのチェック（`Core::check_data`・`clean_data` が操作用のロックの中で使う） ---
 
-    /// `blobs` の直下の項目を1つずつ調べ、ファイルなら名前と大きさ、ファイルでない（フォルダ・リンク）なら None を
-    /// 返す（呼び出し側が項目ごとに途中でやめられるよう、先に全部を集めず、ファイルでない項目も読み飛ばさずに
-    /// 返す）。UTF-16 として正しくない名前は置き換え文字で返す（blob の名前の形に
-    /// 合わないので、対象外として消さない）。
-    pub(crate) fn blob_files(&self) -> Result<impl Iterator<Item = Result<Option<(String, u64)>>>> {
-        Ok(fs::read_dir(self.data_dir.join("blobs"))?.map(|entry| -> Result<Option<(String, u64)>> {
-            let entry = entry?;
-            // `DirEntry::file_type` はリンクを辿らない（リンクは is_file にならない）
-            if !entry.file_type()?.is_file() {
-                return Ok(None);
-            }
-            Ok(Some((entry.file_name().to_string_lossy().into_owned(), entry.metadata()?.len())))
+    /// `blobs` の直下のファイルの名前と大きさを1つずつ返す（呼び出し側が項目ごとに途中でやめられるよう、先に全部を
+    /// 集めない）。ファイルでない項目（フォルダ・リンク）は飛ばす。UTF-16 として正しくない名前は置き換え文字で
+    /// 返す（blob の名前の形に合わないので、対象外として消さない）。
+    pub(crate) fn blob_files(&self) -> Result<impl Iterator<Item = Result<(String, u64)>>> {
+        Ok(fs::read_dir(self.data_dir.join("blobs"))?.filter_map(|entry| -> Option<Result<(String, u64)>> {
+            let read = || -> Result<Option<(String, u64)>> {
+                let entry = entry?;
+                // `DirEntry::file_type` はリンクを辿らない（リンクは is_file にならない）
+                if !entry.file_type()?.is_file() {
+                    return Ok(None);
+                }
+                Ok(Some((entry.file_name().to_string_lossy().into_owned(), entry.metadata()?.len())))
+            };
+            read().transpose()
         }))
     }
 
@@ -621,12 +616,11 @@ impl Storage {
         }
     }
 
-    /// blob `name` がファイルとしてあるか。無い（`NotFound`）・ファイルでない（同じ名前のフォルダなど。読めない
-    /// ので欠けているのと同じ）ときは false、ほかの誤り（権限など）は Err（調べられないものを「無い」と取り違えて
-    /// 項目を消さない）。
+    /// blob `name` があるか。無い（`NotFound`）ときは false、ほかの誤り（権限など）は Err（調べられないものを
+    /// 「無い」と取り違えて項目を消さない）。
     pub(crate) fn blob_exists(&self, name: &str) -> Result<bool> {
         match fs::metadata(self.blob_path(name)) {
-            Ok(m) => Ok(m.is_file()),
+            Ok(_) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
         }

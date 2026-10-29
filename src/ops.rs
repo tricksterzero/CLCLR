@@ -387,17 +387,16 @@ impl Core {
     }
 
     /// ピン留めの項目（またはフォルダ）を消す。pinned.toml へ書けてからメモリに反映し、配下の
-    /// blob を消す（失敗したらメモリも blob も変えない。残る項目・消し直し待ちが参照する blob は消さない）。
+    /// blob を消す（失敗したらメモリも blob も変えない）。
     pub fn delete_pinned(&self, id: Uuid) -> Result<(), OpError> {
-        let scope = self.begin()?;
+        let _scope = self.begin()?;
         let mut nodes = self.with_service(|s| s.pinned.clone())?;
         let node = store::remove_node(&mut nodes, id).ok_or(OpError::NotFound)?;
         self.inner.storage.save_pinned(&nodes)?;
         self.with_service(|s| s.set_pinned(nodes))?;
         let mut metas = Vec::new();
         store::collect_item_metas(&node, &mut metas);
-        let protected = live_references(&self.inner, &scope.ops.pending_removals);
-        remove_unreferenced_blobs(&self.inner.storage, &metas, protected.as_ref());
+        remove_item_blobs(&self.inner.storage, &metas);
         Ok(())
     }
 
@@ -677,8 +676,7 @@ impl Core {
         }
         // blob は、全部の書き直しの結果が決まってから消す。実際に消せた項目以外（残った項目・保存に失敗して残った
         // 項目・今の消し直し待ち・ディスクのインデックス）から参照されるものは消さない。
-        // メモリの分は、ID で除くのではなく消した後の今の状態から取る（同じ ID の別の項目の参照も残す）。
-        // ディスクの分は、走査のときのコピーから消した項目の ID を除く（消した項目はもう書き直した）
+        // メモリの分は、消した後の今の状態から取る。ディスクの分は、走査のときのコピーから消した項目の ID を除く（消した項目はもう書き直した）
         let removed_history_ids: HashSet<Uuid> = removed_history.iter().map(|m| m.id).collect();
         let removed_pinned_ids: HashSet<Uuid> = removed_pinned.iter().map(|m| m.id).collect();
         let (history_now, pinned_now) = self.with_service(|s| (s.history_metas(), item_metas(&s.pinned)))?;
@@ -743,9 +741,7 @@ impl Core {
         for file in storage.blob_files()? {
             self.hook("check:file");
             self.check_closing()?;
-            let Some((name, size)) = file? else {
-                continue;
-            };
+            let (name, size) = file?;
             if datacheck::is_blob_temp_name(&name) {
                 report.temps.push(TempFile { place: TempPlace::Blobs, name, size });
             } else if datacheck::is_blob_name(&name) {
@@ -765,15 +761,8 @@ impl Core {
         if storage.data_file_size("config.toml.tmp")?.is_some() {
             report.ignored.push("config.toml.tmp".to_string());
         }
-        // (b) 参照している blob（サムネイルは除く）が無い項目。ファイルがあるかは実際に調べる。同じ ID の項目が
-        // 2つ以上ある（手で編集した）ときは、ID で消すと別の項目を消しうるので、その ID は対象にしない
-        let (duplicate_history, duplicate_pinned) = (duplicate_ids(&scan.history), duplicate_ids(&scan.pinned));
-        let items = scan
-            .history
-            .iter()
-            .filter(|m| !duplicate_history.contains(&m.id))
-            .map(|m| (m, false))
-            .chain(scan.pinned.iter().filter(|m| !duplicate_pinned.contains(&m.id)).map(|m| (m, true)));
+        // (b) 参照している blob（サムネイルは除く）が無い項目。ファイルがあるかは実際に調べる
+        let items = scan.history.iter().map(|m| (m, false)).chain(scan.pinned.iter().map(|m| (m, true)));
         for (meta, pinned) in items {
             self.check_closing()?;
             let mut missing = false;
@@ -832,9 +821,9 @@ impl Core {
         if self.inner.persist {
             self.inner.storage.save_history_index(&metas)?;
             // 全件を書けたので、消し直し待ちの項目はもうインデックスに無い。blob を消して片付ける（消し直しだけが
-            // 失敗して全件の保存が成功したとき、`Unsaved` にしない。残る項目が参照するものは消さない）
+            // 失敗して全件の保存が成功したとき、`Unsaved` にしない）
             let removed = std::mem::take(&mut ops.pending_removals);
-            remove_unreferenced_blobs(&self.inner.storage, &removed, live_references(&self.inner, &[]).as_ref());
+            remove_item_blobs(&self.inner.storage, &removed);
         }
         if !ops.pending_removals.is_empty() {
             return Err(OpError::Unsaved(ops.pending_removals.len()));
@@ -862,8 +851,7 @@ fn prepare_capture(storage: &Storage, cfg: &Config, persist: bool, entry: Entry)
 /// 消さずに残し、あとで消し直す対象にする。完全メモリモードでは、blob の有無で絞らず、除いた
 /// 項目の ID をすべてインデックスから消す（全形式が save=false で blob の無い、保存済みの項目も
 /// インデックスには載っているため）。
-/// インデックスを書けなかったときはその誤りを返す（項目は消し直す対象に残す）。blob は、残る項目・消し直し待ちが
-/// 参照しているものを消さない（`live_references`）。
+/// インデックスを書けなかったときはその誤りを返す（項目は消し直す対象に残す）。
 fn retire_items(inner: &Inner, ops: &mut OpState, items: Vec<HistoryItem>, retire: Retire) -> Result<(), StorageError> {
     if items.is_empty() {
         return Ok(());
@@ -879,7 +867,7 @@ fn retire_items(inner: &Inner, ops: &mut OpState, items: Vec<HistoryItem>, retir
     };
     match result {
         Ok(()) => {
-            remove_unreferenced_blobs(storage, &metas, live_references(inner, &ops.pending_removals).as_ref());
+            remove_item_blobs(storage, &metas);
             Ok(())
         }
         Err(e) => {
@@ -890,8 +878,7 @@ fn retire_items(inner: &Inner, ops: &mut OpState, items: Vec<HistoryItem>, retir
     }
 }
 
-/// 消し直す対象が残っていれば、インデックスから ID を消し、消せたら blob を消す（残る項目が参照しているものは
-/// 消さない）。
+/// 消し直す対象が残っていれば、インデックスから ID を消し、消せたら blob を消す。
 fn retry_pending(inner: &Inner, ops: &mut OpState) {
     if ops.pending_removals.is_empty() {
         return;
@@ -900,45 +887,16 @@ fn retry_pending(inner: &Inner, ops: &mut OpState) {
     match inner.storage.remove_from_history_index(&ids) {
         Ok(()) => {
             let removed = std::mem::take(&mut ops.pending_removals);
-            remove_unreferenced_blobs(&inner.storage, &removed, live_references(inner, &[]).as_ref());
+            remove_item_blobs(&inner.storage, &removed);
         }
         Err(e) => eprintln!("履歴のインデックスから消し直せませんでした（次に消し直します）: {e}"),
     }
 }
 
-/// 今も参照されている blob・サムネイルの名前（比べるための小文字）: メモリの履歴・ピン留めと、`pending`（消し直し
-/// 待ちの項目。インデックスにまだ残っている）。サービスのロックが poison していれば None（読めない状態で消さない）。
-/// 呼ぶときにサービスのロックを持っていないこと。
-/// ロックの中では、メタデータを複製せずに参照でたどり、名前だけを集める。
-fn live_references(inner: &Inner, pending: &[EntryMeta]) -> Option<HashSet<String>> {
-    let service = inner.service.lock().ok()?;
-    let mut pinned = Vec::new();
-    pinned_meta_refs(&service.pinned, &mut pinned);
-    Some(reference_keys(service.history.iter().map(|item| &item.meta).chain(pinned).chain(pending)))
-}
-
-/// ピン留めの木のアイテム（フォルダの中も）のメタデータへの参照（`item_metas` と同じ並びで、複製しない）。
-fn pinned_meta_refs<'a>(nodes: &'a [PinnedNode], out: &mut Vec<&'a EntryMeta>) {
-    for node in nodes {
-        match node {
-            PinnedNode::Item(meta) => out.push(meta),
-            PinnedNode::Folder(folder) => pinned_meta_refs(&folder.children, out),
-        }
-    }
-}
-
-/// 除いた項目の blob・サムネイルのうち、`protected`（今も参照されている名前。`live_references`）に無いものを消す
-/// （保存データを書き換えて2つの項目に同じ blob を指させても、残る項目のデータを消さない）。`protected` が None
-/// （参照を読めない）なら何も消さない（残った blob は参照されないので、データのチェックで見つかる）。
-fn remove_unreferenced_blobs(storage: &Storage, metas: &[EntryMeta], protected: Option<&HashSet<String>>) {
-    let Some(protected) = protected else {
-        eprintln!("参照を読めないため、blob を消さずに残しました（データのチェックで見つかります）");
-        return;
-    };
+/// 除いた項目の blob・サムネイルを消す（blob の名前は項目の ID から作るので、ほかの項目は参照しない）。1つ消せなくても
+/// 残りを消す。
+fn remove_item_blobs(storage: &Storage, metas: &[EntryMeta]) {
     for name in metas.iter().flat_map(|m| &m.formats).flat_map(|f| std::iter::once(&f.blob).chain(f.thumb.as_ref())) {
-        if protected.contains(&datacheck::name_key(name)) {
-            continue;
-        }
         if let Err(e) = storage.remove_blob(name) {
             eprintln!("blobの削除に失敗（blobs\\{name}）: {e}");
         }
@@ -964,12 +922,6 @@ impl DataScan {
     fn references(&self) -> HashSet<String> {
         reference_keys(self.history.iter().chain(&self.pinned).chain(&self.disk_history).chain(&self.disk_pinned).chain(&self.pending))
     }
-}
-
-/// 2回以上出てくる ID。
-fn duplicate_ids(metas: &[EntryMeta]) -> HashSet<Uuid> {
-    let mut seen = HashSet::new();
-    metas.iter().filter(|m| !seen.insert(m.id)).map(|m| m.id).collect()
 }
 
 /// 項目が参照する blob・サムネイルの名前（比べるための小文字）。
@@ -1023,8 +975,7 @@ fn persist_enabled(config: &Config) -> bool {
 }
 
 /// 履歴追加音を鳴らす（C版 CLCL の tool_utl「音を鳴らす」の統合。watcherスレッドから呼ばれる）。
-/// ファイル未指定・再生失敗時はシステム音にフォールバック（C版と同じ）。ファイルは `sound_file_path` の絶対パスで
-/// 鳴らし、ネットワークの場所のファイルは開かずにシステム音を鳴らす（コピーのたびに外へ接続しないため）。
+/// ファイル未指定・再生失敗時はシステム音にフォールバック（C版と同じ）。ファイルは `sound_file_path` の絶対パスで鳴らす。
 fn play_add_sound(sound_file: &str) {
     use windows::core::PCWSTR;
     use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT};
@@ -1053,10 +1004,9 @@ fn play_add_sound(sound_file: &str) {
 
 /// 追加音のファイルを鳴らす絶対パス。相対のパス（`a.wav`・`sub\a.wav`）は exe のフォルダ（`storage::base_dir`）
 /// からのパスにする（PlaySound は相対の名前を、作業フォルダのほか Windows のフォルダ・PATH・ネットワークに割り当てた
-/// フォルダからも探すので、絶対パスにしてから判定し、同じパスで鳴らす）。ルートからの相対（`\a.wav`）・ドライブの中の
-/// 相対（`C:a.wav`）は、作業フォルダから絶対パスにする。空・絶対パスにできない・この PC のドライブでない
-/// （`is_local_path` が偽）ときは None。
-pub(crate) fn sound_file_path(sound_file: &str) -> Option<std::path::PathBuf> {
+/// フォルダからも探すので、絶対パスにしてから鳴らす）。ルートからの相対（`\a.wav`）・ドライブの中の相対（`C:a.wav`）は、
+/// 作業フォルダから絶対パスにする。空・絶対パスにできないときは None。
+fn sound_file_path(sound_file: &str) -> Option<std::path::PathBuf> {
     use std::path::{Component, Path};
     if sound_file.is_empty() {
         return None;
@@ -1068,33 +1018,7 @@ pub(crate) fn sound_file_path(sound_file: &str) -> Option<std::path::PathBuf> {
         crate::storage::base_dir().join(path)
     };
     // 文字列の上での組み立てで、ファイルには触れない（GetFullPathNameW）
-    let absolute = std::path::absolute(path).ok()?;
-    is_local_path(&absolute.to_string_lossy()).then_some(absolute)
-}
-
-/// パスがこの PC のドライブを指すか（追加音のファイルに使う）。偽にするのは、先頭が区切り2つ（`\\`・`//`。
-/// UNC・`\\?\`・`\\.\` の形を含む）か区切りと `?`（`\??\` の形）のものと、ドライブ（ドライブ名が無ければ
-/// 作業フォルダのドライブ）の種類がネットワーク（`DRIVE_REMOTE`）のもの。ローカルのドライブに置いた
-/// シンボリックリンクがネットワークの場所を指す場合は見分けない。
-pub(crate) fn is_local_path(path: &str) -> bool {
-    use windows::core::PCWSTR;
-    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
-    // WindowsProgramming の機能を足さないため、値をここに置く（winbase.h の DRIVE_REMOTE）
-    const DRIVE_REMOTE: u32 = 4;
-
-    let bytes = path.as_bytes();
-    let is_sep = |b: Option<&u8>| matches!(b, Some(b'\\' | b'/'));
-    if is_sep(bytes.first()) && (is_sep(bytes.get(1)) || bytes.get(1) == Some(&b'?')) {
-        return false;
-    }
-    let drive_type = match bytes {
-        [letter, b':', ..] if letter.is_ascii_alphabetic() => {
-            let root = [u16::from(*letter), u16::from(b':'), u16::from(b'\\'), 0];
-            unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) }
-        }
-        _ => unsafe { GetDriveTypeW(PCWSTR::null()) },
-    };
-    drive_type != DRIVE_REMOTE
+    std::path::absolute(path).ok()
 }
 
 #[cfg(test)]
@@ -1215,33 +1139,15 @@ pub(crate) mod tests {
     }
 
     /// 実際に音が鳴ったかまでは検証できないが、空文字列（システムビープへのフォールバック）、
-    /// 存在しないファイル（`PlaySoundW` 失敗→ビープ）、ネットワークの場所（開かずにビープ）のどれでもパニックせず戻る。
+    /// 存在しないファイル（`PlaySoundW` 失敗→ビープ）のどちらでもパニックせず戻る。
     #[test]
     fn play_add_sound_does_not_panic_for_empty_or_missing_file() {
         play_add_sound("");
         play_add_sound(r"C:\clclr-test-nonexistent-sound-file.wav");
-        play_add_sound(r"\\clclr-test-nonexistent-host\share\a.wav");
-    }
-
-    /// ネットワークの場所の形（区切り2つ・`\??\`）は偽。この PC のドライブ・作業フォルダからの相対は真
-    /// （テストを動かすドライブがローカルである前提）。
-    #[test]
-    fn is_local_path_rejects_network_forms() {
-        for path in [r"\\server\share\a.wav", "//server/share/a.wav", r"\/server\share\a.wav", r"/\server\a.wav",
-            r"\\?\UNC\server\share\a.wav", r"\\?\C:\a.wav", r"\\.\C:\a.wav", r"\??\UNC\server\share\a.wav"]
-        {
-            assert!(!is_local_path(path), "{path} をローカルとした");
-        }
-        let exe = std::env::current_exe().unwrap();
-        let exe = exe.to_str().unwrap();
-        assert!(is_local_path(exe), "前提: {exe} がローカルのドライブにある");
-        for path in ["a.wav", r"\a.wav", "/a.wav", &exe[..2]] {
-            assert!(is_local_path(path), "{path} をネットワークとした");
-        }
     }
 
     /// 追加音の相対のパスは exe のフォルダからの絶対パスにする（PlaySound に作業フォルダ・PATH・ネットワークに割り当てた
-    /// フォルダを探させない）。絶対パスはそのまま、ルートからの相対も絶対パスにする。空・ネットワークの場所は None。
+    /// フォルダを探させない）。絶対パスはそのまま、ルートからの相対も絶対パスにする。空は None。
     #[test]
     fn sound_file_path_resolves_relative_names_to_exe_folder() {
         let base = crate::storage::base_dir();
@@ -1250,11 +1156,9 @@ pub(crate) mod tests {
         }
         let absolute = std::env::current_exe().unwrap().with_file_name("a.wav");
         assert_eq!(sound_file_path(absolute.to_str().unwrap()), Some(absolute));
-        let root_relative = sound_file_path(r"\a.wav").expect("前提: 作業フォルダのドライブがローカル");
+        let root_relative = sound_file_path(r"\a.wav").unwrap();
         assert!(root_relative.is_absolute() && root_relative.ends_with("a.wav"), "{root_relative:?}");
-        for none in ["", r"\\server\share\a.wav", "//server/share/a.wav", r"\\?\UNC\server\share\a.wav"] {
-            assert_eq!(sound_file_path(none), None, "{none}");
-        }
+        assert_eq!(sound_file_path(""), None);
     }
 
     /// 履歴・ピン留めを変える操作のたびに変更番号が変わる。読むだけ・送るための読み込みでは変わらない。
@@ -1642,13 +1546,12 @@ pub(crate) mod tests {
         result
     }
 
-    /// blobs の列挙の途中でも、終了の要求（受け付けが閉じる）が来たら `Closing` で抜ける。ファイルでない項目
-    /// （フォルダ）だけでも、項目ごとに確かめる。
+    /// blobs の列挙の途中でも、終了の要求（受け付けが閉じる）が来たら `Closing` で抜ける（項目ごとに確かめる）。
     #[test]
     fn check_data_stops_while_listing_files_when_admission_closes() {
         let (dir, core) = temp_core(Config::default());
         for _ in 0..3 {
-            std::fs::create_dir(dir.join("blobs").join(format!("{}_0.bin", Uuid::new_v4()))).unwrap();
+            write_blob(&dir, &format!("{}_0.bin", Uuid::new_v4()), b"x");
         }
         let result = run_until_closed_at(&core, "check:file", |core| core.check_data());
         assert!(matches!(result, Err(OpError::Closing)), "{result:?}");
@@ -1672,41 +1575,6 @@ pub(crate) mod tests {
         assert!(result.interrupted && result.items_removed == 1, "{result:?}");
         assert!(core.read(|s| s.history.get_by_id(broken.id).is_none()).unwrap());
         assert!(dir.join("blobs").join(&present).exists(), "終了の要求の後に blob を消した");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// 手で編集して履歴に同じ ID の項目が2つある（片方だけ blob が欠けている）ときは、その ID を欠けた項目に数えず、
-    /// 計画に紛れ込ませても消さない（ID で消すと、残るはずの項目やその blob を消しうる）。
-    #[test]
-    fn clean_data_skips_items_with_duplicate_ids() {
-        let dir = std::env::temp_dir().join(format!("clclr-test-{}", Uuid::new_v4()));
-        let storage = Storage::open(dir.clone()).unwrap();
-        let (shared, gone) = (format!("{}_0.bin", Uuid::new_v4()), format!("{}_1.bin", Uuid::new_v4()));
-        write_blob(&dir, &shared, b"shared");
-        let id = Uuid::new_v4();
-        storage.save_history_index(&[meta_with_blobs(id, &[&shared, &gone]), meta_with_blobs(id, &[&shared])]).unwrap();
-        let core = reopen(&dir, Config::default());
-        let mut plan = core.check_data().unwrap();
-        assert!(plan.missing.is_empty(), "重複した ID を欠けた項目に数えた: {plan:?}");
-        plan.missing.push(MissingItem { id, pinned: false, label: String::new() });
-        let result = core.clean_data(&plan).unwrap();
-        assert_eq!(result.items_removed, 0, "{result:?}");
-        assert_eq!(core.read(|s| s.history.iter().filter(|i| i.meta.id == id).count()), Some(2));
-        assert!(dir.join("blobs").join(&shared).exists(), "残る項目が使う blob を消した");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// 参照している blob の場所がファイルでなくフォルダなら、読めないので欠けた項目に数える。
-    #[test]
-    fn check_data_counts_blob_replaced_by_folder_as_missing() {
-        let (dir, core) = temp_core(Config::default());
-        core.capture(text_entry("フォルダに置き換わる")).unwrap();
-        let meta = core.read(|s| s.history.front().unwrap().meta.clone()).unwrap();
-        let path = blob_path(&dir, &meta);
-        std::fs::remove_file(&path).unwrap();
-        std::fs::create_dir(&path).unwrap();
-        let report = core.check_data().unwrap();
-        assert_eq!(report.missing.iter().map(|m| m.id).collect::<Vec<_>>(), [meta.id]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2159,70 +2027,9 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 保存データを書き換えて2つの項目に同じ blob を指させても、一方を消したとき、残る項目が参照する blob は消さない
-    /// （履歴の削除・ピン留めの削除）。参照する項目が無くなれば消す。
+    /// blob は、ピン留めの削除でも、起動時の切り詰め（永続化が有効で全件を書き直す経路）でも消す。
     #[test]
-    fn deleting_keeps_blob_still_referenced_by_another_item() {
-        let mut config = Config::default();
-        config.history.save_on_change = true;
-        let (dir, core) = temp_core(config.clone());
-        core.capture(text_entry("A")).unwrap();
-        let a = core.read(|s| s.history.front().unwrap().meta.clone()).unwrap();
-        core.capture(text_entry("B")).unwrap();
-        let b = core.read(|s| s.history.front().unwrap().meta.clone()).unwrap();
-        core.pin(b.id, None).unwrap();
-        let p = pinned_item(&core, 0);
-        core.shutdown(None).unwrap();
-        drop(core);
-        // B とピン留めの項目が A の blob を指すように書き換える
-        let history = index_text(&dir).replace(&b.formats[0].blob, &a.formats[0].blob);
-        std::fs::write(dir.join("history.toml"), history).unwrap();
-        let pinned = std::fs::read_to_string(dir.join("pinned.toml")).unwrap().replace(&p.formats[0].blob, &a.formats[0].blob);
-        std::fs::write(dir.join("pinned.toml"), pinned).unwrap();
-        let core = reopen(&dir, config);
-
-        core.delete_history(a.id).unwrap();
-        assert!(blob_path(&dir, &a).exists(), "残る履歴・ピン留めが参照する blob を消した");
-        core.delete_pinned(p.id).unwrap();
-        assert!(blob_path(&dir, &a).exists(), "残る履歴が参照する blob を消した");
-        core.delete_history(b.id).unwrap();
-        assert!(!blob_path(&dir, &a).exists(), "どこからも参照されない blob を残した");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// 参照を集めるときにたどるピン留めのメタデータ（複製しない `pinned_meta_refs`）は、フォルダの中も含めて
-    /// `item_metas` と同じ項目を同じ並びで返す。
-    #[test]
-    fn pinned_meta_refs_match_item_metas_including_folders() {
-        let (dir, core) = temp_core(Config::default());
-        for text in ["一", "二", "三"] {
-            core.capture(text_entry(text)).unwrap();
-        }
-        core.create_folder(None, "フォルダ").unwrap();
-        let folder = core.read(|s| s.pinned.iter().find_map(|n| matches!(n, PinnedNode::Folder(_)).then(|| n.id()))).unwrap().unwrap();
-        core.create_folder(Some(folder), "中のフォルダ").unwrap();
-        let inner = core
-            .read(|s| store::find_folder(&s.pinned, folder).unwrap().children.iter().find_map(|n| matches!(n, PinnedNode::Folder(_)).then(|| n.id())))
-            .unwrap()
-            .unwrap();
-        let ids: Vec<Uuid> = core.read(|s| s.history.iter().map(|i| i.meta.id).collect()).unwrap();
-        core.pin(ids[0], None).unwrap();
-        core.pin(ids[1], Some(folder)).unwrap();
-        core.pin(ids[2], Some(inner)).unwrap();
-        core.read(|s| {
-            let mut refs = Vec::new();
-            pinned_meta_refs(&s.pinned, &mut refs);
-            let copied = item_metas(&s.pinned);
-            assert_eq!(refs.len(), 3);
-            assert_eq!(refs.iter().map(|m| m.id).collect::<Vec<_>>(), copied.iter().map(|m| m.id).collect::<Vec<_>>());
-        })
-        .unwrap();
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// ほかから参照されない blob は、ピン留めの削除でも、起動時の切り詰め（永続化が有効で全件を書き直す経路）でも消す。
-    #[test]
-    fn unshared_blobs_are_removed_by_pinned_delete_and_startup_trim() {
+    fn blobs_are_removed_by_pinned_delete_and_startup_trim() {
         let mut config = Config::default();
         config.history.save_on_change = true;
         config.history.grouping.enabled = false;

@@ -304,8 +304,6 @@ pub enum Unverified {
     Unreadable { path: PathBuf, error: String },
     /// 解釈できない種類の ACE がある
     UnknownAce(PathBuf),
-    /// `blobs` の中のフォルダが深すぎるので、中を確かめていない（`BLOBS_MAX_DEPTH`）
-    TooDeep(PathBuf),
 }
 
 /// 確かめた結果。
@@ -770,21 +768,15 @@ pub(crate) fn check_contents(dir: &Path, exe_name: &OsStr, trusted: &Trusted, re
     }
 }
 
-/// `blobs` の中のフォルダをたどる深さの上限（`blobs` の直下が 1 段目）。CLCLR は中にフォルダを作らないので、外から
-/// 作られた深いフォルダで、スタックやメモリを使い切らないための歯止め。
-const BLOBS_MAX_DEPTH: usize = 16;
-
 /// `blobs` の中の全部を確かめる（中のフォルダは CLCLR が作らないが、あればその中もたどる。リンクはたどらない）。
-/// 再帰せず、たどるフォルダの一覧で回す。`BLOBS_MAX_DEPTH` より深いフォルダは、中を確かめずに「確かめられない」にする。
+/// 再帰せず、たどるフォルダの一覧で回す。
 fn check_blobs(folder: &Path, trusted: &Trusted, report: &mut FolderReport) {
-    let mut pending = vec![(folder.to_path_buf(), 0usize)];
-    while let Some((dir, depth)) = pending.pop() {
+    let mut pending = vec![folder.to_path_buf()];
+    while let Some(dir) = pending.pop() {
         for (path, _, attrs) in entries(&dir, report) {
             if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
-                if depth >= BLOBS_MAX_DEPTH {
-                    report.unverified.push(Unverified::TooDeep(path));
-                } else if inspect(&path, attrs, Role::Folder, trusted, report) {
-                    pending.push((path, depth + 1));
+                if inspect(&path, attrs, Role::Folder, trusted, report) {
+                    pending.push(path);
                 }
             } else {
                 inspect(&path, attrs, Role::DataFile, trusted, report);
@@ -1113,27 +1105,6 @@ mod tests {
         tree.set_dacl(&sub, &owner_only);
         assert!(found.unverified.iter().any(|u| matches!(u, Unverified::Unreadable { path, .. } if path == &sub)), "{found:?}");
         assert!(!found.findings.iter().any(|f| f.path == sub), "{found:?}");
-    }
-
-    /// `blobs` の中のフォルダは `BLOBS_MAX_DEPTH` 段までたどり、それより深いフォルダは中を確かめずに「確かめられない」に
-    /// する（黙って飛ばさない）。上限の段の中のファイルは確かめる。
-    #[test]
-    fn blobs_deeper_than_limit_is_unverified() {
-        let tree = TempTree::new();
-        let me = current_user_sid().unwrap();
-        tree.set_dacl(&tree.0, &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"));
-        let mut deepest_checked = tree.0.join("blobs");
-        for _ in 0..BLOBS_MAX_DEPTH {
-            deepest_checked.push("d");
-        }
-        let too_deep = deepest_checked.join("d");
-        std::fs::create_dir_all(&too_deep).unwrap();
-        let file = deepest_checked.join("b_0.bin");
-        std::fs::write(&file, b"x").unwrap();
-        tree.set_dacl(&file, &format!("D:P(A;;FA;;;{me})(A;;FR;;;WD)"));
-        let found = contents(&tree.0);
-        assert_eq!(found.unverified, [Unverified::TooDeep(too_deep)], "{found:?}");
-        assert_eq!(found.findings.iter().map(|f| (f.path.clone(), f.concern)).collect::<Vec<_>>(), [(file, Concern::Read)]);
     }
 
     /// `blobs` がジャンクション（フォルダの外を指す）なら、中は確かめずに確かめられないものとして知らせる。

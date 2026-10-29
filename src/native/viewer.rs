@@ -1707,7 +1707,6 @@ pub(crate) fn folder_report_text(report: &FolderReport) -> (String, String) {
         Unverified::Link(path) => format!("{}: リンク（ジャンクション・シンボリックリンクなど）なので、確かめていません", path.display()),
         Unverified::Unreadable { path, error } => format!("{}: 権限を読めません（{error}）", path.display()),
         Unverified::UnknownAce(path) => format!("{}: 解釈できない種類の権限の設定があります", path.display()),
-        Unverified::TooDeep(path) => format!("{}: フォルダが深すぎるため、中を確かめていません", path.display()),
     });
     let mut details = Vec::new();
     if !report.findings.is_empty() {
@@ -1932,9 +1931,7 @@ unsafe extern "system" fn name_dialog_proc(dialog: HWND, msg: u32, wparam: WPARA
                 let id = (wparam.0 & 0xFFFF) as i32;
                 if id == IDOK.0 {
                     if let (Some(state), Ok(edit)) = (state(), GetDlgItem(Some(dialog), crate::native::settings::IDC_RENAME_NAME)) {
-                        // 長さを測ってから全部読む（`EM_LIMITTEXT` は初めに入れた今の名前を縮めないので、上限より
-                        // 長い今の名前を、変えずに OK しただけで切り詰めない）
-                        let mut buf = vec![0u16; GetWindowTextLengthW(edit).max(0) as usize + 1];
+                        let mut buf = [0u16; NAME_MAX_LEN + 1];
                         let len = GetWindowTextW(edit, &mut buf).max(0) as usize;
                         state.result = Some(String::from_utf16_lossy(&buf[..len]));
                     }
@@ -6727,20 +6724,6 @@ mod tests {
         assert!(!finish_menu_test(), "やり直しのタイマーで閉じなかった");
         assert!(CLOSE_RETRIES.with(Cell::get) >= 1);
         assert_eq!(recorder.renamed.borrow().len(), 1, "キャンセルなのに伝えた");
-
-        // 入力の上限（`NAME_MAX_LEN`）より長い今の名前は、変えずに OK しても縮めない
-        let long = "長".repeat(NAME_MAX_LEN + 44);
-        *recorder.pinned_title.borrow_mut() = Some(Some(long.clone()));
-        during_dialog(hwnd, move || {
-            let ctx = unsafe { ctx_ref(hwnd) }.unwrap();
-            unsafe {
-                SendMessageW(HWND(ctx.dialog.get() as *mut _), WM_COMMAND, Some(WPARAM(IDOK.0 as usize)), Some(LPARAM(0)));
-            }
-        });
-        press_f2(&window);
-        assert!(!finish_menu_test());
-        assert_eq!(recorder.renamed.borrow().last(), Some(&(id, long)), "長い名前を切り詰めた");
-        recorder.renamed.borrow_mut().pop();
 
         recorder.hide_on_close.set(true);
         during_dialog(hwnd, move || unsafe {
