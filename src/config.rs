@@ -593,18 +593,10 @@ impl Config {
                 });
             }
         };
-        let h = &self.history;
-        range("history.max", "最大件数", u64::from(h.max), 0, 10_000);
-        range("history.grouping.visible_items", "直下に表示する件数", u64::from(h.grouping.visible_items), 1, 1_000);
-        range("history.grouping.folders", "フォルダ数", u64::from(h.grouping.folders), 1, 100);
-        range("history.grouping.items_per_folder", "フォルダ内の件数", u64::from(h.grouping.items_per_folder), 1, 1_000);
-        range("history.add_interval_ms", "追加までの遅延", h.add_interval_ms, 1, 10_000);
+        for field in NUMBER_FIELDS {
+            range(field.field, field.label, (field.get)(self), field.min, field.max);
+        }
         let k = &self.hotkey;
-        range("hotkey.menu_max_items", "メニューに出す履歴件数", u64::from(k.menu_max_items), 1, 100);
-        range("hotkey.tooltip.delay_ms", "表示までの待ち時間", u64::from(k.tooltip.delay_ms), 0, 5_000);
-        range("hotkey.tooltip.max_chars", "最大文字数", u64::from(k.tooltip.max_chars), 1, 100_000);
-        range("hotkey.tooltip.max_lines", "最大行数", u64::from(k.tooltip.max_lines), 1, 200);
-        range("tools.text.word_break_width", "折り返し幅", u64::from(self.tools.text.word_break_width), 1, 1_000);
         if k.popup_menu.enabled && !crate::hotkey::is_valid_hotkey_key(&k.popup_menu.key) {
             issues.push(ConfigIssue {
                 field: "hotkey.popup_menu.key",
@@ -671,6 +663,120 @@ pub struct ConfigIssue {
     pub row: Option<usize>,
     pub message: String,
 }
+
+/// 設定画面で入力する数値の項目。範囲はここにだけ書き、`Config::validate` が範囲を確かめ、設定画面が入力欄の
+/// 上下のボタンの範囲と読み書きに使う（入力欄の場所は設定画面が持つ）。`min <= max`。
+pub struct NumberField {
+    /// 設定の鍵の道筋（`ConfigIssue::field`）
+    pub field: &'static str,
+    /// 設定画面の見出し（誤りの文に使う）
+    pub label: &'static str,
+    /// 入力してよい範囲（両端を含む）
+    pub min: u64,
+    pub max: u64,
+    /// 今の値
+    pub get: fn(&Config) -> u64,
+    /// 値を入れる。項目の型に収まらない値は入れずに false（範囲は確かめない。`validate` が確かめる）
+    pub set: fn(&mut Config, u64) -> bool,
+}
+
+pub static HISTORY_MAX: NumberField = NumberField {
+    field: "history.max",
+    label: "最大件数",
+    min: 0,
+    max: 10_000,
+    get: |c| u64::from(c.history.max),
+    set: |c, v| u32::try_from(v).map(|v| c.history.max = v).is_ok(),
+};
+pub static GROUPING_VISIBLE_ITEMS: NumberField = NumberField {
+    field: "history.grouping.visible_items",
+    label: "直下に表示する件数",
+    min: 1,
+    max: 1_000,
+    get: |c| u64::from(c.history.grouping.visible_items),
+    set: |c, v| u32::try_from(v).map(|v| c.history.grouping.visible_items = v).is_ok(),
+};
+pub static GROUPING_FOLDERS: NumberField = NumberField {
+    field: "history.grouping.folders",
+    label: "フォルダ数",
+    min: 1,
+    max: 100,
+    get: |c| u64::from(c.history.grouping.folders),
+    set: |c, v| u32::try_from(v).map(|v| c.history.grouping.folders = v).is_ok(),
+};
+pub static GROUPING_ITEMS_PER_FOLDER: NumberField = NumberField {
+    field: "history.grouping.items_per_folder",
+    label: "フォルダ内の件数",
+    min: 1,
+    max: 1_000,
+    get: |c| u64::from(c.history.grouping.items_per_folder),
+    set: |c, v| u32::try_from(v).map(|v| c.history.grouping.items_per_folder = v).is_ok(),
+};
+pub static HISTORY_ADD_INTERVAL: NumberField = NumberField {
+    field: "history.add_interval_ms",
+    label: "追加までの遅延",
+    min: 1,
+    max: 10_000,
+    get: |c| c.history.add_interval_ms,
+    set: |c, v| {
+        c.history.add_interval_ms = v;
+        true
+    },
+};
+pub static MENU_MAX_ITEMS: NumberField = NumberField {
+    field: "hotkey.menu_max_items",
+    label: "メニューに出す履歴件数",
+    min: 1,
+    max: 100,
+    get: |c| u64::from(c.hotkey.menu_max_items),
+    set: |c, v| u32::try_from(v).map(|v| c.hotkey.menu_max_items = v).is_ok(),
+};
+pub static TOOLTIP_DELAY: NumberField = NumberField {
+    field: "hotkey.tooltip.delay_ms",
+    label: "表示までの待ち時間",
+    min: 0,
+    max: 5_000,
+    get: |c| u64::from(c.hotkey.tooltip.delay_ms),
+    set: |c, v| u32::try_from(v).map(|v| c.hotkey.tooltip.delay_ms = v).is_ok(),
+};
+pub static TOOLTIP_MAX_CHARS: NumberField = NumberField {
+    field: "hotkey.tooltip.max_chars",
+    label: "最大文字数",
+    min: 1,
+    max: 100_000,
+    get: |c| u64::from(c.hotkey.tooltip.max_chars),
+    set: |c, v| u32::try_from(v).map(|v| c.hotkey.tooltip.max_chars = v).is_ok(),
+};
+pub static TOOLTIP_MAX_LINES: NumberField = NumberField {
+    field: "hotkey.tooltip.max_lines",
+    label: "最大行数",
+    min: 1,
+    max: 200,
+    get: |c| u64::from(c.hotkey.tooltip.max_lines),
+    set: |c, v| u32::try_from(v).map(|v| c.hotkey.tooltip.max_lines = v).is_ok(),
+};
+pub static WORD_BREAK_WIDTH: NumberField = NumberField {
+    field: "tools.text.word_break_width",
+    label: "折り返し幅",
+    min: 1,
+    max: 1_000,
+    get: |c| u64::from(c.tools.text.word_break_width),
+    set: |c, v| u32::try_from(v).map(|v| c.tools.text.word_break_width = v).is_ok(),
+};
+
+/// 数値の項目の全部（`Config::validate` は、この順に誤りを返す）。
+pub static NUMBER_FIELDS: [&NumberField; 10] = [
+    &HISTORY_MAX,
+    &GROUPING_VISIBLE_ITEMS,
+    &GROUPING_FOLDERS,
+    &GROUPING_ITEMS_PER_FOLDER,
+    &HISTORY_ADD_INTERVAL,
+    &MENU_MAX_ITEMS,
+    &TOOLTIP_DELAY,
+    &TOOLTIP_MAX_CHARS,
+    &TOOLTIP_MAX_LINES,
+    &WORD_BREAK_WIDTH,
+];
 
 /// 設定画面の OK で保存する設定を作る。項目ごとに、開いたときの値（`base`）・
 /// 設定画面で編集した値（`draft`）・今の値（`current`）を比べ、設定画面で変えた項目（`draft != base`）は
@@ -1160,34 +1266,58 @@ mod tests {
 
     // --- 設定画面の入力の確かめと合わせ方 ---
 
-    /// 各数値の範囲の端（下限・上限は通り、外れは誤り）。既定の設定には誤りが無い。
+    /// 数値の項目の表（`NUMBER_FIELDS`）の項目と範囲は仕様どおり（並びは `validate` の誤りの順）。各範囲の端は、
+    /// 下限・上限が通り、外れは誤り。`set` は自分の項目に入れる（`get` で同じ値を読め、`validate` の誤りの項目が
+    /// 自分になる）。既定の設定には誤りが無い。
     #[test]
-    fn validate_checks_each_range_at_its_ends() {
+    fn number_fields_match_spec_and_validate_checks_each_end() {
         assert!(Config::default().validate().is_empty(), "{:?}", Config::default().validate());
-        type Set = fn(&mut Config, u64);
-        let cases: [(&str, u64, u64, Set); 10] = [
-            ("history.max", 0, 10_000, |c, v| c.history.max = v as u32),
-            ("history.grouping.visible_items", 1, 1_000, |c, v| c.history.grouping.visible_items = v as u32),
-            ("history.grouping.folders", 1, 100, |c, v| c.history.grouping.folders = v as u32),
-            ("history.grouping.items_per_folder", 1, 1_000, |c, v| c.history.grouping.items_per_folder = v as u32),
-            ("history.add_interval_ms", 1, 10_000, |c, v| c.history.add_interval_ms = v),
-            ("hotkey.menu_max_items", 1, 100, |c, v| c.hotkey.menu_max_items = v as u32),
-            ("hotkey.tooltip.delay_ms", 0, 5_000, |c, v| c.hotkey.tooltip.delay_ms = v as u32),
-            ("hotkey.tooltip.max_chars", 1, 100_000, |c, v| c.hotkey.tooltip.max_chars = v as u32),
-            ("hotkey.tooltip.max_lines", 1, 200, |c, v| c.hotkey.tooltip.max_lines = v as u32),
-            ("tools.text.word_break_width", 1, 1_000, |c, v| c.tools.text.word_break_width = v as u32),
+        let spec: [(&str, u64, u64); 10] = [
+            ("history.max", 0, 10_000),
+            ("history.grouping.visible_items", 1, 1_000),
+            ("history.grouping.folders", 1, 100),
+            ("history.grouping.items_per_folder", 1, 1_000),
+            ("history.add_interval_ms", 1, 10_000),
+            ("hotkey.menu_max_items", 1, 100),
+            ("hotkey.tooltip.delay_ms", 0, 5_000),
+            ("hotkey.tooltip.max_chars", 1, 100_000),
+            ("hotkey.tooltip.max_lines", 1, 200),
+            ("tools.text.word_break_width", 1, 1_000),
         ];
-        for (field, min, max, set) in cases {
+        let table: Vec<(&str, u64, u64)> = NUMBER_FIELDS.iter().map(|f| (f.field, f.min, f.max)).collect();
+        assert_eq!(table, spec);
+        for field in NUMBER_FIELDS {
+            assert!(!field.label.is_empty(), "{} の見出しが空", field.field);
             let fields_for = |value: u64| {
                 let mut c = Config::default();
-                set(&mut c, value);
+                assert!((field.set)(&mut c, value), "{} に {value} を入れられない", field.field);
+                assert_eq!((field.get)(&c), value, "{} に入れた値を読めない", field.field);
                 c.validate().into_iter().map(|i| i.field).collect::<Vec<_>>()
             };
-            assert!(fields_for(min).is_empty(), "{field} の下限 {min} が誤りになった");
-            assert!(fields_for(max).is_empty(), "{field} の上限 {max} が誤りになった");
-            assert_eq!(fields_for(max + 1), [field], "{field} の上限を超えた値");
-            if min > 0 {
-                assert_eq!(fields_for(min - 1), [field], "{field} の下限を下回った値");
+            assert!(fields_for(field.min).is_empty(), "{} の下限 {} が誤りになった", field.field, field.min);
+            assert!(fields_for(field.max).is_empty(), "{} の上限 {} が誤りになった", field.field, field.max);
+            assert_eq!(fields_for(field.max + 1), [field.field], "{} の上限を超えた値", field.field);
+            if field.min > 0 {
+                assert_eq!(fields_for(field.min - 1), [field.field], "{} の下限を下回った値", field.field);
+            }
+        }
+    }
+
+    /// 数値の項目の `set` は、項目の型（`add_interval_ms` だけ u64、ほかは u32）に収まらない値を入れずに false を返す
+    /// （型の上限ちょうどは入る）。
+    #[test]
+    fn number_field_set_rejects_values_that_do_not_fit_the_type() {
+        let over_u32 = u64::from(u32::MAX) + 1;
+        for field in NUMBER_FIELDS {
+            let mut c = Config::default();
+            assert!((field.set)(&mut c, u64::from(u32::MAX)), "{} に u32 の上限を入れられない", field.field);
+            let before = (field.get)(&c);
+            let fits = (field.set)(&mut c, over_u32);
+            if field.field == "history.add_interval_ms" {
+                assert!(fits && (field.get)(&c) == over_u32, "{} は u64 の値を入れられる", field.field);
+            } else {
+                assert!(!fits, "{} が u32 に収まらない値を受け付けた", field.field);
+                assert_eq!((field.get)(&c), before, "{} が入れられない値で変わった", field.field);
             }
         }
     }

@@ -35,7 +35,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{
-    Config, ConfigIssue, DoublePressAction, FilterAction, FormatFilter, MenuPosition, OverlapCheck, WindowFilter,
+    self, Config, ConfigIssue, DoublePressAction, FilterAction, FormatFilter, MenuPosition, NumberField, OverlapCheck,
+    WindowFilter,
 };
 use crate::native::app::ApplyError;
 
@@ -103,28 +104,25 @@ const PAGE_TEXT: usize = 3;
 const PAGE_FORMAT: usize = 4;
 const PAGE_WINDOW: usize = 5;
 
-/// 数値の入力欄（範囲は `Config::validate` と同じ値）。
+/// 数値の入力欄（項目の鍵・見出し・範囲・値の読み書きは `number`。`config::NUMBER_FIELDS` の項目ごとに1つ）。
 struct NumField {
-    field: &'static str,
-    label: &'static str,
+    number: &'static NumberField,
     page: usize,
     ctl: i32,
     spin: i32,
-    min: u32,
-    max: u32,
 }
 
 const NUMS: [NumField; 10] = [
-    NumField { field: "history.max", label: "最大件数", page: PAGE_HISTORY, ctl: IDC_HIS_MAX, spin: IDC_HIS_MAX_SPIN, min: 0, max: 10_000 },
-    NumField { field: "history.grouping.visible_items", label: "直下に表示する件数", page: PAGE_HISTORY, ctl: IDC_HIS_VISIBLE, spin: IDC_HIS_VISIBLE_SPIN, min: 1, max: 1_000 },
-    NumField { field: "history.grouping.folders", label: "フォルダ数", page: PAGE_HISTORY, ctl: IDC_HIS_FOLDERS, spin: IDC_HIS_FOLDERS_SPIN, min: 1, max: 100 },
-    NumField { field: "history.grouping.items_per_folder", label: "フォルダ内の件数", page: PAGE_HISTORY, ctl: IDC_HIS_PER_FOLDER, spin: IDC_HIS_PER_FOLDER_SPIN, min: 1, max: 1_000 },
-    NumField { field: "history.add_interval_ms", label: "追加までの遅延", page: PAGE_HISTORY, ctl: IDC_HIS_INTERVAL, spin: IDC_HIS_INTERVAL_SPIN, min: 1, max: 10_000 },
-    NumField { field: "hotkey.menu_max_items", label: "メニューに出す履歴件数", page: PAGE_HOTKEY, ctl: IDC_HK_MENU_ITEMS, spin: IDC_HK_MENU_ITEMS_SPIN, min: 1, max: 100 },
-    NumField { field: "hotkey.tooltip.delay_ms", label: "表示までの待ち時間", page: PAGE_HOTKEY, ctl: IDC_HK_TIP_DELAY, spin: IDC_HK_TIP_DELAY_SPIN, min: 0, max: 5_000 },
-    NumField { field: "hotkey.tooltip.max_chars", label: "最大文字数", page: PAGE_HOTKEY, ctl: IDC_HK_TIP_CHARS, spin: IDC_HK_TIP_CHARS_SPIN, min: 1, max: 100_000 },
-    NumField { field: "hotkey.tooltip.max_lines", label: "最大行数", page: PAGE_HOTKEY, ctl: IDC_HK_TIP_LINES, spin: IDC_HK_TIP_LINES_SPIN, min: 1, max: 200 },
-    NumField { field: "tools.text.word_break_width", label: "折り返し幅", page: PAGE_TEXT, ctl: IDC_TX_WRAP, spin: IDC_TX_WRAP_SPIN, min: 1, max: 1_000 },
+    NumField { number: &config::HISTORY_MAX, page: PAGE_HISTORY, ctl: IDC_HIS_MAX, spin: IDC_HIS_MAX_SPIN },
+    NumField { number: &config::GROUPING_VISIBLE_ITEMS, page: PAGE_HISTORY, ctl: IDC_HIS_VISIBLE, spin: IDC_HIS_VISIBLE_SPIN },
+    NumField { number: &config::GROUPING_FOLDERS, page: PAGE_HISTORY, ctl: IDC_HIS_FOLDERS, spin: IDC_HIS_FOLDERS_SPIN },
+    NumField { number: &config::GROUPING_ITEMS_PER_FOLDER, page: PAGE_HISTORY, ctl: IDC_HIS_PER_FOLDER, spin: IDC_HIS_PER_FOLDER_SPIN },
+    NumField { number: &config::HISTORY_ADD_INTERVAL, page: PAGE_HISTORY, ctl: IDC_HIS_INTERVAL, spin: IDC_HIS_INTERVAL_SPIN },
+    NumField { number: &config::MENU_MAX_ITEMS, page: PAGE_HOTKEY, ctl: IDC_HK_MENU_ITEMS, spin: IDC_HK_MENU_ITEMS_SPIN },
+    NumField { number: &config::TOOLTIP_DELAY, page: PAGE_HOTKEY, ctl: IDC_HK_TIP_DELAY, spin: IDC_HK_TIP_DELAY_SPIN },
+    NumField { number: &config::TOOLTIP_MAX_CHARS, page: PAGE_HOTKEY, ctl: IDC_HK_TIP_CHARS, spin: IDC_HK_TIP_CHARS_SPIN },
+    NumField { number: &config::TOOLTIP_MAX_LINES, page: PAGE_HOTKEY, ctl: IDC_HK_TIP_LINES, spin: IDC_HK_TIP_LINES_SPIN },
+    NumField { number: &config::WORD_BREAK_WIDTH, page: PAGE_TEXT, ctl: IDC_TX_WRAP, spin: IDC_TX_WRAP_SPIN },
 ];
 
 /// 誤りの項目（`ConfigIssue::field`）→ ページ・入力欄・その欄を有効にするチェックボックス（無効な間は、そちらへ
@@ -609,26 +607,15 @@ fn load(ctx: &Ctx) {
     set_check(general, IDC_GEN_FOLDER_CHECK, c.general.check_folder_permissions);
 
     let h = &c.history;
-    let values: [u64; 10] = [
-        u64::from(h.max),
-        u64::from(h.grouping.visible_items),
-        u64::from(h.grouping.folders),
-        u64::from(h.grouping.items_per_folder),
-        h.add_interval_ms,
-        u64::from(c.hotkey.menu_max_items),
-        u64::from(c.hotkey.tooltip.delay_ms),
-        u64::from(c.hotkey.tooltip.max_chars),
-        u64::from(c.hotkey.tooltip.max_lines),
-        u64::from(c.tools.text.word_break_width),
-    ];
-    for (num, value) in NUMS.iter().zip(values) {
+    for num in &NUMS {
         if let Some(spin) = item(pages[num.page], num.spin) {
+            let (min, max) = (num.number.min, num.number.max);
             unsafe {
-                SendMessageW(spin, UDM_SETRANGE32, Some(WPARAM(num.min as usize)), Some(LPARAM(num.max as isize)));
+                SendMessageW(spin, UDM_SETRANGE32, Some(WPARAM(min as usize)), Some(LPARAM(max as isize)));
             }
         }
         // 範囲外の値（手で書き換えた設定ファイル）もそのまま出す（OK で誤りとして知らせる）
-        set_text(pages[num.page], num.ctl, &value.to_string());
+        set_text(pages[num.page], num.ctl, &(num.number.get)(c).to_string());
     }
     set_check(history, IDC_HIS_GROUP, h.grouping.enabled);
     set_text(history, IDC_HIS_FORMAT, &h.grouping.folder_name_format);
@@ -961,16 +948,14 @@ fn select_issue_row(ctx: &Ctx, rl: &RowList, row: usize) {
     with_rows_changing(ctx, rl, || select_row(list, Some(row)));
 }
 
-/// 数値の入力欄を読む（空欄・数字以外・桁あふれは、その項目の誤り）。範囲は `Config::validate` が確かめる。
-fn read_num(pages: &[HWND], num: &NumField, issues: &mut Vec<ConfigIssue>) -> u64 {
+/// 数値の入力欄を読み、`draft` の項目に入れる。空欄・数字以外・項目の型に収まらない値は入れずに、その項目の誤りを
+/// `issues` へ足す。範囲は `Config::validate` が確かめる。
+fn read_num(pages: &[HWND], num: &NumField, draft: &mut Config, issues: &mut Vec<ConfigIssue>) {
     // 上下のボタンは桁区切りを入れない（UDS_NOTHOUSANDS）が、貼り付けに備えて空白は除く
     let text: String = get_text(pages[num.page], num.ctl).chars().filter(|c| !c.is_whitespace()).collect();
-    match text.parse::<u64>() {
-        Ok(v) if u32::try_from(v).is_ok() || num.field == "history.add_interval_ms" => v,
-        _ => {
-            issues.push(ConfigIssue { field: num.field, row: None, message: format!("「{}」に数値を入力してください", num.label) });
-            0
-        }
+    if !text.parse::<u64>().is_ok_and(|v| (num.number.set)(draft, v)) {
+        let message = format!("「{}」に数値を入力してください", num.number.label);
+        issues.push(ConfigIssue { field: num.number.field, row: None, message });
     }
 }
 
@@ -988,18 +973,9 @@ fn read_draft(pages: &[HWND], base: &Config, formats: &[FormatRow], windows: &[W
     c.general.notify_action_errors = get_check(general, IDC_GEN_NOTIFY);
     c.general.check_folder_permissions = get_check(general, IDC_GEN_FOLDER_CHECK);
 
-    let n: Vec<u64> = NUMS.iter().map(|num| read_num(pages, num, &mut issues)).collect();
-    let as_u32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
-    c.history.max = as_u32(n[0]);
-    c.history.grouping.visible_items = as_u32(n[1]);
-    c.history.grouping.folders = as_u32(n[2]);
-    c.history.grouping.items_per_folder = as_u32(n[3]);
-    c.history.add_interval_ms = n[4];
-    c.hotkey.menu_max_items = as_u32(n[5]);
-    c.hotkey.tooltip.delay_ms = as_u32(n[6]);
-    c.hotkey.tooltip.max_chars = as_u32(n[7]);
-    c.hotkey.tooltip.max_lines = as_u32(n[8]);
-    c.tools.text.word_break_width = as_u32(n[9]);
+    for num in &NUMS {
+        read_num(pages, num, &mut c, &mut issues);
+    }
 
     c.history.grouping.enabled = get_check(history, IDC_HIS_GROUP);
     c.history.grouping.folder_name_format = get_text(history, IDC_HIS_FORMAT);
@@ -1842,7 +1818,7 @@ mod tests {
         let issues = bad.validate();
         assert_eq!(issues.len(), 13, "前提: すべての項目が誤り");
         let limit = ["format_filters.limit_size"]; // 上限は画面の読み取りの誤り（read_draft）
-        for field in issues.iter().map(|i| i.field).chain(NUMS.iter().map(|n| n.field)).chain(limit) {
+        for field in issues.iter().map(|i| i.field).chain(NUMS.iter().map(|n| n.number.field)).chain(limit) {
             assert!(PLACES.iter().any(|p| p.field == field), "{field} の場所が無い");
         }
         // 行の誤りの場所は、行を編集するページの入力欄
@@ -1850,6 +1826,19 @@ mod tests {
             let place = PLACES.iter().find(|p| p.field == issue.field).unwrap();
             let rl = row_list(place.page).expect("行の誤りが一覧の無いページを指す");
             assert!(rl.fields.contains(&place.ctl), "{} の欄が行の入力欄でない", issue.field);
+        }
+    }
+
+    /// 数値の項目の表（`config::NUMBER_FIELDS`）のどの項目にも、数値の入力欄がちょうど1つある（表に項目を足したら、
+    /// 入力欄も足す）。入力欄は、その項目の誤りの場所（`PLACES`）の欄と同じ。
+    #[test]
+    fn every_number_field_has_one_input() {
+        assert_eq!(NUMS.len(), crate::config::NUMBER_FIELDS.len());
+        for field in crate::config::NUMBER_FIELDS {
+            let inputs: Vec<&NumField> = NUMS.iter().filter(|n| std::ptr::eq(n.number, field)).collect();
+            assert_eq!(inputs.len(), 1, "{} の入力欄が1つでない", field.field);
+            let place = PLACES.iter().find(|p| p.field == field.field).expect("誤りの場所が無い");
+            assert_eq!((place.page, place.ctl), (inputs[0].page, inputs[0].ctl), "{} の誤りの場所が入力欄と違う", field.field);
         }
     }
 
