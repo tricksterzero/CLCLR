@@ -282,7 +282,8 @@ impl Core {
     // --- 書く操作 ---
 
     /// クリップボードから取り込んだ項目を履歴に足す（監視スレッドから呼ぶ）。項目を足した後でインデックスを
-    /// 書けなかったときは `CapturedIndexNotSaved`（項目は履歴に入っている）。
+    /// 書けなかったときは `CapturedIndexNotSaved`（項目は履歴に入っている）。追加音は鳴らさない（呼び出し側が
+    /// `capture_added` で結果を見て `sound::play_add_sound` を呼ぶ）。
     pub fn capture(&self, entry: Entry) -> Result<(), OpError> {
         let mut scope = self.begin()?;
         let cfg = self.cfg();
@@ -297,9 +298,6 @@ impl Core {
             let snapshot = (persist && (!evicted.is_empty() || cfg.history.save_on_change)).then(|| s.history_metas());
             (evicted, snapshot)
         })?;
-        if cfg.history.sound_on_add {
-            play_add_sound(&cfg.history.sound_file);
-        }
         if !evicted.is_empty() {
             let retire = snapshot.map_or(Retire::Targeted, Retire::Full);
             // 書けなかった項目は消し直す対象に残る（ログは `retire_items` が書く）
@@ -968,51 +966,10 @@ fn persist_enabled(config: &Config) -> bool {
     config.history.save_on_change || config.history.save_on_exit
 }
 
-/// 履歴追加音を鳴らす（C版 CLCL の tool_utl「音を鳴らす」の統合。watcherスレッドから呼ばれる）。
-/// ファイル未指定・再生失敗時はシステム音にフォールバック（C版と同じ）。ファイルは `sound_file_path` の絶対パスで鳴らす。
-fn play_add_sound(sound_file: &str) {
-    use windows::core::PCWSTR;
-    use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT};
-    // MessageBeepはwinuser.h由来だがwindows crateではDiagnostics::Debug配下
-    use windows::Win32::System::Diagnostics::Debug::MessageBeep;
-    use windows::Win32::UI::WindowsAndMessaging::MB_ICONASTERISK;
-
-    // ファイル名のバッファを関数を抜けた後も持つ必要は、PlaySound の文書には無い（SND_ASYNC で呼び出しの後も
-    // 生かしておくよう求めているのは SND_MEMORY の音のデータ）。C版がグローバルのバッファを渡すのに合わせて、
-    // 次の再生まで持っている
-    static SOUND_BUF: Mutex<Vec<u16>> = Mutex::new(Vec::new());
-
-    let played = match sound_file_path(sound_file) {
-        None => false,
-        Some(path) => {
-            use std::os::windows::ffi::OsStrExt;
-            let mut buf = SOUND_BUF.lock().unwrap_or_else(|p| p.into_inner());
-            *buf = path.as_os_str().encode_wide().chain([0]).collect();
-            unsafe { PlaySoundW(PCWSTR(buf.as_ptr()), None, SND_FILENAME | SND_ASYNC | SND_NODEFAULT) }.as_bool()
-        }
-    };
-    if !played {
-        let _ = unsafe { MessageBeep(MB_ICONASTERISK) };
-    }
-}
-
-/// 追加音のファイルを鳴らす絶対パス。相対のパス（`a.wav`・`sub\a.wav`）は exe のフォルダ（`storage::base_dir`）
-/// からのパスにする（PlaySound は相対の名前を、作業フォルダのほか Windows のフォルダ・PATH・ネットワークに割り当てた
-/// フォルダからも探すので、絶対パスにしてから鳴らす）。ルートからの相対（`\a.wav`）・ドライブの中の相対（`C:a.wav`）は、
-/// 作業フォルダから絶対パスにする。空・絶対パスにできないときは None。
-fn sound_file_path(sound_file: &str) -> Option<std::path::PathBuf> {
-    use std::path::{Component, Path};
-    if sound_file.is_empty() {
-        return None;
-    }
-    let path = Path::new(sound_file);
-    let path = if path.has_root() || matches!(path.components().next(), Some(Component::Prefix(_))) {
-        path.to_path_buf()
-    } else {
-        crate::storage::base_dir().join(path)
-    };
-    // 文字列の上での組み立てで、ファイルには触れない（GetFullPathNameW）
-    std::path::absolute(path).ok()
+/// `Core::capture` の結果で、項目が履歴に入ったか（成功と、足した後にインデックスを書けなかった
+/// `CapturedIndexNotSaved`）。呼び出し側が追加音を鳴らすかを決めるのに使う。
+pub fn capture_added(result: &Result<(), OpError>) -> bool {
+    matches!(result, Ok(()) | Err(OpError::CapturedIndexNotSaved(_)))
 }
 
 #[cfg(test)]
@@ -1127,27 +1084,16 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir_a);
     }
 
-    /// 実際に音が鳴ったかまでは検証できないが、空文字列（システムビープへのフォールバック）、
-    /// 存在しないファイル（`PlaySoundW` 失敗→ビープ）のどちらでもパニックせず戻る。
+    /// 取り込みの結果のうち、項目が履歴に入ったもの: 成功と、足した後にインデックスを書けなかったもの
+    /// （`CapturedIndexNotSaved`）。ほかの誤り（締め切り・poison・変換や blob の書き込みの失敗）は入っていない。
     #[test]
-    fn play_add_sound_does_not_panic_for_empty_or_missing_file() {
-        play_add_sound("");
-        play_add_sound(r"C:\clclr-test-nonexistent-sound-file.wav");
-    }
-
-    /// 追加音の相対のパスは exe のフォルダからの絶対パスにする（PlaySound に作業フォルダ・PATH・ネットワークに割り当てた
-    /// フォルダを探させない）。絶対パスはそのまま、ルートからの相対も絶対パスにする。空は None。
-    #[test]
-    fn sound_file_path_resolves_relative_names_to_exe_folder() {
-        let base = crate::storage::base_dir();
-        for relative in ["a.wav", r"sub\a.wav"] {
-            assert_eq!(sound_file_path(relative), Some(std::path::absolute(base.join(relative)).unwrap()), "{relative}");
+    fn capture_added_is_true_only_when_the_item_entered_history() {
+        let storage_error = || StorageError::Io(std::io::Error::other("書けない"));
+        assert!(capture_added(&Ok(())));
+        assert!(capture_added(&Err(OpError::CapturedIndexNotSaved(storage_error()))));
+        for error in [OpError::Closing, OpError::Poisoned, OpError::Storage(storage_error()), OpError::IndexNotSaved(storage_error())] {
+            assert!(!capture_added(&Err(error)));
         }
-        let absolute = std::env::current_exe().unwrap().with_file_name("a.wav");
-        assert_eq!(sound_file_path(absolute.to_str().unwrap()), Some(absolute));
-        let root_relative = sound_file_path(r"\a.wav").unwrap();
-        assert!(root_relative.is_absolute() && root_relative.ends_with("a.wav"), "{root_relative:?}");
-        assert_eq!(sound_file_path(""), None);
     }
 
     /// 履歴・ピン留めを変える操作のたびに変更番号が変わる。読むだけ・送るための読み込みでは変わらない。

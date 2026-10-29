@@ -18,6 +18,7 @@ mod native;
 mod ops;
 mod paste;
 mod service;
+mod sound;
 mod storage;
 mod store;
 mod tools;
@@ -338,13 +339,25 @@ fn main() {
 
     let watcher = {
         let core = core.clone();
+        let sound_config = Arc::clone(&config);
         let reporter = Arc::new(native::actions::CaptureReporter::new(failures.clone()));
         let problem_reporter = Arc::clone(&reporter);
         match ClipboardWatcher::spawn(
             Arc::clone(&config),
             move |entry| {
+                let result = core.capture(entry);
+                // 履歴に入ったら（インデックスを書けなかったときも）、設定に従って追加音を鳴らす
+                if ops::capture_added(&result) {
+                    let sound = {
+                        let c = sound_config.read().unwrap_or_else(|p| p.into_inner());
+                        c.history.sound_on_add.then(|| c.history.sound_file.clone())
+                    };
+                    if let Some(file) = sound {
+                        sound::play_add_sound(&file);
+                    }
+                }
                 // 終了処理が始まった後の取り込みは保存しない（締め切り。`failed` は知らせない）
-                if let Err(e) = core.capture(entry) {
+                if let Err(e) = result {
                     reporter.failed(&e);
                 }
                 waker.wake();
