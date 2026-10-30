@@ -295,6 +295,8 @@ fn should_capture_size(size: usize, limit: u64) -> bool {
 enum Capture {
     /// 変更番号（開いた直後に読んだもの）が抑止する番号と同じ。中身は読んでいない
     Suppressed(u32),
+    /// 「履歴に残さないで」の印が付いていた（`is_marked_no_history`）。中身は読んでいない
+    Marked(u32),
     /// 読んだ（形式が無ければ `None`）
     Read(u32, Option<Entry>),
     /// 取り込む形式の大きさの合計が上限を超えた。中身は写していない
@@ -317,14 +319,18 @@ pub enum WatchProblem {
     TooLarge(TooLarge),
 }
 
-/// 監視の取り込み: 開いてから変更番号を読み、抑止する番号と同じなら中身を読まない。開いている
-/// 間はほかのプロセスが書けない（監視のウィンドウを渡して開くため）ので、読んだ番号と中身は同じ状態の
-/// もの。
+/// 監視の取り込み: 開いてから変更番号を読み、抑止する番号と同じなら中身を読まない。「履歴に残さないで」の
+/// 印が付いていても中身を読まない（形式のフィルタより前に見る。既定の形式のフィルタは印の形式を通さないので）。
+/// 開いている間はほかのプロセスが書けない（監視のウィンドウを渡して開くため）ので、読んだ番号と中身は同じ
+/// 状態のもの。
 fn capture_clipboard(config: &Config, port: &ClipboardPort) -> Result<Capture> {
     let guard = port.open()?;
     let seq = unsafe { GetClipboardSequenceNumber() };
     if port.is_suppressed(seq) {
         return Ok(Capture::Suppressed(seq));
+    }
+    if is_marked_no_history(&guard) {
+        return Ok(Capture::Marked(seq));
     }
     Ok(match read_entry(&guard, config) {
         Ok(entry) => Capture::Read(seq, entry),
@@ -404,6 +410,80 @@ fn read_entry(_guard: &ClipboardGuard, config: &Config) -> std::result::Result<O
 fn clipboard_data_size(id: u32) -> Option<usize> {
     let handle = unsafe { GetClipboardData(id) }.ok()?;
     Some(unsafe { GlobalSize(HGLOBAL(handle.0)) })
+}
+
+// --- Marks against clipboard history ---
+
+/// 形式があるだけで、そのコピーを記録しない印（データは読まない）。パスワード管理ソフトなどが付ける。
+const SKIP_MARKS: [&str; 2] = ["ExcludeClipboardContentFromMonitorProcessing", "Clipboard Viewer Ignore"];
+
+/// 値（DWORD）が 1 のときだけ、そのコピーを記録してよい印。
+const HISTORY_MARK: &str = "CanIncludeInClipboardHistory";
+
+/// コピーに付いた `CanIncludeInClipboardHistory` の形式の状態。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryMark {
+    /// 形式が無い
+    Absent,
+    /// 先頭の4バイト（リトルエンディアンの DWORD）
+    Value(u32),
+    /// 形式はあるが、データを取れない・4バイトに満たない
+    Unreadable,
+}
+
+impl HistoryMark {
+    /// 形式のデータ（取れなければ `None`）から作る。5バイト目からは見ない（`GlobalSize` は確保の単位で丸められうる）。
+    fn from_data(data: Option<&[u8]>) -> Self {
+        match data.and_then(|data| data.first_chunk::<4>()) {
+            Some(bytes) => Self::Value(u32::from_le_bytes(*bytes)),
+            None => Self::Unreadable,
+        }
+    }
+}
+
+/// 印から、そのコピーを記録しないかを決める。`skip` は `SKIP_MARKS` の形式があったか。
+/// `CanIncludeInClipboardHistory` は 1 のときだけ記録してよい（0 は記録しない。仕様に無い値・読めない値も記録しない）。
+/// `CanUploadToCloudClipboard` はクラウドへの同期だけを決める印なので見ない。
+fn excluded_by_marks(skip: bool, history: HistoryMark) -> bool {
+    skip || !matches!(history, HistoryMark::Absent | HistoryMark::Value(1))
+}
+
+/// 開いているクリップボード（`guard`）のコピーに「履歴に残さないで」の印が付いているか。`SKIP_MARKS` は形式が
+/// あるかだけを見て、データを取らない（遅延描画のアプリに描かせない）。`CanIncludeInClipboardHistory` は、
+/// `SKIP_MARKS` が無いときだけ値を読む。
+///
+/// 形式は名前ではなく ID で比べる。形式の名前の登録は大文字小文字を区別せず、`GetClipboardFormatNameW` は最初に
+/// 登録した表記を返すので、ほかのアプリが違う表記で先に登録していると、名前の比較では外れる。
+fn is_marked_no_history(_guard: &ClipboardGuard) -> bool {
+    let skip_ids = SKIP_MARKS.map(registered_format_id);
+    let history_id = registered_format_id(HISTORY_MARK);
+    let mut has_history = false;
+    let mut id = 0u32;
+    loop {
+        id = unsafe { EnumClipboardFormats(id) };
+        if id == 0 {
+            break;
+        }
+        if skip_ids.contains(&id) {
+            return excluded_by_marks(true, HistoryMark::Absent);
+        }
+        has_history |= id == history_id;
+    }
+    let history = if has_history { read_history_mark(history_id) } else { HistoryMark::Absent };
+    excluded_by_marks(false, history)
+}
+
+/// 形式 `id`（`CanIncludeInClipboardHistory`）の値を読む。
+fn read_history_mark(id: u32) -> HistoryMark {
+    let Ok(handle) = (unsafe { GetClipboardData(id) }) else {
+        return HistoryMark::from_data(None);
+    };
+    let hglobal = HGLOBAL(handle.0);
+    let size = unsafe { GlobalSize(hglobal) };
+    let Some(guard) = GlobalLockGuard::lock(hglobal) else {
+        return HistoryMark::from_data(None);
+    };
+    HistoryMark::from_data(Some(guard.as_slice(size.min(4))))
 }
 
 // --- Write to clipboard ---
@@ -552,9 +632,15 @@ fn resolve_format_id(fmt: &Format) -> Option<u32> {
     if fmt.format_name.starts_with("0x") {
         return None;
     }
-    let wide: Vec<u16> = fmt.format_name.encode_utf16().chain([0]).collect();
-    let id = unsafe { RegisterClipboardFormatW(PCWSTR(wide.as_ptr())) };
+    let id = registered_format_id(&fmt.format_name);
     (id != 0).then_some(id)
+}
+
+/// 形式の名前を `RegisterClipboardFormatW` で登録した ID（同じ名前は大文字小文字を区別せずに同じ ID になる）。
+/// 登録できなければ 0（形式の ID には使われない値）。
+fn registered_format_id(name: &str) -> u32 {
+    let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    unsafe { RegisterClipboardFormatW(PCWSTR(wide.as_ptr())) }
 }
 
 /// 指定ウィンドウのタイトル・クラス名がフィルタに一致するか判定する。
@@ -607,6 +693,8 @@ pub(crate) enum Outcome {
     Ignored,
     /// 抑止する番号と同じだった（中身は読んでいない）
     Suppressed { seq: u32 },
+    /// 「履歴に残さないで」の印が付いていた（中身は読んでいない）
+    Marked { seq: u32 },
     /// 取り込んだ（`on_entry` を呼んだ後）
     Captured { seq: u32 },
     /// 取り込める形式が無かった
@@ -725,6 +813,7 @@ fn worker_loop(
         // 使わない。捕まえたら監視を止め（同じ不具合で繰り返さない。戻すのは利用者）、知らせる
         let captured = panic::catch_unwind(AssertUnwindSafe(|| match capture_clipboard(&config, &port) {
             Ok(Capture::Suppressed(seq)) => Outcome::Suppressed { seq },
+            Ok(Capture::Marked(seq)) => Outcome::Marked { seq },
             Ok(Capture::Read(seq, Some(entry))) => {
                 on_entry(entry);
                 Outcome::Captured { seq }
@@ -2037,6 +2126,72 @@ mod tests {
         assert_eq!(o.next_outcome(), Outcome::Captured { seq: copied });
         assert_eq!(entry_text(&o.entries.try_recv().unwrap()), "テキスト");
         assert!(o.problems.try_recv().is_err());
+    }
+
+    fn mark(name: &str, data: Vec<u8>) -> Format {
+        Format { format_name: name.to_string(), format_id: 0, data }
+    }
+
+    /// 「履歴に残さないで」の印が付いたコピーは、中身を読まずに飛ばす。形式があるだけで決まる2つ（大文字小文字の
+    /// 違う表記で書いたものも同じ形式）と、`CanIncludeInClipboardHistory` の 0・仕様に無い値。
+    #[test]
+    fn copies_marked_no_history_are_not_captured() {
+        let o = observed(50, true);
+        let port = o.watcher.port();
+        let copies = [
+            mark("ExcludeClipboardContentFromMonitorProcessing", vec![0]),
+            mark("Clipboard Viewer Ignore", vec![0]),
+            mark("clipboard viewer ignore", vec![0]),
+            mark(HISTORY_MARK, 0u32.to_le_bytes().to_vec()),
+            mark(HISTORY_MARK, 2u32.to_le_bytes().to_vec()),
+        ];
+        for marked in copies {
+            let name = marked.format_name.clone();
+            set_clipboard(&port, &[text("パスワード"), marked]).unwrap();
+            let copied = seq();
+            assert_eq!(o.next_outcome(), Outcome::Marked { seq: copied }, "{name}");
+            assert!(o.entries.try_recv().is_err(), "印 {name} の付いたコピーを取り込んだ");
+        }
+    }
+
+    /// `CanIncludeInClipboardHistory` が 1 のコピーと、`CanUploadToCloudClipboard` だけが 0 のコピーは取り込む。
+    #[test]
+    fn copies_allowed_by_marks_are_captured() {
+        let o = observed(50, true);
+        let port = o.watcher.port();
+        let copies = [
+            mark(HISTORY_MARK, 1u32.to_le_bytes().to_vec()),
+            mark("CanUploadToCloudClipboard", 0u32.to_le_bytes().to_vec()),
+        ];
+        for marked in copies {
+            let name = marked.format_name.clone();
+            set_clipboard(&port, &[text("残してよい"), marked]).unwrap();
+            let copied = seq();
+            assert_eq!(o.next_outcome(), Outcome::Captured { seq: copied }, "{name}");
+            assert_eq!(entry_text(&o.entries.try_recv().unwrap()), "残してよい", "{name}");
+        }
+    }
+
+    #[test]
+    fn history_mark_reads_first_four_bytes_little_endian() {
+        assert_eq!(HistoryMark::from_data(None), HistoryMark::Unreadable);
+        assert_eq!(HistoryMark::from_data(Some(&[])), HistoryMark::Unreadable);
+        assert_eq!(HistoryMark::from_data(Some(&[1, 0, 0])), HistoryMark::Unreadable);
+        assert_eq!(HistoryMark::from_data(Some(&[0, 0, 0, 0])), HistoryMark::Value(0));
+        assert_eq!(HistoryMark::from_data(Some(&[1, 0, 0, 0])), HistoryMark::Value(1));
+        assert_eq!(HistoryMark::from_data(Some(&[0, 0, 0, 1])), HistoryMark::Value(0x0100_0000));
+        assert_eq!(HistoryMark::from_data(Some(&[1, 0, 0, 0, 9])), HistoryMark::Value(1));
+    }
+
+    #[test]
+    fn excluded_by_marks_allows_only_absent_or_one() {
+        assert!(!excluded_by_marks(false, HistoryMark::Absent));
+        assert!(!excluded_by_marks(false, HistoryMark::Value(1)));
+        assert!(excluded_by_marks(false, HistoryMark::Value(0)));
+        assert!(excluded_by_marks(false, HistoryMark::Value(2)));
+        assert!(excluded_by_marks(false, HistoryMark::Unreadable));
+        assert!(excluded_by_marks(true, HistoryMark::Absent));
+        assert!(excluded_by_marks(true, HistoryMark::Value(1)));
     }
 
     #[test]
